@@ -324,6 +324,6 @@ html.dark body {
     --color-tertiary-800: oklch(from #4e0002 calc(l - 0.2) c h);
     --color-tertiary-900: oklch(from #4e0002 calc(l - 0.25) c h);
     --color-tertiary-950: oklch(from #4e0002 calc(l - 0.3) c h);
-=======
->>>>>>> upstream/main
+
+  
 }
