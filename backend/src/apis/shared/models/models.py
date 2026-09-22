@@ -4,9 +4,11 @@ These models define the structure for managed models used across
 app API and inference API deployments.
 """
 
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict, computed_field, field_validator, model_validator
 from typing import Any, Dict, List, Optional
 from datetime import datetime
+
+from apis.shared.models.model_icons import model_icon_url, normalize_icon_slug
 
 
 class ModelParamSpec(BaseModel):
@@ -151,6 +153,29 @@ class ManagedModelCreate(BaseModel):
 
     model_id: str = Field(..., alias="modelId", min_length=1)
     model_name: str = Field(..., alias="modelName", min_length=1)
+    short_description: Optional[str] = Field(
+        None,
+        alias="shortDescription",
+        max_length=80,
+        description="One-line reason a user would pick this model, shown under its name "
+                    "in the chat model picker. Keep it short — the picker truncates.",
+    )
+    icon_slug: Optional[str] = Field(
+        None,
+        alias="iconSlug",
+        description="Built-in vendor logo to show beside this model in the chat "
+                    "picker (e.g. 'anthropic'). A crisp, theme-aware SVG the SPA "
+                    "already ships — prefer it over an upload when we have one. "
+                    "Send '' to clear it; an uploaded icon takes precedence.",
+    )
+
+    @field_validator("icon_slug")
+    @classmethod
+    def _validate_icon_slug(cls, value: Optional[str]) -> Optional[str]:
+        # Normalizes case/whitespace and rejects a slug we ship no asset for,
+        # which would otherwise render an invisible tile for every user.
+        return normalize_icon_slug(value)
+
     provider: str = Field(..., min_length=1)
     provider_name: str = Field(..., alias="providerName", min_length=1)
     input_modalities: List[str] = Field(..., alias="inputModalities", min_length=1)
@@ -201,21 +226,33 @@ class ManagedModelCreate(BaseModel):
         alias="isDefault",
         description="Whether this is the default model for new sessions. Only one model can be default."
     )
+    is_featured: bool = Field(
+        True,
+        alias="isFeatured",
+        description="Whether the model appears at the top level of the chat model "
+                    "picker. False collapses it into the picker's 'More models' "
+                    "submenu. Defaults to True so an uncurated catalog keeps showing "
+                    "every model where it always has."
+    )
     mantle_api_mode: Optional[str] = Field(
         None,
         alias="apiMode",
-        description="Bedrock Mantle API surface (provider='mantle' only): 'chat' "
-                    "(OpenAI Chat Completions, the default) or 'responses' (OpenAI "
-                    "Responses API — required by models that don't serve Chat "
-                    "Completions, e.g. openai.gpt-5.x). Ignored for other providers."
+        description="OpenAI-compatible API surface: 'chat' (OpenAI Chat "
+                    "Completions, the default) or 'responses' (OpenAI Responses "
+                    "API — required by models that don't serve Chat Completions, "
+                    "e.g. openai.gpt-5.x). Selectable for provider='mantle'; "
+                    "forced to 'responses' for provider='bedrock-responses', "
+                    "which exists because GPT-5.6 caches only over that API. "
+                    "Ignored for other providers."
     )
     mantle_region: Optional[str] = Field(
         None,
         alias="region",
-        description="Bedrock Mantle region override (provider='mantle' only): pins "
-                    "inference to the region hosting the model (e.g. 'us-east-1'), "
-                    "independent of where the app runs. Empty -> the app's region. "
-                    "Ignored for other providers."
+        description="Region override for an OpenAI-compatible Bedrock surface "
+                    "(provider='mantle' or 'bedrock-responses'): pins inference to "
+                    "the region hosting the model (e.g. 'us-east-1'), independent "
+                    "of where the app runs, and signs the bearer token for it. "
+                    "Empty -> the app's region. Ignored for other providers."
     )
     mantle_endpoint_path: Optional[str] = Field(
         None,
@@ -243,6 +280,29 @@ class ManagedModelUpdate(BaseModel):
 
     model_id: Optional[str] = Field(None, alias="modelId", min_length=1)
     model_name: Optional[str] = Field(None, alias="modelName")
+    short_description: Optional[str] = Field(
+        None,
+        alias="shortDescription",
+        max_length=80,
+        description="One-line reason a user would pick this model, shown under its name "
+                    "in the chat model picker. Keep it short — the picker truncates.",
+    )
+    icon_slug: Optional[str] = Field(
+        None,
+        alias="iconSlug",
+        description="Built-in vendor logo to show beside this model in the chat "
+                    "picker (e.g. 'anthropic'). A crisp, theme-aware SVG the SPA "
+                    "already ships — prefer it over an upload when we have one. "
+                    "Send '' to clear it; an uploaded icon takes precedence.",
+    )
+
+    @field_validator("icon_slug")
+    @classmethod
+    def _validate_icon_slug(cls, value: Optional[str]) -> Optional[str]:
+        # Same validation as create, except '' survives as '': on a PATCH it is
+        # the only way to say "remove the slug", since None means "don't touch".
+        return normalize_icon_slug(value, keep_clear_sentinel=True)
+
     provider: Optional[str] = None
     provider_name: Optional[str] = Field(None, alias="providerName")
     input_modalities: Optional[List[str]] = Field(None, alias="inputModalities")
@@ -289,17 +349,27 @@ class ManagedModelUpdate(BaseModel):
         alias="isDefault",
         description="Whether this is the default model for new sessions."
     )
+    is_featured: Optional[bool] = Field(
+        None,
+        alias="isFeatured",
+        description="Whether the model appears at the top level of the chat model "
+                    "picker. False collapses it into the picker's 'More models' "
+                    "submenu. Defaults to True so an uncurated catalog keeps showing "
+                    "every model where it always has."
+    )
     mantle_api_mode: Optional[str] = Field(
         None,
         alias="apiMode",
-        description="Bedrock Mantle API surface (provider='mantle' only): 'chat' "
-                    "or 'responses'. Ignored for other providers."
+        description="OpenAI-compatible API surface: 'chat' or 'responses'. "
+                    "Selectable for provider='mantle'; forced to 'responses' for "
+                    "provider='bedrock-responses'. Ignored for other providers."
     )
     mantle_region: Optional[str] = Field(
         None,
         alias="region",
-        description="Bedrock Mantle region override (provider='mantle' only). "
-                    "Empty -> the app's region. Ignored for other providers."
+        description="Region override for an OpenAI-compatible Bedrock surface "
+                    "(provider='mantle' or 'bedrock-responses'). Empty -> the "
+                    "app's region. Ignored for other providers."
     )
     mantle_endpoint_path: Optional[str] = Field(
         None,
@@ -326,6 +396,32 @@ class ManagedModel(BaseModel):
     id: str
     model_id: str = Field(..., alias="modelId")
     model_name: str = Field(..., alias="modelName")
+    short_description: Optional[str] = Field(
+        None,
+        alias="shortDescription",
+        # Deliberately NOT length-capped here, unlike the create/update models.
+        # This is the READ model: a stored value longer than the write-path cap
+        # (hand-edited record, or a future cap that shrinks) would fail
+        # validation and take the whole /models listing down with it. Bound the
+        # input, be permissive about what is already persisted; the picker
+        # truncates visually anyway.
+        description="One-line reason a user would pick this model, shown under its name "
+                    "in the chat model picker.",
+    )
+    icon_slug: Optional[str] = Field(
+        None,
+        alias="iconSlug",
+        description="Built-in vendor logo slug (e.g. 'anthropic'). The SPA resolves "
+                    "it to its shipped light/dark SVG pair. Superseded by iconUrl "
+                    "when an icon has been uploaded.",
+    )
+    icon_key: Optional[str] = Field(
+        None,
+        alias="iconKey",
+        description="S3 object key for an uploaded icon. Internal — clients read "
+                    "iconUrl, which is derived from this.",
+    )
+
     provider: str
     provider_name: str = Field(..., alias="providerName")
     input_modalities: List[str] = Field(..., alias="inputModalities")
@@ -379,17 +475,28 @@ class ManagedModel(BaseModel):
         alias="isDefault",
         description="Whether this is the default model for new sessions. Only one model can be default."
     )
+    is_featured: bool = Field(
+        True,
+        alias="isFeatured",
+        description="Whether the model appears at the top level of the chat model "
+                    "picker. False collapses it into the picker's 'More models' "
+                    "submenu. Defaults to True so an uncurated catalog keeps showing "
+                    "every model where it always has."
+    )
     mantle_api_mode: Optional[str] = Field(
         None,
         alias="apiMode",
-        description="Bedrock Mantle API surface (provider='mantle' only): 'chat' "
-                    "(default) or 'responses'. Ignored for other providers."
+        description="OpenAI-compatible API surface: 'chat' (default) or "
+                    "'responses'. Selectable for provider='mantle'; forced to "
+                    "'responses' for provider='bedrock-responses'. Ignored for "
+                    "other providers."
     )
     mantle_region: Optional[str] = Field(
         None,
         alias="region",
-        description="Bedrock Mantle region override (provider='mantle' only). "
-                    "Empty -> the app's region. Ignored for other providers."
+        description="Region override for an OpenAI-compatible Bedrock surface "
+                    "(provider='mantle' or 'bedrock-responses'). Empty -> the "
+                    "app's region. Ignored for other providers."
     )
     mantle_endpoint_path: Optional[str] = Field(
         None,
@@ -402,6 +509,17 @@ class ManagedModel(BaseModel):
         alias="supportedParams",
         description="Per-model inference parameter capabilities."
     )
+    @computed_field(alias="iconUrl", return_type=Optional[str])  # type: ignore[prop-decorator]
+    @property
+    def icon_url(self) -> Optional[str]:
+        """Path that serves the uploaded icon, or ``None`` when there isn't one.
+
+        Derived rather than stored so the ``?v=`` cache-buster can never disagree
+        with the key it is meant to describe. Clients choose: ``iconUrl`` first,
+        then ``iconSlug``, then their own provider-name fallback.
+        """
+        return model_icon_url(self.id, self.icon_key)
+
     created_at: datetime = Field(..., alias="createdAt")
     updated_at: datetime = Field(..., alias="updatedAt")
 

@@ -23,6 +23,8 @@ import { AppRolesService } from '../services/app-roles.service';
 import { AdminToolService } from '../../tools/services/admin-tool.service';
 import { ManagedModelsService } from '../../manage-models/services/managed-models.service';
 import { AppRoleCreateRequest, AppRoleUpdateRequest } from '../models/app-role.model';
+import { AdminScope } from '../../admin-scope.model';
+import { SpinnerComponent } from '../../../components/spinner/spinner.component';
 
 interface RoleFormGroup {
   roleId: FormControl<string>;
@@ -32,6 +34,7 @@ interface RoleFormGroup {
   inheritsFrom: FormControl<string[]>;
   grantedTools: FormControl<string[]>;
   grantedModels: FormControl<string[]>;
+  grantedAdminScopes: FormControl<string[]>;
   priority: FormControl<number>;
   enabled: FormControl<boolean>;
 }
@@ -39,7 +42,7 @@ interface RoleFormGroup {
 @Component({
   selector: 'app-role-form',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, NgIcon],
+  imports: [ReactiveFormsModule, NgIcon, SpinnerComponent],
   providers: [
     provideIcons({ heroArrowLeft, heroInformationCircle }),
   ],
@@ -71,9 +74,7 @@ interface RoleFormGroup {
         @if (loading()) {
           <div class="flex items-center justify-center h-64">
             <div class="flex flex-col items-center gap-4">
-              <div
-                class="animate-spin rounded-full size-12 border-4 border-gray-300 dark:border-gray-600 border-t-blue-600 dark:border-t-blue-400"
-              ></div>
+              <app-spinner size="xl" label="Loading role" />
               <p class="text-sm text-gray-500 dark:text-gray-400">
                 Loading role...
               </p>
@@ -92,7 +93,7 @@ interface RoleFormGroup {
                 <!-- Role ID -->
                 <div>
                   <label for="roleId" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
-                    Role ID <span class="text-red-600">*</span>
+                    Role ID <span class="text-state-danger-600">*</span>
                   </label>
                   <input
                     type="text"
@@ -100,14 +101,14 @@ interface RoleFormGroup {
                     formControlName="roleId"
                     placeholder="e.g., basic_user, power_user, developer"
                     [readonly]="isEditMode()"
-                    class="mt-1 block w-full rounded-sm border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-hidden focus:ring-3 focus:ring-blue-500/50 dark:border-gray-600 dark:bg-gray-700 dark:text-white dark:placeholder:text-gray-500 read-only:bg-gray-100 read-only:dark:bg-gray-600"
-                    [class.border-red-500]="roleForm.controls.roleId.invalid && roleForm.controls.roleId.touched"
+                    class="mt-1 block w-full rounded-sm border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-primary-500 focus:outline-hidden focus:ring-3 focus:ring-primary-500/50 dark:border-gray-600 dark:bg-gray-700 dark:text-white dark:placeholder:text-gray-500 read-only:bg-gray-100 read-only:dark:bg-gray-600"
+                    [class.border-state-danger-500]="roleForm.controls.roleId.invalid && roleForm.controls.roleId.touched"
                   />
                   <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
                     Lowercase letters, numbers, and underscores only. 3-50 characters.
                   </p>
                   @if (roleForm.controls.roleId.invalid && roleForm.controls.roleId.touched) {
-                    <p class="mt-1 text-sm/6 text-red-600 dark:text-red-400">
+                    <p class="mt-1 text-sm/6 text-state-danger-600 dark:text-state-danger-400">
                       @if (roleForm.controls.roleId.errors?.['required']) {
                         Role ID is required
                       } @else if (roleForm.controls.roleId.errors?.['pattern']) {
@@ -124,18 +125,18 @@ interface RoleFormGroup {
                 <!-- Display Name -->
                 <div>
                   <label for="displayName" class="block text-sm/6 font-medium text-gray-700 dark:text-gray-300">
-                    Display Name <span class="text-red-600">*</span>
+                    Display Name <span class="text-state-danger-600">*</span>
                   </label>
                   <input
                     type="text"
                     id="displayName"
                     formControlName="displayName"
                     placeholder="e.g., Basic User, Power User, Developer"
-                    class="mt-1 block w-full rounded-sm border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-hidden focus:ring-3 focus:ring-blue-500/50 dark:border-gray-600 dark:bg-gray-700 dark:text-white dark:placeholder:text-gray-500"
-                    [class.border-red-500]="roleForm.controls.displayName.invalid && roleForm.controls.displayName.touched"
+                    class="mt-1 block w-full rounded-sm border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-primary-500 focus:outline-hidden focus:ring-3 focus:ring-primary-500/50 dark:border-gray-600 dark:bg-gray-700 dark:text-white dark:placeholder:text-gray-500"
+                    [class.border-state-danger-500]="roleForm.controls.displayName.invalid && roleForm.controls.displayName.touched"
                   />
                   @if (roleForm.controls.displayName.invalid && roleForm.controls.displayName.touched) {
-                    <p class="mt-1 text-sm/6 text-red-600 dark:text-red-400">Display name is required</p>
+                    <p class="mt-1 text-sm/6 text-state-danger-600 dark:text-state-danger-400">Display name is required</p>
                   }
                 </div>
 
@@ -149,7 +150,7 @@ interface RoleFormGroup {
                     formControlName="description"
                     rows="3"
                     placeholder="Describe what this role is for..."
-                    class="mt-1 block w-full rounded-sm border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-hidden focus:ring-3 focus:ring-blue-500/50 dark:border-gray-600 dark:bg-gray-700 dark:text-white dark:placeholder:text-gray-500"
+                    class="mt-1 block w-full rounded-sm border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-primary-500 focus:outline-hidden focus:ring-3 focus:ring-primary-500/50 dark:border-gray-600 dark:bg-gray-700 dark:text-white dark:placeholder:text-gray-500"
                   ></textarea>
                   <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
                     Optional description for administrators. Max 500 characters.
@@ -167,7 +168,7 @@ interface RoleFormGroup {
                     formControlName="priority"
                     min="0"
                     max="999"
-                    class="mt-1 block w-32 rounded-sm border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 focus:border-blue-500 focus:outline-hidden focus:ring-3 focus:ring-blue-500/50 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
+                    class="mt-1 block w-32 rounded-sm border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 focus:border-primary-500 focus:outline-hidden focus:ring-3 focus:ring-primary-500/50 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
                   />
                   <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
                     Higher priority roles take precedence for quota tier selection (0-999).
@@ -180,7 +181,7 @@ interface RoleFormGroup {
                     type="checkbox"
                     id="enabled"
                     formControlName="enabled"
-                    class="size-4 rounded-xs border-gray-300 text-blue-600 focus:ring-3 focus:ring-blue-500/50 dark:border-gray-600 dark:bg-gray-700"
+                    class="size-4 rounded-xs border-gray-300 text-primary-600 focus:ring-3 focus:ring-primary-500/50 dark:border-gray-600 dark:bg-gray-700"
                   />
                   <label for="enabled" class="text-sm/6 font-medium text-gray-700 dark:text-gray-300">
                     Role Enabled
@@ -206,11 +207,17 @@ interface RoleFormGroup {
                   type="text"
                   id="jwtRoleMappings"
                   formControlName="jwtRoleMappings"
-                  placeholder="e.g., User, Admin, DotNetDevelopers"
-                  class="mt-1 block w-full rounded-sm border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-hidden focus:ring-3 focus:ring-blue-500/50 dark:border-gray-600 dark:bg-gray-700 dark:text-white dark:placeholder:text-gray-500"
+                  placeholder="e.g., User, Admin, PSEmeriti Entra Sync"
+                  class="mt-1 block w-full rounded-sm border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-primary-500 focus:outline-hidden focus:ring-3 focus:ring-primary-500/50 dark:border-gray-600 dark:bg-gray-700 dark:text-white dark:placeholder:text-gray-500"
                 />
                 <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
-                  Enter JWT role names separated by commas. These are the roles from your identity provider.
+                  Enter the group names exactly as your identity provider sends them,
+                  separated by commas. Group names may contain spaces
+                  (<span class="font-medium">PSEmeriti Entra Sync</span>) &mdash; only the
+                  comma separates one name from the next, so a name cannot itself contain
+                  one. Surrounding spaces are trimmed; a name that still fails to save is
+                  usually carrying an invisible character from a copy&#8209;paste, and the
+                  error will point at it.
                 </p>
               </div>
             </div>
@@ -234,14 +241,14 @@ interface RoleFormGroup {
                       <button
                         type="button"
                         (click)="toggleArrayValue('inheritsFrom', role.roleId)"
-                        [class.bg-purple-600]="isSelected('inheritsFrom', role.roleId)"
+                        [class.bg-primary-600]="isSelected('inheritsFrom', role.roleId)"
                         [class.text-white]="isSelected('inheritsFrom', role.roleId)"
                         [class.bg-gray-100]="!isSelected('inheritsFrom', role.roleId)"
                         [class.text-gray-700]="!isSelected('inheritsFrom', role.roleId)"
-                        [class.dark:bg-purple-500]="isSelected('inheritsFrom', role.roleId)"
+                        [class.dark:bg-primary-500]="isSelected('inheritsFrom', role.roleId)"
                         [class.dark:bg-gray-700]="!isSelected('inheritsFrom', role.roleId)"
                         [class.dark:text-gray-300]="!isSelected('inheritsFrom', role.roleId)"
-                        class="rounded-sm px-3 py-1.5 text-sm/6 font-medium hover:opacity-80 focus:outline-hidden focus:ring-3 focus:ring-purple-500/50"
+                        class="rounded-sm px-3 py-1.5 text-sm/6 font-medium hover:opacity-80 focus:outline-hidden focus:ring-3 focus:ring-primary-500/50"
                         [title]="role.description"
                       >
                         {{ role.displayName }}
@@ -276,7 +283,7 @@ interface RoleFormGroup {
                     id="grantAllTools"
                     [checked]="isSelected('grantedTools', '*')"
                     (change)="toggleWildcard('grantedTools', $event)"
-                    class="size-4 rounded-xs border-gray-300 text-green-600 focus:ring-3 focus:ring-green-500/50 dark:border-gray-600 dark:bg-gray-700"
+                    class="size-4 rounded-xs border-gray-300 text-state-success-600 focus:ring-3 focus:ring-state-success-500/50 dark:border-gray-600 dark:bg-gray-700"
                   />
                   <label for="grantAllTools" class="text-sm/6 font-medium text-gray-700 dark:text-gray-300">
                     Grant access to all tools
@@ -292,14 +299,14 @@ interface RoleFormGroup {
                         <button
                           type="button"
                           (click)="toggleArrayValue('grantedTools', tool.toolId)"
-                          [class.bg-green-600]="isSelected('grantedTools', tool.toolId)"
+                          [class.bg-state-success-600]="isSelected('grantedTools', tool.toolId)"
                           [class.text-white]="isSelected('grantedTools', tool.toolId)"
                           [class.bg-gray-100]="!isSelected('grantedTools', tool.toolId)"
                           [class.text-gray-700]="!isSelected('grantedTools', tool.toolId)"
-                          [class.dark:bg-green-500]="isSelected('grantedTools', tool.toolId)"
+                          [class.dark:bg-state-success-500]="isSelected('grantedTools', tool.toolId)"
                           [class.dark:bg-gray-700]="!isSelected('grantedTools', tool.toolId)"
                           [class.dark:text-gray-300]="!isSelected('grantedTools', tool.toolId)"
-                          class="rounded-sm px-3 py-1.5 text-sm/6 font-medium hover:opacity-80 focus:outline-hidden focus:ring-3 focus:ring-green-500/50"
+                          class="rounded-sm px-3 py-1.5 text-sm/6 font-medium hover:opacity-80 focus:outline-hidden focus:ring-3 focus:ring-state-success-500/50"
                           [title]="tool.description"
                         >
                           {{ tool.displayName }}
@@ -313,6 +320,62 @@ interface RoleFormGroup {
                   }
                 }
               </div>
+            </div>
+
+            <!-- Admin Access Section -->
+            <div class="rounded-sm border border-gray-300 bg-white p-6 dark:border-gray-600 dark:bg-gray-800">
+              <h2 class="mb-2 text-xl/8 font-semibold text-gray-900 dark:text-white">
+                Admin Access
+              </h2>
+              <p class="mb-6 text-sm/6 text-gray-600 dark:text-gray-400">
+                Grant this role access to specific areas of the admin console. Members
+                get only the areas selected here — everything else stays hidden.
+                Managing roles and auth providers cannot be delegated, because either
+                one would let the holder grant themselves full admin.
+              </p>
+
+              @if (adminScopesLoading()) {
+                <p class="text-sm text-gray-500 dark:text-gray-400">Loading admin areas...</p>
+              } @else if (adminScopeGroups().length > 0) {
+                <div class="flex flex-col gap-6">
+                  @for (group of adminScopeGroups(); track group.label) {
+                    <div>
+                      <h3 class="mb-2 text-xs/5 font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                        {{ group.label }}
+                      </h3>
+                      <div class="flex flex-wrap gap-2">
+                        @for (scope of group.scopes; track scope.id) {
+                          <button
+                            type="button"
+                            [disabled]="!scope.delegable"
+                            (click)="toggleArrayValue('grantedAdminScopes', scope.id)"
+                            [class.bg-state-success-600]="isSelected('grantedAdminScopes', scope.id)"
+                            [class.text-white]="isSelected('grantedAdminScopes', scope.id)"
+                            [class.bg-gray-100]="!isSelected('grantedAdminScopes', scope.id)"
+                            [class.text-gray-700]="!isSelected('grantedAdminScopes', scope.id)"
+                            [class.dark:bg-state-success-500]="isSelected('grantedAdminScopes', scope.id)"
+                            [class.dark:bg-gray-700]="!isSelected('grantedAdminScopes', scope.id)"
+                            [class.dark:text-gray-300]="!isSelected('grantedAdminScopes', scope.id)"
+                            class="rounded-sm px-3 py-1.5 text-sm/6 font-medium hover:opacity-80 focus:outline-hidden focus:ring-3 focus:ring-state-success-500/50 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:opacity-50"
+                            [title]="scope.delegable ? scope.description : scope.description + ' (cannot be delegated)'"
+                            [attr.aria-pressed]="scope.delegable ? isSelected('grantedAdminScopes', scope.id) : null"
+                          >
+                            {{ scope.label }}
+                            @if (!scope.delegable) {
+                              <span class="ml-1 text-xs" aria-hidden="true">&#128274;</span>
+                              <span class="sr-only">(cannot be delegated)</span>
+                            }
+                          </button>
+                        }
+                      </div>
+                    </div>
+                  }
+                </div>
+              } @else {
+                <p class="text-sm text-gray-500 dark:text-gray-400">
+                  Could not load admin areas.
+                </p>
+              }
             </div>
 
             <!-- Model Permissions Section -->
@@ -332,7 +395,7 @@ interface RoleFormGroup {
                     id="grantAllModels"
                     [checked]="isSelected('grantedModels', '*')"
                     (change)="toggleWildcard('grantedModels', $event)"
-                    class="size-4 rounded-xs border-gray-300 text-amber-600 focus:ring-3 focus:ring-amber-500/50 dark:border-gray-600 dark:bg-gray-700"
+                    class="size-4 rounded-xs border-gray-300 text-state-warning-600 focus:ring-3 focus:ring-state-warning-500/50 dark:border-gray-600 dark:bg-gray-700"
                   />
                   <label for="grantAllModels" class="text-sm/6 font-medium text-gray-700 dark:text-gray-300">
                     Grant access to all models
@@ -348,14 +411,14 @@ interface RoleFormGroup {
                         <button
                           type="button"
                           (click)="toggleArrayValue('grantedModels', model.modelId)"
-                          [class.bg-amber-600]="isSelected('grantedModels', model.modelId)"
+                          [class.bg-state-warning-600]="isSelected('grantedModels', model.modelId)"
                           [class.text-white]="isSelected('grantedModels', model.modelId)"
                           [class.bg-gray-100]="!isSelected('grantedModels', model.modelId)"
                           [class.text-gray-700]="!isSelected('grantedModels', model.modelId)"
-                          [class.dark:bg-amber-500]="isSelected('grantedModels', model.modelId)"
+                          [class.dark:bg-state-warning-500]="isSelected('grantedModels', model.modelId)"
                           [class.dark:bg-gray-700]="!isSelected('grantedModels', model.modelId)"
                           [class.dark:text-gray-300]="!isSelected('grantedModels', model.modelId)"
-                          class="rounded-sm px-3 py-1.5 text-sm/6 font-medium hover:opacity-80 focus:outline-hidden focus:ring-3 focus:ring-amber-500/50"
+                          class="rounded-sm px-3 py-1.5 text-sm/6 font-medium hover:opacity-80 focus:outline-hidden focus:ring-3 focus:ring-state-warning-500/50"
                           [title]="model.modelId"
                         >
                           {{ model.modelName }}
@@ -376,7 +439,7 @@ interface RoleFormGroup {
               <button
                 type="submit"
                 [disabled]="isSubmitting() || roleForm.invalid"
-                class="rounded-sm bg-blue-600 px-6 py-2 text-sm/6 font-medium text-white hover:bg-blue-700 focus:outline-hidden focus:ring-3 focus:ring-blue-500/50 disabled:opacity-50 disabled:cursor-not-allowed dark:bg-blue-500 dark:hover:bg-blue-600"
+                class="rounded-2xl bg-primary-accessible px-6 py-2 text-sm/6 font-medium text-white hover:brightness-95 focus:outline-hidden focus:ring-3 focus:ring-primary-500/50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 @if (isSubmitting()) {
                   Saving...
@@ -388,7 +451,7 @@ interface RoleFormGroup {
                 type="button"
                 (click)="goBack()"
                 [disabled]="isSubmitting()"
-                class="rounded-sm border border-gray-300 bg-white px-6 py-2 text-sm/6 font-medium text-gray-700 hover:bg-gray-50 focus:outline-hidden focus:ring-3 focus:ring-gray-500/50 disabled:opacity-50 disabled:cursor-not-allowed dark:border-gray-600 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
+                class="rounded-2xl border border-gray-300 bg-white px-6 py-2 text-sm/6 font-medium text-gray-700 hover:bg-gray-50 focus:outline-hidden focus:ring-3 focus:ring-gray-500/50 disabled:opacity-50 disabled:cursor-not-allowed dark:border-gray-600 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
               >
                 Cancel
               </button>
@@ -439,6 +502,7 @@ export class RoleFormPage implements OnInit {
     inheritsFrom: this.fb.control<string[]>([], { nonNullable: true }),
     grantedTools: this.fb.control<string[]>([], { nonNullable: true }),
     grantedModels: this.fb.control<string[]>([], { nonNullable: true }),
+    grantedAdminScopes: this.fb.control<string[]>([], { nonNullable: true }),
     priority: this.fb.control(0, {
       nonNullable: true,
       validators: [Validators.min(0), Validators.max(1000)],
@@ -456,6 +520,29 @@ export class RoleFormPage implements OnInit {
     this.managedModelsService.getManagedModels()
   );
 
+  /**
+   * The admin scope registry, grouped for display.
+   *
+   * Groups are built in first-seen order from the server's own `group` field,
+   * which mirrors the admin nav headings — so the picker reads in the same
+   * order as the sidebar the grantee will end up looking at.
+   */
+  readonly adminScopes = signal<AdminScope[]>([]);
+  readonly adminScopesLoading = signal(false);
+
+  readonly adminScopeGroups = computed(() => {
+    const groups: { label: string; scopes: AdminScope[] }[] = [];
+    for (const scope of this.adminScopes()) {
+      const existing = groups.find(g => g.label === scope.group);
+      if (existing) {
+        existing.scopes.push(scope);
+      } else {
+        groups.push({ label: scope.group, scopes: [scope] });
+      }
+    }
+    return groups;
+  });
+
   readonly availableParentRoles = computed(() => {
     const currentRoleId = this.roleId();
     return this.appRolesService
@@ -464,11 +551,29 @@ export class RoleFormPage implements OnInit {
   });
 
   ngOnInit(): void {
+    void this.loadAdminScopes();
+
     const id = this.route.snapshot.paramMap.get('id');
     if (id && id !== 'new') {
       this.isEditMode.set(true);
       this.roleId.set(id);
       this.loadRoleData(id);
+    }
+  }
+
+  private async loadAdminScopes(): Promise<void> {
+    this.adminScopesLoading.set(true);
+    try {
+      const response = await this.appRolesService.fetchAdminScopes();
+      this.adminScopes.set(response.scopes);
+    } catch (error) {
+      // Non-fatal: the rest of the form still works, and the section renders
+      // its empty state. Blocking role editing because one optional picker
+      // could not load would be a worse trade.
+      console.error('Failed to load admin scopes:', error);
+      this.adminScopes.set([]);
+    } finally {
+      this.adminScopesLoading.set(false);
     }
   }
 
@@ -484,6 +589,10 @@ export class RoleFormPage implements OnInit {
         inheritsFrom: role.inheritsFrom,
         grantedTools: role.grantedTools,
         grantedModels: role.grantedModels,
+        // `?? []` — a role written before admin scopes existed has no such
+        // field, and patchValue(undefined) would leave the control untouched
+        // rather than clearing it.
+        grantedAdminScopes: role.grantedAdminScopes ?? [],
         priority: role.priority,
         enabled: role.enabled,
       });
@@ -497,7 +606,7 @@ export class RoleFormPage implements OnInit {
   }
 
   toggleArrayValue(
-    controlName: 'inheritsFrom' | 'grantedTools' | 'grantedModels',
+    controlName: 'inheritsFrom' | 'grantedTools' | 'grantedModels' | 'grantedAdminScopes',
     value: string
   ): void {
     const control = this.roleForm.get(controlName) as FormControl<string[]>;
@@ -511,7 +620,7 @@ export class RoleFormPage implements OnInit {
   }
 
   isSelected(
-    controlName: 'inheritsFrom' | 'grantedTools' | 'grantedModels',
+    controlName: 'inheritsFrom' | 'grantedTools' | 'grantedModels' | 'grantedAdminScopes',
     value: string
   ): boolean {
     const control = this.roleForm.get(controlName) as FormControl<string[]>;
@@ -559,6 +668,7 @@ export class RoleFormPage implements OnInit {
           inheritsFrom: formValue.inheritsFrom,
           grantedTools: formValue.grantedTools,
           grantedModels: formValue.grantedModels,
+          grantedAdminScopes: formValue.grantedAdminScopes,
           priority: formValue.priority,
           enabled: formValue.enabled,
         };
@@ -572,6 +682,7 @@ export class RoleFormPage implements OnInit {
           inheritsFrom: formValue.inheritsFrom,
           grantedTools: formValue.grantedTools,
           grantedModels: formValue.grantedModels,
+          grantedAdminScopes: formValue.grantedAdminScopes,
           priority: formValue.priority,
           enabled: formValue.enabled,
         };

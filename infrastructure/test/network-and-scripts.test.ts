@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { createMockConfig, MOCK_ACCOUNT, MOCK_REGION } from './helpers/mock-config';
+import { mockCognitoRefs, MOCK_BFF_CLIENT_ID } from './helpers/mock-cognito';
 
 import { NetworkConstruct } from '../lib/constructs/network/network-construct';
 import { AlbConstruct } from '../lib/constructs/network/alb-construct';
@@ -88,6 +89,54 @@ describe('AlbConstruct — detailed', () => {
       SecurityGroupIngress: Match.arrayWith([
         Match.objectLike({ FromPort: 443, ToPort: 443, CidrIp: '0.0.0.0/0' }),
       ]),
+    });
+  });
+
+  // Access logs are the only record of who ENDED a connection. A mid-stream
+  // SSE disconnect is indistinguishable inside the container — client gone,
+  // socket dropped, and the ALB's own idle timeout all arrive as the same
+  // cancellation — so losing this attribute re-blinds that investigation.
+  it('access logging is enabled on the ALB', () => {
+    t.hasResourceProperties('AWS::ElasticLoadBalancingV2::LoadBalancer', {
+      LoadBalancerAttributes: Match.arrayWith([
+        Match.objectLike({ Key: 'access_logs.s3.enabled', Value: 'true' }),
+      ]),
+    });
+  });
+
+  it('access-log bucket uses SSE-S3, not KMS', () => {
+    // The ELB log-delivery service cannot write to an SSE-KMS bucket; it
+    // fails silently, leaving an empty bucket and no logs.
+    t.hasResourceProperties('AWS::S3::Bucket', {
+      BucketName: Match.stringLikeRegexp('alb-access-logs'),
+      BucketEncryption: {
+        ServerSideEncryptionConfiguration: [
+          { ServerSideEncryptionByDefault: { SSEAlgorithm: 'AES256' } },
+        ],
+      },
+    });
+  });
+
+  it('access logs expire so a per-request log cannot grow unbounded', () => {
+    t.hasResourceProperties('AWS::S3::Bucket', {
+      BucketName: Match.stringLikeRegexp('alb-access-logs'),
+      LifecycleConfiguration: {
+        Rules: Match.arrayWith([
+          Match.objectLike({ ExpirationInDays: 30, Status: 'Enabled' }),
+        ]),
+      },
+    });
+  });
+
+  it('access-log bucket blocks public access', () => {
+    t.hasResourceProperties('AWS::S3::Bucket', {
+      BucketName: Match.stringLikeRegexp('alb-access-logs'),
+      PublicAccessBlockConfiguration: {
+        BlockPublicAcls: true,
+        BlockPublicPolicy: true,
+        IgnorePublicAcls: true,
+        RestrictPublicBuckets: true,
+      },
     });
   });
 
@@ -247,10 +296,23 @@ describe('McpSandboxBucketConstruct — detailed', () => {
 
 describe('AgentCoreGatewayConstruct — detailed', () => {
   let t: Template;
+  /** Template built with inboundAuth explicitly set to 'jwt'. */
+  let jwtTemplate: Template;
+
   beforeAll(() => {
     const stack = testStack();
-    new AgentCoreGatewayConstruct(stack, 'GW', { config });
+    new AgentCoreGatewayConstruct(stack, 'GW', {
+      config,
+      ...mockCognitoRefs(stack),
+    });
     t = Template.fromStack(stack);
+
+    const jwtStack = testStack();
+    new AgentCoreGatewayConstruct(jwtStack, 'GW', {
+      config: createMockConfig({ gateway: { inboundAuth: 'jwt' } }),
+      ...mockCognitoRefs(jwtStack),
+    });
+    jwtTemplate = Template.fromStack(jwtStack);
   });
 
   it('gateway uses MCP protocol', () => {
@@ -259,10 +321,70 @@ describe('AgentCoreGatewayConstruct — detailed', () => {
     });
   });
 
-  it('gateway uses AWS_IAM authorizer', () => {
+  it('gateway uses AWS_IAM authorizer by default', () => {
+    // The authorizer is immutable after Gateway creation (AgentCore rejects an
+    // authorizerType change on an existing Gateway), so the default must match
+    // what is already deployed everywhere: AWS_IAM. Defaulting to CUSTOM_JWT
+    // would break PlatformStack on every existing deployment.
     t.hasResourceProperties('AWS::BedrockAgentCore::Gateway', {
       AuthorizerType: 'AWS_IAM',
     });
+    const gw = Object.values(
+      t.findResources('AWS::BedrockAgentCore::Gateway'),
+    )[0] as any;
+    expect(gw.Properties.AuthorizerConfiguration).toBeUndefined();
+  });
+
+  it('gateway uses CUSTOM_JWT when inboundAuth is jwt', () => {
+    jwtTemplate.hasResourceProperties('AWS::BedrockAgentCore::Gateway', {
+      AuthorizerType: 'CUSTOM_JWT',
+    });
+  });
+
+  it('JWT authorizer validates client_id, not audience', () => {
+    // Cognito *access* tokens carry `client_id` and no `aud` claim, so
+    // AllowedAudience could never match and would 401 every call.
+    jwtTemplate.hasResourceProperties('AWS::BedrockAgentCore::Gateway', {
+      AuthorizerConfiguration: {
+        CustomJWTAuthorizer: {
+          AllowedClients: [MOCK_BFF_CLIENT_ID],
+        },
+      },
+    });
+    const gw = Object.values(
+      jwtTemplate.findResources('AWS::BedrockAgentCore::Gateway'),
+    )[0] as any;
+    expect(
+      gw.Properties.AuthorizerConfiguration.CustomJWTAuthorizer.AllowedAudience,
+    ).toBeUndefined();
+  });
+
+  it('JWT authorizer points at the Cognito OIDC discovery document', () => {
+    const gw = Object.values(
+      jwtTemplate.findResources('AWS::BedrockAgentCore::Gateway'),
+    )[0] as any;
+    expect(
+      gw.Properties.AuthorizerConfiguration.CustomJWTAuthorizer.DiscoveryUrl,
+    ).toContain('/.well-known/openid-configuration');
+  });
+
+  it('does not require Cognito refs in the default iam mode', () => {
+    // A fork that never opts into JWT must not be forced to wire Cognito.
+    const stack = testStack();
+    expect(
+      () => new AgentCoreGatewayConstruct(stack, 'GW', { config }),
+    ).not.toThrow();
+  });
+
+  it('throws when JWT auth is selected without Cognito refs', () => {
+    // Fail fast at synth rather than deploying a Gateway that 401s everything.
+    const stack = testStack();
+    expect(
+      () =>
+        new AgentCoreGatewayConstruct(stack, 'GW', {
+          config: createMockConfig({ gateway: { inboundAuth: 'jwt' } }),
+        }),
+    ).toThrow(/inboundAuth is 'jwt' but/);
   });
 
   it('gateway role has NO standing lambda:Invoke* grant (per-target only)', () => {

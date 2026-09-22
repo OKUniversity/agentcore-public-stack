@@ -8,7 +8,7 @@ import json
 import logging
 import hashlib
 import os
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Callable, Dict, Optional, List, Tuple
 
 import boto3
 
@@ -61,9 +61,26 @@ def _create_cache_key(
     freshness_hash: str,
     agent_type: Optional[str],
     skills_hash: str = "",
+    document_tools: bool = False,
+    assistant_id: Optional[str] = None,
 ) -> Tuple:
     """
     Create a cache key for agent instances.
+
+    `assistant_id` is the assistant (RAG corpus) the turn ran against. The
+    spreadsheet-analysis builders close over it, so without it in the key a
+    cached agent could answer a later turn against the wrong corpus — which
+    is why that family bypassed the cache until the key carried it. Empty
+    string when no assistant is attached, so keys for assistant-less turns are
+    byte-identical to the pre-field ones.
+
+    `document_tools` is whether the turn built the session-state-gated
+    ``document_read`` tool (the session has a readable attachment). It is not
+    in `enabled_tools`, so without this element an agent cached before the
+    first upload would be served — without the tool — to every turn after it.
+    The gate is monotonic in practice (files stay once uploaded), so the key
+    flips at most once per session, on the attach turn, when restored history
+    carries no document yet to lose.
 
     `freshness_hash` is a short digest of the enabled tools' current
     `updated_at` values (see `freshness.get_freshness_hash`). When an
@@ -95,6 +112,8 @@ def _create_cache_key(
         provider or "bedrock",
         freshness_hash,
         agent_type or "chat",
+        bool(document_tools),
+        assistant_id or "",
         skills_hash,
     )
 
@@ -104,6 +123,18 @@ def _create_cache_key(
 # This reduces initialization overhead for repeated requests
 _agent_cache: dict = {}
 _CACHE_MAX_SIZE = 100
+
+# Kill switch for caching agents that carry key-described injected tools
+# (docs/specs/agent-cache-extra-tools-bypass.md). Default ON; only the literal
+# string "false" disables it — an empty or unset value stays enabled, because
+# workflow env vars can materialize as "". Setting it to "false" restores the
+# blanket `if extra_tools` bypass exactly.
+AGENT_CACHE_INJECTED_TOOLS_ENABLED_ENV = "AGENT_CACHE_INJECTED_TOOLS_ENABLED"
+
+
+def agent_cache_injected_tools_enabled() -> bool:
+    """Whether agents carrying key-described injected tools may be cached."""
+    return os.environ.get(AGENT_CACHE_INJECTED_TOOLS_ENABLED_ENV, "").lower() != "false"
 
 
 def _is_paused_on_interrupt(agent: BaseAgent) -> bool:
@@ -116,6 +147,96 @@ def _is_paused_on_interrupt(agent: BaseAgent) -> bool:
     inner = getattr(agent, "agent", None)
     state = getattr(inner, "_interrupt_state", None)
     return bool(state is not None and getattr(state, "activated", False))
+
+
+def _adopt_session_conversation(agent: BaseAgent, session_id: str) -> None:
+    """Point a newly built agent at the conversation its session is already having.
+
+    The cache key varies with an agent's *configuration* — system prompt, tools,
+    model, skills — and that is correct: those genuinely need different ``Agent``
+    objects. The **conversation** is not configuration. One session is one
+    conversation, whichever agent happens to run a given turn.
+
+    Without this, an `@`-mention (Marketplace D11) forks the thread. The mention
+    turn misses the cache and builds a second agent, which restores history and
+    looks fine; the next plain turn reverts the key and cache-*hits* the original
+    instance, whose in-memory list still ends before the mention. ``initialize()``
+    never re-runs on a hit, so the stale list wins and the model answers "NOT IN
+    HISTORY" about a turn the user can see on screen (issue #741).
+
+    ⚠️ The list is shared **by reference, deliberately**. Copying would fix only
+    the direction that already works — the miss. The turn that goes stale is a
+    cache hit, where nothing runs at all and there is no opportunity to copy
+    anything. Aliasing is what makes the mention turn's appends visible to the
+    instance the *next* turn will hit. This holds because every site that rebinds
+    ``agent.messages`` lives inside ``TurnBasedSessionManager.initialize()``
+    (document stripping, content-block sanitizing, compaction slicing, pairing
+    repair) and so runs before we get here; after construction the list is only
+    appended to — or, for the pending-cut apply at the head of a turn, sliced
+    **in place** by slice assignment (``messages[:] = ...``), which keeps the
+    alias. A future compaction that rebinds mid-life would silently break
+    the alias — ``test_second_cache_key_for_a_session_shares_the_conversation``
+    is what catches that.
+
+    Re-restoring on a stale hit was the alternative and is worse: restored history
+    passes through the sanitizers and pairing repair while accumulated history does
+    not, so the same conversation can serialize differently depending on the path
+    that produced it — a prefix-byte change on an arbitrary turn, which is exactly
+    what the prompt-cache contract forbids. Aliasing never re-serializes anything.
+
+    Safe against concurrent turns because the single-flight session lease admits
+    one turn per session at a time. Cross-replica divergence is not our problem
+    either way — separate processes share no cache — but the length guard below
+    keeps us from *losing* history if a live instance ever trails what was
+    restored from Memory.
+    """
+    inner = getattr(agent, "agent", None)
+    if inner is None or not isinstance(getattr(inner, "messages", None), list):
+        return
+
+    live = None
+    live_wrapper = None
+    for key, cached in _agent_cache.items():
+        if key[0] != session_id:
+            continue
+        cached_inner = getattr(cached, "agent", None)
+        if isinstance(getattr(cached_inner, "messages", None), list):
+            live = cached_inner  # newest wins — dict preserves insertion order
+            live_wrapper = cached
+
+    if live is None or live.messages is inner.messages:
+        return
+
+    # A restored list longer than the live one means that instance is behind
+    # (another replica wrote to Memory). Keep the longer history rather than
+    # aliasing to a shorter one. Note the reverse comparison would be wrong:
+    # compaction legitimately makes a restored list *shorter* than the live one.
+    if len(inner.messages) > len(live.messages):
+        logger.info(
+            "Session %s: restored history (%d) is ahead of the live instance (%d); "
+            "keeping the restored list",
+            scrub_log(session_id), len(inner.messages), len(live.messages),
+        )
+        return
+
+    logger.info(
+        "Session %s: adopting the in-flight conversation (%d message(s)) for a "
+        "newly built agent",
+        scrub_log(session_id), len(live.messages),
+    )
+    inner.messages = live.messages
+
+    # The list's coordinate system travels with it. Compaction expresses its
+    # checkpoint as ``_live_offset + index into this list`` and the pending-cut
+    # apply slices the list in place at that offset, so an instance that adopts
+    # the list must adopt the offset too or it would slice at the wrong place.
+    try:
+        src_sm = getattr(live_wrapper, "session_manager", None)
+        dst_sm = getattr(agent, "session_manager", None)
+        if src_sm is not None and dst_sm is not None and hasattr(src_sm, "_live_offset"):
+            dst_sm._live_offset = src_sm._live_offset
+    except Exception:  # noqa: BLE001 - never let bookkeeping break a turn
+        logger.debug("Session %s: could not sync compaction live offset", scrub_log(session_id), exc_info=True)
 
 
 async def get_agent(
@@ -136,6 +257,11 @@ async def get_agent(
     mantle_region: Optional[str] = None,
     is_resume: bool = False,
     accessible_skill_ids: Optional[List[str]] = None,
+    extra_tools_key_described: bool = False,
+    cache_write: bool = True,
+    has_document_tools: bool = False,
+    assistant_id: Optional[str] = None,
+    build_stage_recorder: Optional[Callable[[str], None]] = None,
 ) -> BaseAgent:
     """
     Get or create agent instance with current configuration for session
@@ -159,6 +285,16 @@ async def get_agent(
         inference_params: Canonical-name -> value map for inference params.
             When provided, supersedes the legacy ``temperature``/``max_tokens``
             kwargs (the explicit dict wins on key conflicts).
+        extra_tools_key_described: Whether every tool in ``extra_tools``
+            closes over only values this cache key already carries. Callers
+            derive it with ``injected_tools_are_key_described``; the default
+            (False) keeps the historical bypass, so any caller that has not
+            reasoned about its closures gets the safe behavior.
+        cache_write: Whether this caller may *populate* the cache. Read stays
+            allowed either way. Set False by callers that build a partial
+            toolset for a session whose real turns build more — otherwise they
+            would seed the shared slot with an agent missing those tools, and
+            the next real turn would cache-hit into it.
 
     Returns:
         BaseAgent subclass instance (cached or newly created)
@@ -200,9 +336,20 @@ async def get_agent(
         freshness_hash=freshness_hash,
         agent_type=agent_type,
         skills_hash=skills_hash,
+        document_tools=has_document_tools,
+        assistant_id=assistant_id,
     )
 
-    if not extra_tools and cache_key in _agent_cache:
+    # Whether this turn's injected tools (if any) let it use the cache at all.
+    # `extra_tools` used to veto the cache outright, standing in for "this agent
+    # captured something the key doesn't describe". True for two families; for
+    # the rest it cost 76% of sessions a full `initialize()` + AgentCore Memory
+    # restore on every turn (docs/specs/agent-cache-extra-tools-bypass.md).
+    cacheable = not extra_tools or (
+        extra_tools_key_described and agent_cache_injected_tools_enabled()
+    )
+
+    if cacheable and cache_key in _agent_cache:
         cached = _agent_cache[cache_key]
         # Defense in depth: a non-resume request should never be served a
         # paused agent. If we ever desync the cache key between the original
@@ -220,10 +367,23 @@ async def get_agent(
             del _agent_cache[cache_key]
         else:
             logger.debug("✅ Agent cache hit")
+            # Experiment instrument (spec §6): "initialize() invocations per
+            # turn" should approach 1 per *session* for treated sessions, not 1
+            # per turn. A cache hit is exactly the turn that skips initialize(),
+            # so counting these against misses over the same session id measures
+            # the gate. INFO and structured, so Logs Insights can group it.
+            logger.info(
+                "agent_cache outcome=hit injected_tools=%s session=%s",
+                bool(extra_tools), scrub_log(session_id),
+            )
             return cached
 
     # Cache miss - create new agent
     logger.debug("⚠️ Agent cache miss - creating new instance")
+    logger.info(
+        "agent_cache outcome=miss injected_tools=%s cacheable=%s session=%s",
+        bool(extra_tools), cacheable, scrub_log(session_id),
+    )
 
     # Create agent via the type registry. Both "chat" and "skill" resolve to
     # ChatAgent (Skills v2 retired the SkillAgent subclass); a "skill" turn just
@@ -251,7 +411,29 @@ async def get_agent(
     # kwarg, so keep it off that path.
     if resolved_agent_type != "voice":
         create_kwargs["accessible_skill_ids"] = accessible_skill_ids
-    agent = create_agent(**create_kwargs)
+    # Decompose the build into sub-stages, same move that opened the preamble
+    # (docs/specs/turn-latency-preamble.md). A contextvar rather than a kwarg:
+    # the explicit alternative threads a parameter through a type registry and
+    # three agent classes that do not share constructor signatures, and a
+    # mis-set timing mark costs a wrong number, not wrong behaviour. See
+    # `apis/shared/observability/build_stages.py` for why that asymmetry with
+    # PR-2's explicit snapshot is deliberate.
+    from apis.shared.observability.build_stages import (
+        reset_stage_recorder,
+        set_stage_recorder,
+    )
+
+    _stage_token = set_stage_recorder(build_stage_recorder)
+    try:
+        agent = create_agent(**create_kwargs)
+    finally:
+        reset_stage_recorder(_stage_token)
+
+    # One session is one conversation, even when a turn runs under a different
+    # configuration (an `@`-mention, a different toolset). Runs before the
+    # extra_tools early return below, because an uncached agent still takes a
+    # turn in the thread and must not fork it. See #741.
+    _adopt_session_conversation(agent, session_id)
 
     # Stamp the type onto the construction snapshot so a paused turn can
     # resume on the same factory variant after cache eviction. A turn carrying
@@ -266,10 +448,24 @@ async def get_agent(
         agent._construction_snapshot["agent_type"] = resolved_agent_type
         if resolved_agent_type != "voice" and accessible_skill_ids is not None:
             agent._construction_snapshot["enabled_skills"] = list(accessible_skill_ids)
+        # The assistant is a key element (spreadsheet tools close over it), so
+        # resume must replay it verbatim or the paused agent is orphaned.
+        agent._construction_snapshot["assistant_id"] = assistant_id
 
-    # Don't cache agents with context-bound extra_tools
-    if extra_tools:
+    # Don't cache agents whose context-bound extra_tools captured anything the
+    # key doesn't describe — a cached agent holds the *old* closures, so reuse
+    # is only safe when those are provably equivalent under this key. That is
+    # the decision spec §6 asks to be explicit about: cached tools are NOT
+    # refreshed on a hit; eligibility is proven at the key instead.
+    if not cacheable:
         logger.debug("⏭️ Skipping cache for agent with extra_tools")
+        return agent
+
+    # Caller builds a partial toolset for a slot that real turns fill more
+    # completely (the MCP App dispatch paths). Reading is fine — a properly
+    # built agent is strictly better — but writing would poison the slot.
+    if not cache_write:
+        logger.debug("⏭️ Not populating cache from a partial-toolset caller")
         return agent
 
     # Add to cache with LRU eviction

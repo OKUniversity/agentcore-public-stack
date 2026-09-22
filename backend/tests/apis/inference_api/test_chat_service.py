@@ -251,3 +251,400 @@ async def test_chat_path_unaffected_by_skills_hash(mock_create_agent, mock_fresh
     assert a is a_again
     assert mock_create_agent.call_count == 1
     assert mock_create_agent.call_args.kwargs.get("accessible_skill_ids") is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #741 — conversation continuity across cache keys
+# ---------------------------------------------------------------------------
+#
+# The cache key intentionally varies with the agent's *configuration* (system
+# prompt, tools, model, skills). The conversation is not configuration: one
+# session is one conversation, whichever agent ran a given turn.
+#
+# An `@`-mention (Marketplace D11) is the first path that changes agent identity
+# mid-thread, so it is the first to violate that: the mention turn misses the
+# cache and builds a second Agent, then the next plain turn reverts the key and
+# cache-HITs the original instance, whose in-memory `agent.messages` still ends
+# before the mention. `initialize()` never re-runs on a hit, so the stale list
+# wins silently and the model answers "NOT IN HISTORY" about a turn the user can
+# see on screen. Measured on dev session e5e8b259-1780-4179-8ebe-38c57d3709a5.
+
+
+def _fake_agent_with_messages(*, system_prompt=None, restored=None) -> MagicMock:
+    """Fake whose inner Strands agent carries a `messages` list, like the real one.
+
+    ``restored`` models what ``TurnBasedSessionManager.initialize()`` loads from
+    AgentCore Memory when a *fresh* instance is built — a copy, because each real
+    instance owns its own list. That detail is the whole bug: a cache **hit**
+    skips this entirely and keeps whatever the instance last saw.
+    """
+    inner = SimpleNamespace(
+        _interrupt_state=SimpleNamespace(activated=False),
+        messages=list(restored or []),
+    )
+    wrapper = MagicMock(spec=["agent", "_construction_snapshot"])
+    wrapper.agent = inner
+    wrapper._construction_snapshot = {"system_prompt": system_prompt}
+    return wrapper
+
+
+@pytest.mark.asyncio
+async def test_second_cache_key_for_a_session_shares_the_conversation(mock_freshness_hash):
+    """Turn 3 runs under a different config; turn 4 reverts and must still see turn 3.
+
+    Models the `@`-mention round trip: plain → plain → mention → plain, where the
+    mention swaps the system prompt (any cache-key component would do). ``store``
+    stands in for AgentCore Memory: every turn flushes into it, and every *freshly
+    built* agent restores from it. That is why the mention turn sees the earlier
+    history in production — it is a cache miss, so it restores. The plain turn
+    after it is a cache **hit**, restores nothing, and is therefore stale.
+
+    The assertion is deliberately about the *conversation*, not instance identity:
+    a fix may reuse one instance, hand the message list between instances, or
+    re-restore on a stale hit, and this test should pass either way.
+    """
+    store: list[dict] = []
+
+    def _turn(agent, *messages):
+        """Run a turn: the agent appends, and the session flushes to Memory."""
+        agent.agent.messages.extend(messages)
+        store.extend(messages)
+
+    with patch.object(service, "create_agent") as mock:
+        mock.side_effect = lambda **kwargs: _fake_agent_with_messages(
+            system_prompt=kwargs.get("system_prompt"), restored=store
+        )
+
+        plain = await service.get_agent(session_id="s", user_id="u")
+        _turn(plain, {"role": "user", "t": 1}, {"role": "assistant", "t": 2})
+
+        # The mention turn: same session, different configuration → cache miss,
+        # so it restores and legitimately sees the first exchange.
+        mentioned = await service.get_agent(
+            session_id="s", user_id="u", system_prompt="You are the mentioned Agent."
+        )
+        assert len(mentioned.agent.messages) == 2, "mention turn lost the prior history"
+        _turn(mentioned, {"role": "user", "t": 3}, {"role": "assistant", "t": 4})
+
+        # The next plain turn reverts the key → cache hit on the original
+        # instance, which never saw turns 3-4.
+        plain_again = await service.get_agent(session_id="s", user_id="u")
+
+    assert len(plain_again.agent.messages) == 4, (
+        "the plain turn cache-hit a stale instance and cannot see the mention exchange"
+    )
+
+
+@pytest.mark.asyncio
+async def test_adoption_keeps_the_longer_history_when_the_live_instance_trails(
+    mock_freshness_hash,
+):
+    """A live instance behind what Memory restored must not drag the new agent back.
+
+    Separate runtime replicas share no cache, so this is not the mention case —
+    it is the guard against *losing* turns if a cached instance ever trails the
+    persisted conversation. Note the comparison only fires in this direction:
+    compaction legitimately makes a restored list shorter than the live one, so
+    "restored is shorter" is normal and must still adopt.
+    """
+    stale_live = [{"role": "user", "t": 1}]
+    restored = [{"role": "user", "t": 1}, {"role": "assistant", "t": 2}]
+
+    with patch.object(service, "create_agent") as mock:
+        mock.side_effect = lambda **kwargs: _fake_agent_with_messages(
+            system_prompt=kwargs.get("system_prompt"),
+            restored=stale_live if kwargs.get("system_prompt") is None else restored,
+        )
+        await service.get_agent(session_id="s", user_id="u")
+        ahead = await service.get_agent(
+            session_id="s", user_id="u", system_prompt="different config"
+        )
+
+    assert len(ahead.agent.messages) == 2, "adoption clobbered a longer restored history"
+
+
+@pytest.mark.asyncio
+async def test_adoption_does_not_reach_across_sessions(mock_freshness_hash):
+    """Sharing is scoped to one session id — never between two conversations."""
+    with patch.object(service, "create_agent") as mock:
+        mock.side_effect = lambda **kwargs: _fake_agent_with_messages(
+            system_prompt=kwargs.get("system_prompt")
+        )
+        a = await service.get_agent(session_id="s1", user_id="u")
+        a.agent.messages.extend([{"role": "user"}, {"role": "assistant"}])
+        b = await service.get_agent(session_id="s2", user_id="u")
+
+    assert b.agent.messages == [], "a different session adopted someone else's conversation"
+    assert a.agent.messages is not b.agent.messages
+
+
+# ============================================================
+# #834 — narrowing the `extra_tools` agent-cache bypass
+# ============================================================
+
+
+class TestInjectedToolCacheEligibility:
+    """`get_agent` used to refuse the cache for *any* per-request tool.
+
+    That predicate stands for "this agent captured something the key doesn't
+    describe" — true for spreadsheets (`assistant_id`) and Memory Spaces (the
+    resolved binding), and false for the rest, which close over only session and
+    user. Both are already key elements, so the cached closures are equivalent
+    and the bypass was pure cost: 76% of sessions paid a full `initialize()` +
+    AgentCore Memory restore every turn
+    (docs/specs/agent-cache-extra-tools-bypass.md §1–§2).
+
+    These pin the narrowed predicate, one builder at a time per that spec's §6.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_artifact_turn_now_caches_and_the_next_turn_hits(
+        self, mock_create_agent, mock_freshness_hash
+    ):
+        first = await service.get_agent(
+            session_id="s", user_id="u",
+            enabled_tools=["create_artifact"],
+            extra_tools=[object()],
+            extra_tools_key_described=True,
+        )
+        second = await service.get_agent(
+            session_id="s", user_id="u",
+            enabled_tools=["create_artifact"],
+            extra_tools=[object()],
+            extra_tools_key_described=True,
+        )
+
+        assert second is first, "the artifact turn rebuilt its agent"
+        assert mock_create_agent.call_count == 1, "initialize() ran twice for one session"
+
+    @pytest.mark.asyncio
+    async def test_a_turn_that_captured_something_unkeyed_still_bypasses(
+        self, mock_create_agent, mock_freshness_hash
+    ):
+        """Spreadsheet tools close over `assistant_id`, which is not in the key —
+        a cached agent could answer against the wrong assistant's corpus."""
+        for _ in range(2):
+            await service.get_agent(
+                session_id="s", user_id="u",
+                enabled_tools=["analyze_spreadsheet"],
+                extra_tools=[object()],
+                extra_tools_key_described=False,
+            )
+
+        assert mock_create_agent.call_count == 2, "cached an agent with unkeyed captures"
+
+    @pytest.mark.asyncio
+    async def test_callers_that_do_not_declare_get_the_old_safe_behavior(
+        self, mock_create_agent, mock_freshness_hash
+    ):
+        """The parameter defaults to False: a caller that has not reasoned about
+        its closures must not be opted in by omission."""
+        for _ in range(2):
+            await service.get_agent(
+                session_id="s", user_id="u", extra_tools=[object()]
+            )
+
+        assert mock_create_agent.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_the_kill_switch_restores_the_blanket_bypass(
+        self, mock_create_agent, mock_freshness_hash, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_CACHE_INJECTED_TOOLS_ENABLED", "false")
+        for _ in range(2):
+            await service.get_agent(
+                session_id="s", user_id="u",
+                enabled_tools=["create_artifact"],
+                extra_tools=[object()],
+                extra_tools_key_described=True,
+            )
+
+        assert mock_create_agent.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_an_empty_flag_value_stays_enabled(
+        self, mock_create_agent, mock_freshness_hash, monkeypatch
+    ):
+        # Workflow env vars can materialize as "" — that must not read as off.
+        monkeypatch.setenv("AGENT_CACHE_INJECTED_TOOLS_ENABLED", "")
+        for _ in range(2):
+            await service.get_agent(
+                session_id="s", user_id="u",
+                enabled_tools=["create_artifact"],
+                extra_tools=[object()],
+                extra_tools_key_described=True,
+            )
+
+        assert mock_create_agent.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_partial_toolset_caller_may_read_the_slot_but_never_seed_it(
+        self, mock_create_agent, mock_freshness_hash
+    ):
+        """The regression this narrowing would otherwise introduce.
+
+        The MCP App dispatch paths call `get_agent` with NO injected tools but
+        the same cache key as the session's real turns. Before the narrowing they
+        could not collide, because artifact turns never cached. Now they share a
+        slot — so if an App call seeded it first, the next real turn would
+        cache-hit an agent with no `create_artifact` and silently lose the tool
+        for the rest of the session.
+        """
+        app_call = await service.get_agent(
+            session_id="s", user_id="u",
+            enabled_tools=["create_artifact"],
+            cache_write=False,
+        )
+        real_turn = await service.get_agent(
+            session_id="s", user_id="u",
+            enabled_tools=["create_artifact"],
+            extra_tools=[object()],
+            extra_tools_key_described=True,
+        )
+
+        assert real_turn is not app_call, "a real turn inherited the App path's toolless agent"
+
+        # …and once a real turn owns the slot, the App path reuses it rather
+        # than building a throwaway.
+        assert await service.get_agent(
+            session_id="s", user_id="u",
+            enabled_tools=["create_artifact"],
+            cache_write=False,
+        ) is real_turn
+
+    @pytest.mark.asyncio
+    async def test_a_newly_cacheable_agent_still_shares_the_session_conversation(
+        self, mock_freshness_hash
+    ):
+        """#741's invariant, under more concurrent siblings.
+
+        Caching agents that never cached before means more instances alive per
+        session, so the aliasing guard gets *more* load, not less — §5 hazard 2.
+        """
+        store: list[dict] = []
+
+        with patch.object(service, "create_agent") as mock:
+            mock.side_effect = lambda **kwargs: _fake_agent_with_messages(
+                system_prompt=kwargs.get("system_prompt"), restored=store
+            )
+
+            artifact_turn = await service.get_agent(
+                session_id="s", user_id="u",
+                enabled_tools=["create_artifact"],
+                extra_tools=[object()],
+                extra_tools_key_described=True,
+            )
+            artifact_turn.agent.messages.append({"role": "user", "t": 1})
+            store.append({"role": "user", "t": 1})
+
+            # An `@`-mention: different system prompt → different slot, second
+            # live Agent for the same session.
+            mentioned = await service.get_agent(
+                session_id="s", user_id="u",
+                enabled_tools=["create_artifact"],
+                system_prompt="You are the mentioned Agent.",
+                extra_tools=[object()],
+                extra_tools_key_described=True,
+            )
+
+        assert mentioned.agent.messages, "the second live Agent forked the conversation"
+
+
+def test_adopting_the_conversation_also_adopts_the_compaction_offset(monkeypatch):
+    """The live list's coordinate system travels with it (thresholds spec §3.5).
+
+    Compaction expresses its checkpoint as ``_live_offset + index into the
+    list`` and the pending-cut apply slices the list in place at that offset,
+    so an instance that adopts another instance's list must adopt its offset.
+    """
+    live_inner = SimpleNamespace(messages=[{"role": "user", "t": 1}, {"role": "assistant", "t": 2}])
+    live_wrapper = SimpleNamespace(agent=live_inner, session_manager=SimpleNamespace(_live_offset=7))
+    monkeypatch.setattr(service, "_agent_cache", {("s", "key-a"): live_wrapper})
+
+    fresh_inner = SimpleNamespace(messages=[{"role": "user", "t": 1}])
+    fresh = SimpleNamespace(agent=fresh_inner, session_manager=SimpleNamespace(_live_offset=0))
+
+    service._adopt_session_conversation(fresh, "s")
+
+    assert fresh.agent.messages is live_inner.messages
+    assert fresh.session_manager._live_offset == 7
+
+
+def test_create_cache_key_includes_assistant_id():
+    """Spreadsheet-analysis tools close over the assistant, so two assistants
+    must not share a cache slot; no assistant hashes to a stable empty element
+    so pre-field keys are unchanged."""
+    base = dict(
+        session_id="s",
+        user_id="u",
+        enabled_tools=["analyze_spreadsheet"],
+        model_id="m",
+        inference_params={},
+        system_prompt=None,
+        caching_enabled=False,
+        provider="bedrock",
+        freshness_hash="f",
+        agent_type="chat",
+    )
+    k_a = service._create_cache_key(**base, assistant_id="asst-a")
+    k_b = service._create_cache_key(**base, assistant_id="asst-b")
+    k_none = service._create_cache_key(**base)
+    assert k_a != k_b
+    assert k_a != k_none
+    assert "asst-a" in k_a
+    assert "" in k_none and "asst-a" not in k_none
+    # skills_hash stays the trailing element (other tests index it as [-1]).
+    assert k_none[-1] == ""
+
+
+@pytest.mark.asyncio
+async def test_assistant_id_is_stamped_on_the_construction_snapshot(
+    mock_create_agent, mock_freshness_hash
+):
+    agent = await service.get_agent(
+        session_id="s1", user_id="u1", is_resume=False, assistant_id="asst-a"
+    )
+    assert agent._construction_snapshot["assistant_id"] == "asst-a"
+
+    bare = await service.get_agent(session_id="s2", user_id="u1", is_resume=False)
+    assert bare._construction_snapshot["assistant_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_resume_replays_assistant_id_onto_the_same_slot(
+    mock_create_agent, mock_freshness_hash
+):
+    """A spreadsheet turn against an assistant pauses; resume feeds the
+    snapshot's assistant_id back and must land on the paused agent. A
+    different assistant (or none) must NOT."""
+    first = await service.get_agent(
+        session_id="s1",
+        user_id="u1",
+        enabled_tools=["analyze_spreadsheet"],
+        extra_tools=[object()],
+        extra_tools_key_described=True,
+        is_resume=False,
+        assistant_id="asst-a",
+    )
+    first.agent._interrupt_state.activated = True
+    replay = first._construction_snapshot["assistant_id"]
+
+    same = await service.get_agent(
+        session_id="s1",
+        user_id="u1",
+        enabled_tools=["analyze_spreadsheet"],
+        is_resume=True,
+        assistant_id=replay,
+    )
+    assert same is first
+    assert mock_create_agent.call_count == 1
+
+    other = await service.get_agent(
+        session_id="s1",
+        user_id="u1",
+        enabled_tools=["analyze_spreadsheet"],
+        is_resume=True,
+        assistant_id="asst-b",
+    )
+    assert other is not first
+    assert mock_create_agent.call_count == 2

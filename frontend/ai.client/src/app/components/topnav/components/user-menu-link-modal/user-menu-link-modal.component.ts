@@ -3,6 +3,7 @@ import { DIALOG_DATA, DialogRef } from '@angular/cdk/dialog';
 import { MarkdownComponent } from 'ngx-markdown';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import { heroXMark } from '@ng-icons/heroicons/outline';
+import { DialogDismissDirective } from '../../../dialog/dialog-dismiss.directive';
 
 export interface UserMenuLinkModalData {
   label: string;
@@ -17,7 +18,7 @@ export interface UserMenuLinkModalData {
 @Component({
   selector: 'app-user-menu-link-modal',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MarkdownComponent, NgIcon],
+  imports: [DialogDismissDirective, MarkdownComponent, NgIcon],
   providers: [provideIcons({ heroXMark })],
   host: {
     class: 'block',
@@ -27,10 +28,11 @@ export interface UserMenuLinkModalData {
     <div
       class="dialog-backdrop fixed inset-0 bg-gray-500/75 dark:bg-gray-900/80"
       aria-hidden="true"
-      (click)="onClose()"
     ></div>
 
-    <div class="fixed inset-0 z-10 flex min-h-full items-end justify-center p-4 sm:items-center sm:p-0">
+    <div class="fixed inset-0 z-10 flex min-h-full items-end justify-center p-4 sm:items-center sm:p-0"
+      appDialogDismiss
+      (dismissed)="onClose()">
       <div
         class="dialog-panel relative w-full transform overflow-hidden rounded-lg bg-white text-left shadow-xl sm:my-8 sm:max-w-2xl dark:bg-gray-800 dark:outline dark:-outline-offset-1 dark:outline-white/10"
         role="dialog"
@@ -61,7 +63,7 @@ export interface UserMenuLinkModalData {
           <button
             type="button"
             (click)="onClose()"
-            class="rounded-md bg-white px-3 py-2 text-sm/6 font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 dark:bg-white/10 dark:text-white dark:shadow-none dark:ring-white/5 dark:hover:bg-white/20"
+            class="rounded-2xl bg-white px-3 py-2 text-sm/6 font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 dark:bg-white/10 dark:text-white dark:shadow-none dark:ring-white/5 dark:hover:bg-white/20"
           >
             Close
           </button>
@@ -70,8 +72,7 @@ export interface UserMenuLinkModalData {
     </div>
   `,
   styles: `
-    @import "tailwindcss";
-    @custom-variant dark (&:where(.dark, .dark *));
+    @reference "../../../../../styles/theme.css";
 
     .dialog-backdrop {
       animation: backdrop-fade-in 200ms ease-out;

@@ -16,6 +16,54 @@ from agents.main_agent.session.preview_session_manager import (
 
 logger = logging.getLogger(__name__)
 
+# Kill switch for async session persistence. Default ON; only the literal
+# string "false" disables it — an empty or unset value stays enabled (workflow
+# env vars can materialize as ""). See ``session_async_persistence_enabled``.
+SESSION_ASYNC_PERSISTENCE_ENABLED_ENV = "AGENTCORE_SESSION_ASYNC_PERSISTENCE_ENABLED"
+
+
+MEMORY_SUMMARY_RETRIEVAL_ENV = "MEMORY_SUMMARY_NAMESPACE_RETRIEVAL_ENABLED"
+
+
+def summary_namespace_retrieval_enabled() -> bool:
+    """Whether the current session's own summary is retrieved on every user
+    message and prepended to it. Off unless ``=true``: it re-injects a
+    conversation the model already holds, at a lookup per message. The
+    compaction path still reads summaries where they matter
+    (`TurnBasedSessionManager._retrieve_session_summaries`)."""
+    return os.environ.get(MEMORY_SUMMARY_RETRIEVAL_ENV, "").strip().lower() == "true"
+
+
+def session_async_persistence_enabled() -> bool:
+    """Whether AgentCore Memory writes are offloaded off the event loop.
+
+    ``batch_size`` is 1, so every message appended during a turn — the user
+    message, each assistant message, each tool result — fires a synchronous
+    boto3 ``create_event`` plus a ``sync_agent`` from inside the SSE stream
+    generator, blocking the asyncio event loop for the whole container.
+
+    ``async_mode`` (bedrock-agentcore 1.21.0) wraps exactly those calls in
+    ``asyncio.to_thread``. It is the same discipline the chat path already
+    applies to every other boto3 caller (artifacts, spreadsheet tools, the
+    interrupted-turn persistence in ``stream_coordinator``); session
+    persistence was the last blocking one on the hot path.
+
+    Two constraints come with it, both satisfied here:
+
+    - The agent MUST be invoked via the async path. Sync ``agent(...)`` raises
+      RuntimeError from Strands' hook registry, which refuses to dispatch
+      coroutine callbacks synchronously. Every invocation in this repo goes
+      through ``stream_async``.
+    - ``AgentInitializedEvent`` cannot be async (Strands disallows it), so
+      ``initialize()`` — session restore plus our compaction — still blocks the
+      calling thread. This flag buys per-turn writes, not cold start.
+
+    Read per call (no module-level caching) so tests and live config changes
+    behave predictably; the env read is negligible next to the boto3 work.
+    """
+    return os.environ.get(SESSION_ASYNC_PERSISTENCE_ENABLED_ENV, "").lower() != "false"
+
+
 # AgentCore Memory integration (optional, only for cloud deployment)
 try:
     from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig, RetrievalConfig
@@ -186,9 +234,20 @@ class SessionFactory:
             )
             logger.info(f"   • Facts namespace: {facts_namespace}")
 
-        if summary_id:
+        if summary_id and summary_namespace_retrieval_enabled():
             # Session summaries (condensed conversation context for the current session)
-            # Note: Summary namespace includes sessionId since summaries are per-session
+            # Note: Summary namespace includes sessionId since summaries are per-session.
+            #
+            # Off by default. This namespace holds AgentCore's summary of THIS
+            # session, and the SDK retrieves it on every user message and
+            # prepends it to that message — a second copy of a conversation
+            # the model already has in context, paid as input tokens on every
+            # turn, plus one RetrieveMemoryRecords call per message against a
+            # 30/s account quota. The summary is genuinely useful once the
+            # conversation has been compacted, and that path reads it directly
+            # (`_retrieve_session_summaries` at checkpoint advance), so nothing
+            # is lost by not retrieving it per message. See
+            # docs/specs/load-test-assessment-2026-09.md P2-F.
             summary_namespace = f"/strategies/{summary_id}/actors/{{actorId}}/sessions/{{sessionId}}"
             retrieval_config[summary_namespace] = RetrievalConfig(
                 top_k=top_k,
@@ -202,12 +261,15 @@ class SessionFactory:
             logger.warning("⚠️ No memory strategies found - long-term memory retrieval disabled")
 
         # Configure AgentCore Memory with dynamically discovered namespaces
+        async_persistence = session_async_persistence_enabled()
+
         agentcore_memory_config = AgentCoreMemoryConfig(
             memory_id=memory_id,
             session_id=session_id,
             actor_id=user_id,
             enable_prompt_caching=caching_enabled,
-            retrieval_config=retrieval_config
+            retrieval_config=retrieval_config,
+            async_mode=async_persistence,
         )
 
         # Build compaction config
@@ -236,6 +298,7 @@ class SessionFactory:
             logger.info("   • Compaction: Enabled (threshold=%s)", f"{compaction_config.token_threshold:,}")
         else:
             logger.info("   • Compaction: Disabled")
+        logger.info("   • Persistence: %s", "Async (off the event loop)" if async_persistence else "Sync (blocking)")
 
         return session_manager
 

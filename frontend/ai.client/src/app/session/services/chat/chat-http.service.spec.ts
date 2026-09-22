@@ -29,9 +29,9 @@ describe('ChatHttpService', () => {
         // and lets cookie auth ride along with the request rather than
         // attaching a Bearer manually.
         { provide: BffSessionService, useValue: { csrfHeaders: vi.fn().mockReturnValue({}), handleUnauthorized: vi.fn() } },
-        { provide: SessionService, useValue: { currentSession: signal({ sessionId: 's1' }), updateSessionTitleInCache: vi.fn(), getSessionMetadata: vi.fn().mockResolvedValue({}) } },
+        { provide: SessionService, useValue: { currentSession: signal({ sessionId: 's1' }), updateSessionTitleInCache: vi.fn(), getSessionMetadata: vi.fn().mockResolvedValue({}), isNewSession: vi.fn().mockReturnValue(false) } },
         { provide: StreamParserService, useValue: { getCurrentStreamId: vi.fn().mockReturnValue('stream-1'), parseEventSourceMessage: vi.fn() } },
-        { provide: ChatStateService, useValue: { abortRequest: vi.fn(), setChatLoading: vi.fn(), setLastTurnInterrupted: vi.fn(), seedSessionAggregates: vi.fn(), createAbortController: vi.fn().mockReturnValue(new AbortController()) } },
+        { provide: ChatStateService, useValue: { abortRequest: vi.fn(), setChatLoading: vi.fn(), setLastTurnInterrupted: vi.fn(), seedSessionAggregates: vi.fn(), createAbortController: vi.fn().mockReturnValue(new AbortController()), releaseAbortController: vi.fn(), streamingSessionIds: vi.fn().mockReturnValue([]) } },
         { provide: MessageMapService, useValue: { endStreaming: vi.fn() } },
         { provide: ErrorService, useValue: { handleHttpError: vi.fn(), addError: vi.fn() } },
       ],
@@ -145,6 +145,28 @@ describe('ChatHttpService', () => {
     vi.restoreAllMocks();
   });
 
+  it('releases the session controller when a stream finishes normally', async () => {
+    // Without this the controller outlives its stream for the life of the
+    // tab, so `streamingSessionIds()` keeps reporting a finished turn and the
+    // next page-hide attributes it to `navigated_away` — a "Response
+    // interrupted" chip on a complete answer.
+    const controller = new AbortController();
+    chatStateService.createAbortController.mockReturnValue(controller);
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('event: done\ndata: {}\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    );
+
+    await service.sendChatRequest({ session_id: 's1', message: 'hi' });
+
+    expect(chatStateService.releaseAbortController).toHaveBeenCalledWith('s1', controller);
+    // Released, not aborted — the turn completed on its own.
+    expect(controller.signal.aborted).toBe(false);
+    vi.restoreAllMocks();
+  });
+
   it('surfaces a soft "Already responding" notice (not a hard error) on a 409 single-flight rejection', async () => {
     // The inference-api single-flight guard rejects a duplicate turn while the
     // prior one is still streaming server-side; the BFF relays it as 409.
@@ -188,5 +210,68 @@ describe('ChatHttpService', () => {
     const [, message] = errorSvc.addError.mock.calls[0];
     expect(message).toBe('This conversation is busy generating a response.');
     vi.restoreAllMocks();
+  });
+
+  describe('page-departure attribution', () => {
+    // A refresh / tab close / navigation is the one interruption cause only
+    // the browser witnesses. Unattested it lands server-side as
+    // `connection_lost` — indistinguishable from a dropped socket or a
+    // platform-side idle timeout — which is what made the remaining drops
+    // undiagnosable in the first place.
+
+    interface InterruptCall {
+      url: string;
+      body: { reason: string };
+      keepalive: boolean | undefined;
+    }
+
+    function interruptCalls(fetchSpy: any): InterruptCall[] {
+      return fetchSpy.mock.calls
+        .filter(([url]: [string]) => String(url).includes('/interrupt'))
+        .map(([url, init]: [string, RequestInit]) => ({
+          url: String(url),
+          body: JSON.parse(String(init.body)),
+          keepalive: init.keepalive,
+        }));
+    }
+
+    it('signals navigated_away for each streaming session on pagehide', () => {
+      chatStateService.streamingSessionIds.mockReturnValue(['s1', 's2']);
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+
+      window.dispatchEvent(new Event('pagehide'));
+
+      const calls = interruptCalls(fetchSpy);
+      expect(calls).toHaveLength(2);
+      expect(calls.map((c: InterruptCall) => c.body.reason)).toEqual(['navigated_away', 'navigated_away']);
+      expect(calls[0].url).toContain('/sessions/s1/interrupt');
+      expect(calls[1].url).toContain('/sessions/s2/interrupt');
+      // `keepalive` is what lets the request outlive the page being torn down.
+      expect(calls.every((c: InterruptCall) => c.keepalive)).toBe(true);
+      vi.restoreAllMocks();
+    });
+
+    it('signals nothing when no turn is in flight', () => {
+      chatStateService.streamingSessionIds.mockReturnValue([]);
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+
+      window.dispatchEvent(new Event('pagehide'));
+
+      expect(interruptCalls(fetchSpy)).toHaveLength(0);
+      vi.restoreAllMocks();
+    });
+
+    it('does not abort the stream — attribution must not intervene', () => {
+      // Aborting on page-hide would kill turns for a bfcache navigation the
+      // user may come back from, and the server turn is meant to keep running
+      // so a reload can offer to continue it.
+      chatStateService.streamingSessionIds.mockReturnValue(['s1']);
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+
+      window.dispatchEvent(new Event('pagehide'));
+
+      expect(chatStateService.abortRequest).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    });
   });
 });

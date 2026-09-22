@@ -3,6 +3,8 @@ import { Router, ActivatedRoute } from '@angular/router';
 import { FormBuilder, FormGroup, FormControl, Validators, ReactiveFormsModule } from '@angular/forms';
 import { QuotaStateService } from '../../services/quota-state.service';
 import { QuotaOverrideCreate, OverrideType } from '../../models/quota.models';
+import { parseIso } from '../../../../utils/date';
+import { SpinnerComponent } from '../../../../components/spinner/spinner.component';
 
 interface OverrideFormGroup {
   userId: FormControl<string>;
@@ -17,7 +19,7 @@ interface OverrideFormGroup {
 
 @Component({
   selector: 'app-override-detail',
-  imports: [ReactiveFormsModule],
+  imports: [ReactiveFormsModule, SpinnerComponent],
   templateUrl: './override-detail.component.html',
   styleUrl: './override-detail.component.css',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -63,7 +65,7 @@ export class OverrideDetailComponent implements OnInit {
     } else {
       // Set default dates (now to 30 days from now)
       const now = new Date();
-      const future = new Date(now);
+      const future = parseIso(now);
       future.setDate(future.getDate() + 30);
 
       // Check for userId query parameter
@@ -118,7 +120,7 @@ export class OverrideDetailComponent implements OnInit {
    * Convert datetime-local input to ISO string
    */
   private dateInputToISO(dateInput: string): string {
-    return new Date(dateInput).toISOString();
+    return parseIso(dateInput).toISOString();
   }
 
   /**
@@ -136,8 +138,8 @@ export class OverrideDetailComponent implements OnInit {
       }
 
       // Convert ISO dates to datetime-local format
-      const validFrom = this.formatDateForInput(new Date(override.validFrom));
-      const validUntil = this.formatDateForInput(new Date(override.validUntil));
+      const validFrom = this.formatDateForInput(parseIso(override.validFrom));
+      const validUntil = this.formatDateForInput(parseIso(override.validUntil));
 
       // Populate form
       this.overrideForm.patchValue({

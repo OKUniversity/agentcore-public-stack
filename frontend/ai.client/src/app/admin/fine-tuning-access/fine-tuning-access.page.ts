@@ -12,10 +12,12 @@ import {
 } from '@ng-icons/heroicons/outline';
 import { TooltipDirective } from '../../components/tooltip/tooltip.directive';
 import { FineTuningAdminStateService } from './services/fine-tuning-admin-state.service';
+import { parseIso } from '../../utils/date';
+import { SpinnerComponent } from '../../components/spinner/spinner.component';
 
 @Component({
   selector: 'app-fine-tuning-access-page',
-  imports: [FormsModule, NgIcon, TooltipDirective],
+  imports: [FormsModule, NgIcon, TooltipDirective, SpinnerComponent],
   providers: [
     provideIcons({
       heroArrowLeft,
@@ -89,7 +91,7 @@ export class FineTuningAccessPage implements OnInit {
   }
 
   formatDate(iso: string): string {
-    const d = new Date(iso);
+    const d = parseIso(iso);
     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
   }
 
@@ -99,8 +101,8 @@ export class FineTuningAccessPage implements OnInit {
 
   usageBarColor(usage: number, quota: number): string {
     const pct = this.usagePercent(usage, quota);
-    if (pct >= 90) return 'bg-red-500';
-    if (pct >= 70) return 'bg-amber-500';
-    return 'bg-blue-500';
+    if (pct >= 90) return 'bg-state-danger-500';
+    if (pct >= 70) return 'bg-state-warning-500';
+    return 'bg-state-info-500';
   }
 }

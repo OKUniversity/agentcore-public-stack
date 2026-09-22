@@ -15,6 +15,11 @@ from agents.main_agent.session.hooks.prefix_fingerprint import (
     get_prefix_fingerprint,
     reset_prefix_fingerprints,
 )
+from agents.main_agent.session.hooks.context_attribution import get_prefix_token_split
+from apis.shared.feature_flags import (
+    agent_status_live_drain_enabled,
+    cost_diagnostics_enabled,
+)
 from apis.shared.errors import (
     ConversationalErrorEvent,
     ErrorCode,
@@ -25,6 +30,28 @@ from apis.shared.errors import (
 from .stream_processor import process_agent_stream
 
 logger = logging.getLogger(__name__)
+
+# How long the status merge waits on the agent stream before looking at the
+# hook again. Small enough that "Running list_assignments" lands while that
+# tool is actually running; large enough that a silent stretch costs a handful
+# of wakeups a second and nothing else.
+_STATUS_POLL_SECONDS = 0.1
+
+
+class _StatusFrame:
+    """A ready-to-emit ``agent_status`` SSE travelling with the agent's events.
+
+    The merge yields these alongside the processed agent events so the
+    coordinator keeps ONE loop over ONE stream. A class rather than a tagged
+    dict because the loop body reads `event.get("type")` on everything else —
+    a dict would have to be excluded by a value check, and a frame whose text
+    happened to look like an event type would be a very unpleasant bug.
+    """
+
+    __slots__ = ("sse",)
+
+    def __init__(self, sse: str) -> None:
+        self.sse = sse
 
 
 class _CooperativeStopSignal(Exception):
@@ -37,6 +64,165 @@ class _CooperativeStopSignal(Exception):
     connected, and so the generic ``except Exception`` error arm can't mistake
     a deliberate stop for a failure.
     """
+
+
+def reset_cancellation_state(agent: Any, session_manager: Any) -> None:
+    """Clear any cancellation armed by a PREVIOUS turn on this agent.
+
+    Both cancellation flags live on objects the agent cache reuses across
+    turns (#741/#751): ``session_manager.cancelled`` is set by
+    ``_mark_session_cancelled`` and never reset, and Strands' ``_cancel_signal``
+    is normally cleared by ``stream_async``'s own ``finally`` — but only if an
+    invocation was actually running when ``cancel()`` landed. The lease
+    heartbeat can observe a cancel just as a turn finishes, which sets the
+    signal with no invocation left to clear it.
+
+    Left sticky, either flag silently breaks every later turn in the session:
+    ``StopHook`` cancels each tool at its boundary, ``append_message`` drops
+    each message, and the in-loop check below raises ``_CooperativeStopSignal``
+    on the first event. Reset at the head of the turn — the same per-turn
+    discipline ``reset_prefix_fingerprints`` follows, and for the same reason.
+
+    ``_cancel_signal`` is private to Strands; there is no public un-cancel, so
+    the access is guarded and a differently-shaped agent is a no-op.
+    """
+    if session_manager is not None and getattr(session_manager, "cancelled", False):
+        logger.info("Clearing a stale cancel flag left by a previous turn")
+        session_manager.cancelled = False
+
+    cancel_signal = getattr(agent, "_cancel_signal", None)
+    if cancel_signal is not None and cancel_signal.is_set():
+        logger.info("Clearing a stale Strands cancel signal left by a previous turn")
+        cancel_signal.clear()
+
+
+def _is_interrupt_resume_prompt(prompt: Any) -> bool:
+    """True when `prompt` is Strands' resume payload for a paused turn.
+
+    Mirrors ``strands.interrupt.InterruptState.resume``'s own acceptance test
+    — a list whose every content block carries nothing but ``interruptResponse``
+    — so we can never disagree with it about what counts as a resume.
+
+    One deliberate difference: an EMPTY list is not a resume here. Strands
+    tolerates it (``all()`` over nothing is True), but in this codebase ``[]``
+    is the max_tokens "Continue" prompt (``chat_agent.py``), and ``if
+    interrupt_responses:`` means a real resume always carries at least one
+    entry. Treating ``[]`` as a resume would leave a stale pause armed on a
+    continuation.
+    """
+    if not isinstance(prompt, list) or not prompt:
+        return False
+    return all(
+        isinstance(content, dict)
+        and content
+        and all(key == "interruptResponse" for key in content)
+        for content in prompt
+    )
+
+
+def _message_has_tool_use(message: Any) -> bool:
+    if not isinstance(message, dict):
+        return False
+    return any(
+        isinstance(block, dict) and "toolUse" in block
+        for block in (message.get("content") or [])
+    )
+
+
+def _drop_abandoned_turn_tail(messages: List[Dict[str, Any]]) -> int:
+    """Pop trailing messages until history ends on a completed assistant turn.
+
+    Mutates in place and returns the number dropped. In-place is mandatory:
+    the message list is **aliased** across the cached agents serving one
+    session (#741/#750, see ``_adopt_session_conversation``), and rebinding
+    mid-life silently breaks that alias.
+    """
+    dropped = 0
+    while messages:
+        last = messages[-1]
+        if (
+            isinstance(last, dict)
+            and last.get("role") == "assistant"
+            and not _message_has_tool_use(last)
+        ):
+            break
+        messages.pop()
+        dropped += 1
+    return dropped
+
+
+def reset_stale_interrupt_state(agent: Any, prompt: Any) -> None:
+    """Abandon a pause left by a PREVIOUS turn when this turn isn't a resume.
+
+    When ``OAuthConsentHook`` (or the tool-approval hook) calls
+    ``event.interrupt(...)``, Strands sets ``_interrupt_state.activated`` and
+    stops. If the user never completes consent and instead just types a new
+    message, that flag is still set on the cached agent — and
+    ``InterruptState.resume`` rejects a plain string prompt with
+    ``TypeError: prompt_type=<class 'str'> | must resume from interrupt with
+    list of interruptResponse's``. It reached the user as a non-recoverable
+    ``stream_error``: the session was stuck, because every subsequent fresh
+    turn hit the same flag.
+
+    The "a fresh turn supersedes a paused turn" policy already exists — see
+    ``clear_paused_turn`` / ``clear_interrupted_turn`` in
+    ``inference_api/chat/routes.py``. Those only clear the DynamoDB side; the
+    live object on the cached agent was missed. Same sticky-state-on-a-cached-
+    agent family as the cancel flags above.
+
+    Deactivating is not enough on its own. Strands appends the assistant
+    ``toolUse`` message to ``agent.messages`` *before* running tools
+    (``event_loop.py``), and on interrupt it returns without ever appending
+    the matching ``toolResult`` — so history ends on an unanswered tool call.
+    ``_repair_tool_pairing`` can't help here: it deliberately leaves a
+    *trailing* toolUse alone ("left for prompt-arrival handling") and doesn't
+    even count it as a violation, so at this point in the turn it no-ops. Left
+    as-is, Strands appends the new user message behind the dangling toolUse
+    and Bedrock rejects the request.
+
+    So we drop the abandoned turn back to the last completed assistant turn.
+    That clears the unanswered toolUse *and* leaves the history ending on an
+    assistant message, so the incoming user prompt keeps roles alternating.
+    Synthesizing an error ``toolResult`` instead would satisfy the pairing
+    rule but leave two consecutive user turns (the synthetic result, then the
+    real prompt), which Bedrock rejects just the same.
+
+    Dropping messages rewrites the prompt-cache prefix, so this costs a cache
+    write — on a turn the user has already abandoned, which is the right place
+    to spend it. Nothing is lost from the *conversation*: the abandoned turn
+    produced no assistant answer, and the transcript the user sees is
+    persisted separately.
+    """
+    interrupt_state = getattr(agent, "_interrupt_state", None)
+    if interrupt_state is None or not getattr(interrupt_state, "activated", False):
+        return
+
+    if _is_interrupt_resume_prompt(prompt):
+        return
+
+    logger.info(
+        "Abandoning a paused turn: this turn is not an interrupt resume "
+        "(%d pending interrupt(s))",
+        len(getattr(interrupt_state, "interrupts", None) or {}),
+    )
+
+    try:
+        interrupt_state.deactivate()
+    except Exception:
+        logger.exception("Failed to deactivate stale interrupt state")
+        return
+
+    messages = getattr(agent, "messages", None)
+    if not isinstance(messages, list) or not messages:
+        return
+
+    dropped = _drop_abandoned_turn_tail(messages)
+    if dropped:
+        logger.info(
+            "Dropped %d message(s) from the abandoned turn so the incoming "
+            "prompt lands on a valid history",
+            dropped,
+        )
 
 
 class StreamCoordinator:
@@ -61,6 +247,9 @@ class StreamCoordinator:
         main_agent_wrapper: Any = None,
         citations: Optional[List] = None,
         original_message: Optional[str] = None,
+        turn_agent_id: Optional[str] = None,
+        turn_lease: Any = None,
+        turn_started_at: Optional[float] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Stream agent responses with proper lifecycle management
@@ -77,6 +266,17 @@ class StreamCoordinator:
             main_agent_wrapper: MainAgent wrapper instance (has model_config, enabled_tools, etc.)
             citations: Optional list of citation dicts from RAG retrieval to persist with metadata
             original_message: Original user message before RAG augmentation (for clean UI display)
+            turn_agent_id: Which Agent ran this turn (#756), recorded on each cost row so a
+                deliberate `@`-mention prefix swap is distinguishable from the
+                nondeterministic-ordering regression the fingerprints exist to catch.
+                Passed per turn rather than read off the agent: the agent instance is cached
+                and shared across turns, so per-turn state must never live on it (#741/#751).
+            turn_lease: This turn's single-flight ``SessionLease``, which doubles as the
+                mid-turn steering inbox. Stamped onto the session manager for the life of
+                the turn so ``SteeringHook`` can read it at each tool boundary — and
+                stamped *unconditionally*, including to None, for the same reason
+                ``reset_cancellation_state`` exists: a lease left behind by a previous
+                turn on a cached agent would be read against a row that no longer names us.
 
         Yields:
             str: SSE formatted events
@@ -89,6 +289,49 @@ class StreamCoordinator:
         # turn's entries so entry N of this turn maps to the turn's Nth
         # model call (the agent instance is cached across turns).
         reset_prefix_fingerprints(agent)
+
+        # Same per-turn discipline: a cancel armed by a previous turn must not
+        # brick this one. See ``reset_cancellation_state``.
+        reset_cancellation_state(agent, session_manager)
+
+        # This turn's steering inbox handle. Set unconditionally (None included)
+        # so a lease from a previous turn on the cached agent can never be read
+        # against a row a later turn now owns.
+        if session_manager is not None:
+            session_manager.turn_lease = turn_lease
+
+        # Paid-when-free compaction (spec §3.5): if a cut is parked, apply it
+        # to the live list now — before the first model call — only when the
+        # prefix re-write is free (cache expired, model/agent switched) or
+        # unavoidable (hard ceiling). Runs on cached and freshly restored
+        # agents alike; the session manager decides, this just supplies the
+        # model|agent key. Best-effort: never blocks the turn.
+        if session_manager is not None and hasattr(session_manager, "apply_pending_compaction"):
+            try:
+                _model_for_key = getattr(getattr(main_agent_wrapper, "model_config", None), "model_id", None)
+                session_manager.apply_pending_compaction(
+                    agent, prefix_key=f"{_model_for_key}|{turn_agent_id or 'default'}"
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"apply_pending_compaction failed, continuing: {e}")
+
+        # Document offload (offload spec §4C, PR-4): in the same head-of-turn
+        # slot, swap unpinned large documents for their digests and stub aged
+        # document_read slices — only when the re-write is free or
+        # unavoidable, decided by the session manager on the same cache-gap
+        # facts. The incoming prompt is passed so a document the user just
+        # named stays pinned. Best-effort: never blocks the turn.
+        if session_manager is not None and hasattr(session_manager, "apply_document_offload"):
+            try:
+                session_manager.apply_document_offload(agent, prompt=prompt)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"apply_document_offload failed, continuing: {e}")
+
+        # Likewise a pause armed by a previous turn: if the user abandoned an
+        # OAuth/tool-approval consent and just typed again, the still-armed
+        # interrupt state makes Strands reject this turn's prompt outright.
+        # See ``reset_stale_interrupt_state``.
+        reset_stale_interrupt_state(agent, prompt)
 
         # Track timing for latency metrics
         stream_start_time = time.time()
@@ -126,6 +369,14 @@ class StreamCoordinator:
         ui_block_index_to_tool_use_id: Dict[int, str] = {}
         ui_partial_input_acc: Dict[str, str] = {}
 
+        # Tool-batch summary tasks in flight for this turn. Each is a Nova
+        # Micro side-channel call started when a tool batch closed; the emit
+        # loop harvests whichever have finished, and `_collect_tool_summary_
+        # events` rewrites this list in place as it drains. Per-turn only —
+        # never state that outlives the turn, so the CLAUDE.md rule about
+        # caching session state on an agent instance does not bite here.
+        tool_summary_tasks: List[Any] = []
+
         # Accumulate metadata from stream
         accumulated_metadata: Dict[str, Any] = {"usage": {}, "metrics": {}}
 
@@ -156,6 +407,22 @@ class StreamCoordinator:
         initial_message_count = self._get_initial_message_count(session_manager)
         logger.info(f"📊 Initial message count before streaming: {initial_message_count}")
 
+        # Arm the displayText write for this turn. The hook stores the user's
+        # original message on `MessageAddedEvent` — i.e. before the model
+        # call — so a turn that is stopped, dropped, or errors still has the
+        # clean text to render instead of the augmented prompt the model was
+        # sent. Armed UNCONDITIONALLY, including to None: the agent instance
+        # is cached across turns (#741/#751), so an arm left by a previous
+        # turn would otherwise fire against this one. See the end-of-turn
+        # backstop below for wrappers that carry no hook.
+        self._arm_display_text(
+            main_agent_wrapper,
+            session_id=session_id,
+            user_id=user_id,
+            message_index=initial_message_count,
+            display_text=original_message,
+        )
+
         # MCP Apps PR #5: subscribe this conversation stream to the
         # app-initiated tool-event broker so a `tools/call` proxied from an
         # embedded MCP App surfaces as a tool_use/tool_result card in the
@@ -184,8 +451,30 @@ class StreamCoordinator:
             # Get raw agent stream
             agent_stream = agent.stream_async(prompt)
 
-            # Process through new stream processor and format as SSE
-            async for event in process_agent_stream(agent_stream):
+            # Process through new stream processor and format as SSE.
+            #
+            # The status merge sits between the two so a transition recorded
+            # while the agent stream is SILENT still reaches the client — see
+            # `_merge_agent_status`. With its kill switch off this is the bare
+            # `process_agent_stream(...)` the loop has always consumed, and no
+            # `_StatusFrame` is ever produced.
+            processed_stream: AsyncGenerator[Any, None] = process_agent_stream(
+                agent_stream
+            )
+            if agent_status_live_drain_enabled():
+                processed_stream = self._merge_agent_status(
+                    processed_stream, main_agent_wrapper, session_id
+                )
+
+            async for event in processed_stream:
+                # A status transition the merge picked up mid-silence. It is
+                # already a formatted SSE frame and describes nothing the rest
+                # of this body reasons about (no message index, no metadata, no
+                # persistence), so it passes straight through.
+                if isinstance(event, _StatusFrame):
+                    yield event.sse
+                    continue
+
                 # Cooperative stop. A user Stop arms a cancel on the session's
                 # single-flight lease; the inference-api heartbeat observes it
                 # and flips ``session_manager.cancelled``. Because a client
@@ -382,6 +671,13 @@ class StreamCoordinator:
                 # interrupt flavor, so any extractor's resume path can rebuild
                 # the agent shape after a refresh / cache eviction.
                 if event.get("type") == "done":
+                    # Last chance for a summary still in flight to reach the
+                    # live view. Bounded wait; a straggler past it is left to
+                    # its own persistence and shows up on reload instead.
+                    for summary_sse in await self._collect_tool_summary_events(
+                        tool_summary_tasks, drain_all=True
+                    ):
+                        yield summary_sse
                     await self._persist_paused_turn_snapshot(
                         agent,
                         session_id=session_id,
@@ -399,6 +695,20 @@ class StreamCoordinator:
                         session_id=session_id,
                         user_id=user_id,
                     ):
+                        yield sse
+                    for sse in await self._extract_user_question_required_events(
+                        agent,
+                        session_id=session_id,
+                        user_id=user_id,
+                    ):
+                        yield sse
+                    for sse in await self._extract_browser_login_required_events(
+                        agent,
+                        session_id=session_id,
+                        user_id=user_id,
+                    ):
+                        yield sse
+                    for sse in self._extract_preflight_consent_events(user_id):
                         yield sse
 
                 # Check if this is the "done" event - send final metadata before it
@@ -429,6 +739,25 @@ class StreamCoordinator:
                         # Add end-to-end latency to metrics for consistency
                         final_metadata["metrics"]["latencyMs"] = int((stream_end_time - stream_start_time) * 1000)
 
+                        # The same number, named for what it means, so the live
+                        # stream and a reloaded conversation agree. `latencyMs`
+                        # here is the whole turn, but the PERSISTED
+                        # `endToEndLatency` prefers the provider's API-call
+                        # time — so a client reading that field would show one
+                        # number live and a smaller one after refresh.
+                        #
+                        # Measured from `turn_started_at` — the moment the
+                        # invocation reached the container — NOT from
+                        # `stream_start_time`, which is when THIS generator
+                        # began. Those diverged the moment the agent build was
+                        # deferred into the stream (PR-3): the build now runs
+                        # before `stream_response` is ever iterated, so
+                        # `stream_start_time` excludes it. Measured on dev, a
+                        # turn the user waited 7.8s for reported 2.1s.
+                        final_metadata["turnDurationMs"] = int(
+                            (stream_end_time - (turn_started_at or stream_start_time)) * 1000
+                        )
+
                         # Cost: sum the FINAL usage of each assistant message in
                         # this turn and price it. We deliberately price each
                         # message independently and sum, instead of pricing
@@ -440,6 +769,9 @@ class StreamCoordinator:
                         # persisted (one C# record per assistant message).
                         if main_agent_wrapper and hasattr(main_agent_wrapper, "model_config"):
                             model_id = main_agent_wrapper.model_config.model_id
+                            # PR-5: when the static prefix carries the 1h TTL,
+                            # its cache writes are billed at the 1h premium.
+                            long_ttl_static_tokens = self._long_ttl_static_prefix_tokens(main_agent_wrapper, agent)
                             try:
                                 turn_total = 0.0
                                 turn_input_cost = 0.0
@@ -453,6 +785,7 @@ class StreamCoordinator:
                                     msg_cost = await self._calculate_streaming_cost(
                                         model_id=model_id,
                                         usage=msg_usage,
+                                        long_ttl_static_prefix_tokens=long_ttl_static_tokens,
                                     )
                                     if msg_cost is None:
                                         continue
@@ -529,6 +862,11 @@ class StreamCoordinator:
                     # cacheReadInputTokens. Summing all three buckets
                     # below is the only correct "current context size"
                     # under caching.
+                    #
+                    # The sum is only correct because the buckets are
+                    # disjoint. OpenAI-family models report an inclusive
+                    # inputTokens and are normalized to this convention at
+                    # the model seam — apis/shared/models/usage_normalization.py.
                     if hasattr(session_manager, "update_after_turn"):
                         usage = accumulated_metadata.get("usage", {})
                         total_input_tokens = (
@@ -539,9 +877,18 @@ class StreamCoordinator:
                         if total_input_tokens > 0:
                             try:
                                 current_messages = getattr(agent, "messages", None)
+                                # Model-relative policy inputs: the catalog
+                                # window (same lookup the badge uses — the
+                                # catalog is cached) and the measured size of
+                                # the conversation portion of the prompt.
+                                # See docs/specs/compaction-model-relative-thresholds.md.
+                                turn_context_window = await self._resolve_context_window(main_agent_wrapper)
+                                history_tokens = self._history_tokens_from_breakdown(agent)
                                 compaction_result = await session_manager.update_after_turn(
                                     total_input_tokens,
                                     current_messages=current_messages,
+                                    context_window=turn_context_window,
+                                    history_tokens=history_tokens,
                                 )
                                 logger.info(f"   Compaction state updated: {total_input_tokens:,} input tokens")
                                 if compaction_result is not None:
@@ -551,6 +898,14 @@ class StreamCoordinator:
                                         "newCheckpoint": compaction_result.new_checkpoint,
                                         "summarizedTurns": compaction_result.summarized_turns,
                                         "inputTokens": compaction_result.input_tokens,
+                                        # Additive policy fields (the SPA
+                                        # validator ignores unknown keys).
+                                        "contextWindow": compaction_result.context_window,
+                                        "ceiling": compaction_result.ceiling,
+                                        "floor": compaction_result.floor,
+                                        "hardCeiling": compaction_result.hard_ceiling,
+                                        "forced": compaction_result.forced,
+                                        "retainedTokensEstimate": compaction_result.retained_tokens_estimate,
                                     }
                                     yield f"event: compaction\ndata: {json.dumps(compaction_payload)}\n\n"
                             except Exception as e:
@@ -663,6 +1018,21 @@ class StreamCoordinator:
                                 "max_tokens: failed to persist truncated_turn marker for session %s: %s",
                                 session_id, marker_err, exc_info=True,
                             )
+                        # A truncated turn is a SUCCESSFUL read of this turn's
+                        # attachments — the model consumed the documents and
+                        # then ran out of output budget. Clear the write-ahead
+                        # marker here too, or the "Continue" turn would re-send
+                        # documents that are already in the model's context.
+                        # (This branch `return`s below, so the clear on the
+                        # normal success path is never reached.)
+                        try:
+                            from apis.shared.sessions.metadata import clear_pending_attachments
+                            await clear_pending_attachments(session_id, user_id)
+                        except Exception as marker_err:
+                            logger.error(
+                                "max_tokens: failed to clear pending attachments for session %s: %s",
+                                session_id, marker_err, exc_info=True,
+                            )
                         yield "event: done\ndata: {}\n\n"
                     else:
                         # Other errors still surface as a conversational
@@ -736,6 +1106,47 @@ class StreamCoordinator:
 
                     # Skip the original error event and exit the loop - we've handled the error
                     return
+
+                # Mid-turn steering: ack any follow-up the SteeringHook
+                # injected at a tool boundary and has since confirmed in
+                # history. Drained *before* this event is yielded rather than
+                # after, so an injection confirmed on the turn's final tool
+                # batch still lands ahead of `done` — the SPA gates events on
+                # the stream state and drops anything past it. Ordering is
+                # unaffected for every other case: the frame still follows the
+                # `tool_result` events of the batch it rode.
+                # See docs/specs/mid-turn-steering.md.
+                for steering_sse in self._drain_steering_events(
+                    main_agent_wrapper, session_id
+                ):
+                    yield steering_sse
+
+                # Live narration: the status hook records model-call and
+                # tool-call boundaries from inside Strands' event loop, which
+                # has no route to the SSE stream. Drained here, before the
+                # event it precedes is yielded.
+                #
+                # With the live drain on, `_merge_agent_status` has usually
+                # taken these already and this finds nothing — it is kept
+                # because it is the ONLY drain when that kill switch is off,
+                # and because a transition recorded in the gap between the
+                # merge's last poll and this event still lands in order.
+                for status_sse in self._drain_agent_status_events(
+                    main_agent_wrapper, session_id
+                ):
+                    yield status_sse
+
+                # Tool-batch summaries: start a Nova Micro side-channel task
+                # for each batch that just closed, then harvest whichever
+                # earlier tasks have finished. Non-blocking in both
+                # directions — the agent stream never waits on Nova.
+                self._spawn_tool_summary_tasks(
+                    main_agent_wrapper, session_id, user_id, tool_summary_tasks
+                )
+                for summary_sse in await self._collect_tool_summary_events(
+                    tool_summary_tasks
+                ):
+                    yield summary_sse
 
                 # Format as SSE event and yield (including done event after metadata)
                 sse_event = self._format_sse_event(event)
@@ -893,6 +1304,14 @@ class StreamCoordinator:
             message_ids_to_store = assistant_message_ids if assistant_message_ids else ([message_id] if message_id is not None else [])
 
             if message_ids_to_store:
+                # Content-free tool census, read (not drained) per call so each
+                # cost row carries the tools that call requested. None when the
+                # wrapper has no hook (tests, older agents) or the census is off.
+                tool_census_hook = getattr(main_agent_wrapper, "tool_census_hook", None)
+                # Same discipline for the context ledger (window trims +
+                # compaction decisions per call).
+                context_ledger_hook = getattr(main_agent_wrapper, "context_ledger_hook", None)
+
                 # Build list of metadata storage tasks for parallel execution
                 metadata_tasks = []
                 for idx, msg_id in enumerate(message_ids_to_store):
@@ -943,6 +1362,29 @@ class StreamCoordinator:
                             agent=main_agent_wrapper,  # Use wrapper instead of internal agent
                             citations=citations_for_message,  # Pass citations for persistence
                             call_index=idx,  # Nth model call of this turn (prefix fingerprint lookup)
+                            # Turn-level, so only the LAST message carries it.
+                            # The per-message `endToEndLatency` cannot stand in:
+                            # it prefers the provider's own API-call time, so
+                            # summing it across a turn silently drops tool
+                            # execution and the pre-stream agent build — a turn
+                            # the user watched for 9s would read as 3s.
+                            turn_duration_ms=(
+                                int(
+                                    (stream_end_time - (turn_started_at or stream_start_time))
+                                    * 1000
+                                )
+                                if idx == len(message_ids_to_store) - 1
+                                else None
+                            ),
+                            turn_agent_id=turn_agent_id,  # Which Agent ran this turn (#756)
+                            tool_calls=(
+                                tool_census_hook.tally_for_call(idx)
+                                if tool_census_hook is not None else None
+                            ),
+                            context_ledger=(
+                                context_ledger_hook.ledger_for_call(idx)
+                                if context_ledger_hook is not None else None
+                            ),
                         )
                     )
 
@@ -961,8 +1403,13 @@ class StreamCoordinator:
 
                 logger.info(f"✅ Message metadata stored for {len(message_ids_to_store)} assistant messages (sequential)")
 
-            # Store displayText for user message if original_message differs from augmented
-            if original_message:
+            # displayText backstop. `DisplayTextHook` normally wrote this at
+            # append time, which is the write that matters — it is the only
+            # one an interrupted turn ever reaches. This runs only when that
+            # didn't happen: a wrapper with no hook (voice, tests), or a
+            # failed write. Skipped otherwise, so the normal path still makes
+            # exactly one put.
+            if original_message and not self._display_text_written(main_agent_wrapper):
                 user_message_index = initial_message_count  # User message is first in this turn
                 try:
                     from apis.shared.sessions.metadata import store_user_display_text
@@ -975,6 +1422,54 @@ class StreamCoordinator:
                     logger.info(f"💾 Stored displayText for user message {user_message_index}")
                 except Exception as e:
                     logger.error(f"Failed to store user displayText: {e}", exc_info=True)
+
+            # The turn produced an answer, so Bedrock read whatever this turn
+            # attached — drop the write-ahead marker the invocations route set
+            # before the model call. Reaching here IS the success condition:
+            # every failure arm (in-loop stream_error, cooperative stop,
+            # disconnect, coordinator exception) either `return`s above or
+            # jumps to an `except` below, leaving the marker in place so the
+            # next turn can re-send the attachments the model never saw. See
+            # `set_pending_attachments` for the full lifecycle.
+            try:
+                from apis.shared.sessions.metadata import clear_pending_attachments
+                await clear_pending_attachments(session_id, user_id)
+            except Exception as e:
+                logger.error(f"Failed to clear pending attachments: {e}", exc_info=True)
+
+            # Same reasoning, applied to the interrupted-turn marker: a turn
+            # that reached here produced a COMPLETE answer, so it was not
+            # interrupted — whatever the client signalled.
+            #
+            # WHY THE MARKER CAN BE HERE AT ALL. The client's Stop writes
+            # `lastTurnInterrupted` immediately (app-api, `source=client_signal`),
+            # but the server only observes the armed cancel on the lease
+            # heartbeat, which sleeps LEASE_HEARTBEAT_SECONDS (10s) BEFORE its
+            # first check. A turn that finishes inside that window races the
+            # first tick and wins: the stream completes normally and the
+            # cooperative-stop arm never runs, leaving a marker that describes
+            # a turn which was never actually cut short.
+            #
+            # Left in place, the NEXT turn pops it and prepends
+            # `_build_interruption_note("user_stopped")`, telling the model
+            # that its own complete reply "was the partial that was delivered"
+            # and to treat it as rejected feedback. Every clause of that is
+            # false, and it measurably steers the next answer. Observed in dev
+            # on 2026-09-02: Stop at 2.6s on a 10.4s turn, full answer
+            # persisted, and the follow-up turn logged
+            # "Cleared interrupted_turn ... (reason=user_stopped)".
+            #
+            # Narrowing the heartbeat interval does NOT fix this — any turn
+            # shorter than one tick is unstoppable no matter how the ticks are
+            # spaced, so the marker has to be reconciled against what actually
+            # happened. That is what this does. The real interruption arms
+            # below re-set it after persisting their partial, so a genuine
+            # interruption is unaffected.
+            try:
+                from apis.shared.sessions.metadata import clear_interrupted_turn
+                await clear_interrupted_turn(session_id, user_id)
+            except Exception as e:
+                logger.error(f"Failed to clear stale interrupted_turn: {e}", exc_info=True)
 
         except _CooperativeStopSignal:
             # Deliberate user Stop observed mid-stream (see the in-loop check).
@@ -1375,6 +1870,7 @@ class StreamCoordinator:
                 inference_params=dict(inference_params) if inference_params else None,
                 mantle_api_mode=snapshot_source.get("mantle_api_mode"),
                 mantle_region=snapshot_source.get("mantle_region"),
+                assistant_id=snapshot_source.get("assistant_id"),
                 captured_at=now.isoformat(),
                 expires_at=(now + timedelta(hours=1)).isoformat(),
             )
@@ -1384,6 +1880,53 @@ class StreamCoordinator:
                 "Failed to persist paused_turn snapshot for session %s: %s",
                 session_id, e, exc_info=True,
             )
+
+    def _extract_preflight_consent_events(
+        self,
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """Yield an `oauth_required` event per OAuth-gated MCP tool that was
+        dropped at agent-build time because the user hasn't consented.
+
+        These are NOT Strands interrupts — the turn ran to completion, just
+        without the tool, because an unauthorized `tools/list` meant we never
+        learned what the server exposes and so could never advertise it to
+        the model. The events therefore carry no `interruptId` and the
+        frontend must not try to resume anything; it shows the Connect
+        affordance, and the tool registers by itself on the next turn once
+        `_recover_oauth_preflight` can warm a real token from the vault.
+
+        Deliberately not persisted as a `pending_interrupt` breadcrumb: those
+        are keyed by interrupt id for the resume path, and a refresh doesn't
+        need one here — while consent is still outstanding, the next turn
+        fails pre-flight again and re-emits this event.
+        """
+        if not user_id:
+            return []
+
+        from agents.main_agent.integrations.external_mcp_client import (
+            get_external_mcp_integration,
+        )
+        from apis.shared.oauth.models import OAuthRequiredEvent
+
+        try:
+            pending = get_external_mcp_integration().take_pending_consents(user_id)
+        except Exception:
+            logger.exception("Failed to read pre-flight OAuth consents")
+            return []
+
+        events: List[str] = []
+        for provider_id, authorization_url in sorted(pending.items()):
+            logger.info(
+                "Emitting pre-flight oauth_required for provider=%s", provider_id
+            )
+            events.append(
+                OAuthRequiredEvent(
+                    provider_id=provider_id,
+                    authorization_url=authorization_url,
+                ).to_sse_format()
+            )
+        return events
 
     async def _extract_oauth_required_events(
         self,
@@ -1539,6 +2082,218 @@ class StreamCoordinator:
                     message=message,
                 ).to_sse_format()
             )
+        return events
+
+    async def _extract_user_question_required_events(
+        self,
+        agent: Any,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """Yield one SSE-formatted `user_question_required` event per pending
+        ``ask_user_question`` interrupt, persisting each one so the picker
+        rehydrates after a refresh.
+
+        Structurally identical to
+        :meth:`_extract_tool_approval_required_events` — the difference is only
+        where the interrupt came from. That one is raised by a hook before
+        someone else's tool; this one is raised by the ``ask_user_question``
+        tool itself through ``ToolContext``. Strands routes both through
+        ``_stop_for_interrupts``, so by the time we read
+        ``agent._interrupt_state`` the two are indistinguishable and the
+        ``PausedTurnSnapshot`` written on this same ``done`` event covers both.
+
+        Persistence is best-effort: a DynamoDB write failure logs but does not
+        break the live SSE flow — the user still sees the prompt, they just
+        lose it on a refresh.
+        """
+        from apis.shared.sessions.metadata import add_pending_interrupt
+        from apis.shared.sessions.models import PendingInterrupt
+        from apis.shared.user_questions.models import (
+            UserQuestion,
+            UserQuestionRequiredEvent,
+            encode_questions,
+        )
+
+        interrupt_state = getattr(agent, "_interrupt_state", None)
+        if not interrupt_state or not getattr(interrupt_state, "activated", False):
+            return []
+
+        events: List[str] = []
+        for interrupt in interrupt_state.interrupts.values():
+            reason = interrupt.reason or {}
+            if not isinstance(reason, dict) or reason.get("type") != "user_question_required":
+                continue
+
+            raw_questions = reason.get("questions") or []
+            try:
+                questions = [UserQuestion.model_validate(q) for q in raw_questions]
+            except Exception as e:  # noqa: BLE001 - never break the stream
+                logger.warning(
+                    "User-question interrupt carries unrenderable questions "
+                    "(id=%s): %s",
+                    interrupt.id, e,
+                )
+                continue
+            if not questions:
+                logger.warning(
+                    "User-question interrupt has no questions: id=%s", interrupt.id
+                )
+                continue
+
+            tool_use_id = reason.get("toolUseId", "")
+
+            # Persist the breadcrumb before yielding so a client that refreshes
+            # mid-prompt can rehydrate the picker.
+            if session_id and user_id:
+                try:
+                    await add_pending_interrupt(
+                        session_id=session_id,
+                        user_id=user_id,
+                        interrupt=PendingInterrupt(
+                            interrupt_id=interrupt.id,
+                            kind="user_question",
+                            tool_use_id=tool_use_id,
+                            tool_name="ask_user_question",
+                            questions=encode_questions(questions),
+                            created_at=datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to persist user_question pending_interrupt %s: %s",
+                        interrupt.id, e, exc_info=True,
+                    )
+
+            events.append(
+                UserQuestionRequiredEvent(
+                    interrupt_id=interrupt.id,
+                    tool_use_id=tool_use_id,
+                    questions=questions,
+                ).to_sse_format()
+            )
+        return events
+
+    async def _extract_browser_login_required_events(
+        self,
+        agent: Any,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """Yield one SSE-formatted `browser_login_required` event per pending
+        ``request_user_login`` interrupt, and project the browser session onto
+        the metadata row so app-api can mint a live view for it.
+
+        Structurally the same as
+        :meth:`_extract_user_question_required_events` — a tool-raised
+        interrupt Strands routes through ``_stop_for_interrupts``, so the
+        ``PausedTurnSnapshot`` written on this same ``done`` event covers it.
+
+        Two things are specific to this flavor:
+
+        * **The conversation id is added here, not in the tool.** The tool
+          knows only which *browser* session it handed over;
+          ``sessionId`` on the event means the conversation, as it does on
+          every other SSE event, and this is the layer that has it.
+        * **The D4 projection is written here too**, for the same reason: the
+          write is keyed by conversation and owner, which the tool does not
+          know. It is best-effort — without it the prompt still renders and
+          the turn still resumes on skip; the user just has no working viewer.
+
+        Nothing in either payload is a URL, and
+        :func:`apis.shared.browser_takeover.assert_no_url` enforces that rather
+        than trusting it.
+        """
+        from apis.shared.browser_takeover import (
+            BrowserLoginRequiredEvent,
+            BrowserSessionRef,
+            assert_no_url,
+            encode_ref,
+        )
+        from apis.shared.sessions.metadata import (
+            add_pending_interrupt,
+            set_browser_session,
+        )
+        from apis.shared.sessions.models import PendingInterrupt
+
+        interrupt_state = getattr(agent, "_interrupt_state", None)
+        if not interrupt_state or not getattr(interrupt_state, "activated", False):
+            return []
+
+        events: List[str] = []
+        for interrupt in interrupt_state.interrupts.values():
+            reason = interrupt.reason or {}
+            if not isinstance(reason, dict) or reason.get("type") != "browser_login_required":
+                continue
+
+            try:
+                ref = BrowserSessionRef.model_validate(reason)
+            except Exception as e:  # noqa: BLE001 - never break the stream
+                logger.warning(
+                    "Browser-login interrupt carries an unusable session ref "
+                    "(id=%s): %s",
+                    interrupt.id, e,
+                )
+                continue
+
+            tool_use_id = reason.get("toolUseId", "")
+            prompt_reason = reason.get("reason")
+
+            if session_id and user_id:
+                try:
+                    await set_browser_session(
+                        session_id=session_id,
+                        user_id=user_id,
+                        ref=ref.model_dump(by_alias=True, exclude_none=True),
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to project browser_session for %s: %s",
+                        session_id, e, exc_info=True,
+                    )
+
+                try:
+                    await add_pending_interrupt(
+                        session_id=session_id,
+                        user_id=user_id,
+                        interrupt=PendingInterrupt(
+                            interrupt_id=interrupt.id,
+                            kind="browser_login",
+                            tool_use_id=tool_use_id,
+                            tool_name="request_user_login",
+                            browser_session=encode_ref(ref),
+                            reason=prompt_reason,
+                            created_at=datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to persist browser_login pending_interrupt %s: %s",
+                        interrupt.id, e, exc_info=True,
+                    )
+
+            event = BrowserLoginRequiredEvent(
+                interrupt_id=interrupt.id,
+                tool_use_id=tool_use_id,
+                session_id=session_id or "",
+                browser_session_id=ref.browser_session_id,
+                browser_id=ref.browser_id,
+                viewport=ref.viewport,
+                deadline_at=ref.deadline_at,
+                target_url=ref.target_url,
+                reason=prompt_reason,
+                # Same origin MCP Apps are framed from, and for the same
+                # reasons: its CloudFront function locks `frame-ancestors` to
+                # the SPA and composes `connect-src` from `?csp=`, which is how
+                # the viewer is allowed to open DCV's WebSocket. Empty when the
+                # sandbox origin is not deployed — the SPA then shows the
+                # prompt without a viewer rather than framing nothing.
+                sandbox_origin=os.environ.get(
+                    "AGENTCORE_MCP_APPS_SANDBOX_ORIGIN", ""
+                ).strip(),
+            )
+            assert_no_url(event.model_dump(by_alias=True, exclude_none=True))
+            events.append(event.to_sse_format())
         return events
 
     async def _extract_artifact_events(
@@ -1816,6 +2571,340 @@ class StreamCoordinator:
             logger.warning("Failed to emit ui_tool_input_partial event: %s", e)
             return []
 
+    def _arm_display_text(
+        self,
+        main_agent_wrapper: Any,
+        *,
+        session_id: str,
+        user_id: str,
+        message_index: int,
+        display_text: Optional[str],
+    ) -> None:
+        """Prime this turn's ``displayText`` write on the agent's hook.
+
+        No-op for a wrapper that carries no hook (voice, tests) — those fall
+        through to the coordinator's end-of-turn backstop, which is exactly
+        the behaviour they had before the hook existed.
+        """
+        hook = getattr(main_agent_wrapper, "display_text_hook", None)
+        if hook is None:
+            return
+        try:
+            hook.arm(
+                session_id=session_id,
+                user_id=user_id,
+                message_index=message_index,
+                display_text=display_text,
+            )
+        except Exception:  # noqa: BLE001 - never break a turn on a UI nicety
+            logger.warning("Could not arm displayText hook", exc_info=True)
+
+    def _display_text_written(self, main_agent_wrapper: Any) -> bool:
+        """Whether the hook already stored this turn's ``displayText``.
+
+        False whenever we can't tell, so the backstop runs — a duplicate put
+        of an identical record is harmless, a missing one is the bug.
+        """
+        hook = getattr(main_agent_wrapper, "display_text_hook", None)
+        if hook is None:
+            return False
+        try:
+            return bool(hook.wrote_this_turn)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _drain_steering_events(
+        self, main_agent_wrapper: Any, session_id: str
+    ) -> List[str]:
+        """Emit one `steering_applied` SSE per confirmed mid-turn injection.
+
+        Drained rather than pushed because the hook runs inside Strands' event
+        loop, which has no route to the SSE stream. An entry appears here only
+        once its carrying message is in history *and* its inbox entry is
+        cleared — so the event is the client's signal that the follow-up is
+        genuinely in the conversation and its queued composer entry can be
+        dropped without risk of the text being sent twice.
+
+        Best-effort: a wrapper without a steering hook (voice, tests) and any
+        failure both yield nothing, leaving the entry queued for PR #916's
+        end-of-turn flush.
+        """
+        hook = getattr(main_agent_wrapper, "steering_hook", None)
+        if hook is None:
+            return []
+        try:
+            applied = hook.drain_applied()
+        except Exception:  # noqa: BLE001 - never break the stream on an ack
+            logger.warning("Steering ack drain failed", exc_info=True)
+            return []
+
+        events = []
+        for entry in applied:
+            payload = {
+                "type": "steering_applied",
+                "sessionId": session_id,
+                "entryId": entry.get("id"),
+                "text": entry.get("text", ""),
+            }
+            events.append(
+                f"event: steering_applied\ndata: {json.dumps(payload)}\n\n"
+            )
+        return events
+
+    async def _merge_agent_status(
+        self,
+        events: AsyncGenerator[Dict[str, Any], None],
+        main_agent_wrapper: Any,
+        session_id: str,
+    ) -> AsyncGenerator[Any, None]:
+        """Yield the agent's events, interleaved with status transitions as they happen.
+
+        WHAT THIS FIXES
+        ---------------
+        ``_drain_agent_status_events`` is called from the coordinator's emit
+        loop, which only regains control when the agent stream yields. During
+        tool execution the agent stream yields NOTHING, so a ``tool_start`` sat
+        in the hook's queue for exactly the silence it existed to explain and
+        arrived bundled with its own ``tool_end``. Measured on a three-tool
+        browse turn: the indicator read "Thinking" for all 4.5s and never named
+        a tool. The SPA worked around it by deriving the running tool from the
+        content stream instead — correct, but it leaves every OTHER phase
+        (model call, batch shape) unreachable.
+
+        HOW
+        ---
+        Race the agent stream's next event against a short timer. On a timeout,
+        drain the hook and yield whatever it recorded; on an event, drain first
+        (so a status still precedes the event it describes, exactly as before)
+        and then yield the event.
+
+        The in-flight ``__anext__`` is deliberately kept across timeouts rather
+        than re-requested: an async generator cannot have two ``__anext__``
+        calls outstanding, and re-creating it would drop events.
+
+        ON EARLY EXIT
+        -------------
+        The coordinator abandons this stream on several paths (cooperative
+        stop, max_tokens, a conversational error). Closing an async generator
+        runs the ``finally`` below, which cancels the in-flight ``__anext__``.
+        That throws ``CancelledError`` into ``process_agent_stream`` at its
+        yield point and unwinds it — the cleanup-on-cancellation path that
+        generator already documents and already took when the coordinator
+        consumed it directly.
+
+        Best-effort in both directions: with no hook (voice, tests) or a failing
+        drain this degrades to a plain pass-through of the agent stream.
+        """
+        iterator = events.__aiter__()
+        pending: Optional[asyncio.Future] = None
+        try:
+            while True:
+                if pending is None:
+                    pending = asyncio.ensure_future(iterator.__anext__())
+
+                done, _ = await asyncio.wait({pending}, timeout=_STATUS_POLL_SECONDS)
+
+                # On EVERY pass, including the ones where the agent stream
+                # produced nothing — which is the entire point of this merge.
+                for sse in self._drain_agent_status_events(
+                    main_agent_wrapper, session_id
+                ):
+                    yield _StatusFrame(sse)
+
+                if not done:
+                    continue
+
+                completed, pending = pending, None
+                try:
+                    event = completed.result()
+                except StopAsyncIteration:
+                    # A transition recorded in the same instant the stream
+                    # ended still belongs to this turn — most often the final
+                    # `tool_end` of the last batch.
+                    for sse in self._drain_agent_status_events(
+                        main_agent_wrapper, session_id
+                    ):
+                        yield _StatusFrame(sse)
+                    return
+
+                yield event
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+                try:
+                    await pending
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+                except Exception:  # noqa: BLE001 - the turn is already ending
+                    logger.debug(
+                        "Agent stream raised while cancelling the status merge",
+                        exc_info=True,
+                    )
+
+    def _drain_agent_status_events(
+        self, main_agent_wrapper: Any, session_id: str
+    ) -> List[str]:
+        """Emit one `agent_status` SSE per transition the status hook recorded.
+
+        Drained rather than pushed for the same reason as steering: the hook
+        runs inside Strands' event loop, which has no route to the SSE stream.
+        Draining on every iteration of the emit loop keeps the transitions
+        roughly interleaved with the content they describe — "thinking" lands
+        before the text it precedes, "tool_start" before that tool's result.
+
+        Best-effort: a wrapper without the hook (voice, tests) and any failure
+        both yield nothing, leaving the SPA on its cycling phrases.
+        """
+        hook = getattr(main_agent_wrapper, "agent_status_hook", None)
+        if hook is None:
+            return []
+        try:
+            statuses = hook.drain_statuses()
+        except Exception:  # noqa: BLE001 - never break the stream on narration
+            logger.warning("Agent status drain failed", exc_info=True)
+            return []
+
+        events = []
+        for status in statuses:
+            payload = {"type": "agent_status", "sessionId": session_id, **status}
+            events.append(f"event: agent_status\ndata: {json.dumps(payload)}\n\n")
+        return events
+
+    def _spawn_tool_summary_tasks(
+        self,
+        main_agent_wrapper: Any,
+        session_id: str,
+        user_id: str,
+        tasks: List[Any],
+    ) -> None:
+        """Kick off a Nova Micro summary for each tool batch that just closed.
+
+        Concurrent with the agent stream, exactly like conversation-title
+        generation: the batch is finished, so nothing downstream waits on this,
+        and the agent's next model call is already in flight while Nova runs.
+
+        Each task persists its own result before returning it, so reload
+        survival does not depend on the emit loop still being alive when the
+        summary lands — a turn that ends (or is cancelled) between the call and
+        its completion still leaves the row behind for `GET /messages`.
+        """
+        hook = getattr(main_agent_wrapper, "agent_status_hook", None)
+        if hook is None:
+            return
+        try:
+            batches = hook.drain_batches()
+        except Exception:  # noqa: BLE001
+            logger.warning("Tool batch drain failed", exc_info=True)
+            return
+        if not batches:
+            return
+
+        from apis.shared.feature_flags import tool_summaries_enabled
+
+        if not tool_summaries_enabled():
+            return
+
+        for batch in batches:
+            tasks.append(
+                asyncio.create_task(
+                    self._summarize_and_persist_batch(batch, session_id, user_id)
+                )
+            )
+
+    @staticmethod
+    async def _summarize_and_persist_batch(
+        batch: Dict[str, Any], session_id: str, user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Summarize one batch, persist it, and return the SSE payload.
+
+        Returns None whenever there is nothing worth showing — the SPA keeps
+        the deterministic formatter line it is already displaying, which is a
+        good enough answer that no failure here is worth surfacing.
+        """
+        try:
+            from apis.shared.tool_summaries import (
+                get_tool_summary_store,
+                summarize_tool_batch,
+            )
+
+            summary = await summarize_tool_batch(batch.get("calls") or [])
+            if not summary:
+                return None
+
+            batch_id = str(batch.get("batchId") or "")
+            tool_use_ids = [str(t) for t in (batch.get("toolUseIds") or [])]
+
+            # Persist before returning: the emit loop may never get to this
+            # payload (cancelled turn, dropped connection), but the row is
+            # what makes the summary survive a reload either way.
+            await asyncio.to_thread(
+                get_tool_summary_store().store,
+                user_id=user_id,
+                session_id=session_id,
+                batch_id=batch_id,
+                tool_use_ids=tool_use_ids,
+                summary=summary,
+            )
+            return {
+                "type": "tool_group_summary",
+                "sessionId": session_id,
+                "batchId": batch_id,
+                "toolUseIds": tool_use_ids,
+                "summary": summary,
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a summary is never worth an error
+            logger.debug("Tool batch summary task failed", exc_info=True)
+            return None
+
+    @staticmethod
+    async def _collect_tool_summary_events(
+        tasks: List[Any], *, drain_all: bool = False, timeout: float = 3.0
+    ) -> List[str]:
+        """Harvest finished summary tasks into `tool_group_summary` SSEs.
+
+        Non-blocking by default — only tasks that are already done are
+        collected, so the agent stream is never held up waiting on Nova.
+
+        `drain_all` is used once, just before the turn's final metadata and
+        `done`: it waits up to `timeout` for stragglers so a summary that lands
+        late still reaches the live view instead of only appearing on reload.
+        A task that misses even that window is abandoned here but NOT
+        cancelled — it has already persisted (or is about to), and the reload
+        path will show it.
+        """
+        if not tasks:
+            return []
+
+        if drain_all:
+            pending = [t for t in tasks if not t.done()]
+            if pending:
+                try:
+                    await asyncio.wait(pending, timeout=timeout)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        events: List[str] = []
+        still_running: List[Any] = []
+        for task in tasks:
+            if not task.done():
+                still_running.append(task)
+                continue
+            try:
+                payload = task.result()
+            except asyncio.CancelledError:
+                continue
+            except Exception:  # noqa: BLE001
+                logger.debug("Tool summary task raised", exc_info=True)
+                continue
+            if payload:
+                events.append(
+                    f"event: tool_group_summary\ndata: {json.dumps(payload)}\n\n"
+                )
+        tasks[:] = still_running
+        return events
+
     def _format_sse_event(self, event: Dict[str, Any]) -> str:
         """
         Format processed event as SSE (Server-Sent Event)
@@ -1836,6 +2925,46 @@ class StreamCoordinator:
             # Fallback for non-serializable objects (should never happen with new processor)
             logger.error(f"Failed to serialize event: {e}")
             return f"event: error\ndata: {json.dumps({'error': f'Serialization error: {str(e)}'})}\n\n"
+
+    @staticmethod
+    async def _resolve_context_window(main_agent_wrapper: Any) -> Optional[int]:
+        """The serving model's ``maxInputTokens`` from the catalog, or ``None``.
+
+        Feeds the model-relative compaction policy. Best-effort: a miss means
+        the policy falls back to the fixed threshold, never an error.
+        """
+        model_config = getattr(main_agent_wrapper, "model_config", None)
+        model_id = getattr(model_config, "model_id", None)
+        if not model_id:
+            return None
+        try:
+            from apis.shared.costs.pricing_config import get_model_by_model_id
+
+            record = await get_model_by_model_id(model_id)
+            value = getattr(record, "max_input_tokens", None) if record is not None else None
+            return int(value) if value else None
+        except Exception as e:  # noqa: BLE001 - never let a lookup break the turn
+            logger.debug(f"Skipping contextWindow lookup for compaction: {e}")
+            return None
+
+    @staticmethod
+    def _history_tokens_from_breakdown(agent: Any) -> Optional[int]:
+        """The ``messages`` partition of this turn's context breakdown, or ``None``.
+
+        Calibrates the compaction policy's per-message estimates against the
+        measured size of the conversation portion of the prompt.
+        """
+        try:
+            from agents.main_agent.session.hooks.context_attribution import get_context_breakdown
+
+            breakdown = get_context_breakdown(agent)
+            for partition in (breakdown or {}).get("partitions", []) or []:
+                if isinstance(partition, dict) and partition.get("key") == "messages":
+                    tokens = partition.get("tokens")
+                    return int(tokens) if tokens is not None else None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Skipping history-token calibration: {e}")
+        return None
 
     def _log_cache_metrics(self, usage: Dict[str, Any], session_id: str) -> None:
         """
@@ -2087,6 +3216,10 @@ class StreamCoordinator:
         agent: Any = None,
         citations: Optional[List] = None,
         call_index: Optional[int] = None,
+        turn_agent_id: Optional[str] = None,
+        tool_calls: Optional[Dict[str, Dict[str, int]]] = None,
+        context_ledger: Optional[Dict[str, Any]] = None,
+        turn_duration_ms: Optional[int] = None,
     ) -> None:
         """
         Store message-level metadata (token usage, latency, model info, citations)
@@ -2210,7 +3343,13 @@ class StreamCoordinator:
 
                 # Calculate cost if we have both usage and pricing
                 if token_usage and pricing_snapshot:
-                    cost_result = self._calculate_message_cost(usage=accumulated_metadata.get("usage", {}), pricing=pricing_snapshot)
+                    cost_result = self._calculate_message_cost(
+                        usage=accumulated_metadata.get("usage", {}),
+                        pricing=pricing_snapshot,
+                        long_ttl_static_prefix_tokens=self._long_ttl_static_prefix_tokens(
+                            agent, getattr(agent, "agent", None)
+                        ),
+                    )
                     if cost_result is not None:
                         cost = cost_result
 
@@ -2238,6 +3377,15 @@ class StreamCoordinator:
                 )
                 if context_window is not None:
                     metadata_kwargs["contextWindow"] = context_window
+                # PR-5 experiment arm marker (extra field via extra="allow"),
+                # so the cost anatomy can split 1h-static-prefix turns from
+                # the 5m baseline without guessing from the write:read shape.
+                try:
+                    if agent is not None and getattr(agent, "model_config", None) is not None and \
+                            getattr(agent.model_config, "long_ttl_static_prefix", lambda: False)():
+                        metadata_kwargs["staticPrefixTtl"] = "1h"
+                except Exception:  # noqa: BLE001
+                    pass
 
                 # Prompt-cache prefix fingerprints for this model call
                 # (extra field via extra="allow"; persisted on the cost row
@@ -2247,6 +3395,68 @@ class StreamCoordinator:
                     prefix_fingerprint = get_prefix_fingerprint(strands_agent, call_index)
                     if prefix_fingerprint:
                         metadata_kwargs["prefixFingerprints"] = prefix_fingerprint
+
+                # Which Agent ran this turn (#756), as another extra field. An
+                # `@`-mention swaps the Agent for one turn, which genuinely re-writes
+                # the cache prefix; recording the id is what lets the cost surfaces tell
+                # that deliberate swap apart from the nondeterministic-ordering
+                # regression the fingerprints exist to catch. Both show
+                # `toolConfigHash` and `systemPromptHash` flipping together, and nothing
+                # else on the row distinguishes them.
+                if turn_agent_id:
+                    metadata_kwargs["turnAgentId"] = turn_agent_id
+
+                # Content-free tool census for this call (tool name → calls /
+                # errors), another extra field. Read by the admin session
+                # profile to show what the user was doing; tool names are
+                # catalog ids, never content. Absent when the call requested
+                # no tools or COST_DIAGNOSTICS_ENABLED=false.
+                if tool_calls:
+                    metadata_kwargs["toolCalls"] = tool_calls
+
+                # Context ledger for this call: the conversation window's
+                # cumulative trim count (a rise between consecutive rows is a
+                # trim, i.e. a prefix re-write) and the compaction decisions
+                # taken since the previous call, each with the summary's
+                # token size. Plus the agent's stable prefix split (system /
+                # tools tokens) so "how big is the static prefix, and how much
+                # of it is tool schemas" is a stored fact. All numbers.
+                if context_ledger:
+                    removed = context_ledger.get("windowRemovedMessages")
+                    if removed is not None:
+                        metadata_kwargs["windowRemovedMessages"] = removed
+                    events = context_ledger.get("compactionEvents")
+                    if events:
+                        metadata_kwargs["compactionEvents"] = events
+                    # document_read retrievals this call requested (calls /
+                    # pages / bytes) — numbers read off the tool's own
+                    # metadata, never the document.
+                    reads = context_ledger.get("documentReads")
+                    if reads:
+                        metadata_kwargs["documentReads"] = reads
+                if strands_agent is not None and cost_diagnostics_enabled():
+                    prefix_tokens = get_prefix_token_split(strands_agent)
+                    if prefix_tokens:
+                        metadata_kwargs["prefixTokens"] = prefix_tokens
+                    # The attachment footprint of the live context: inline
+                    # documents (count, estimated tokens, format mix), digest
+                    # stand-ins, and retrieved page slices. Flat fields so a
+                    # query can split rows by hasDocuments / documentDigests
+                    # without reading the conversation
+                    # (docs/specs/document-context-offload.md §6.1).
+                    try:
+                        from agents.main_agent.session.document_context import summarize_document_context
+
+                        footprint = summarize_document_context(getattr(strands_agent, "messages", None))
+                        if footprint:
+                            metadata_kwargs.update(footprint)
+                    except Exception as doc_err:  # noqa: BLE001 - never block the cost row
+                        logger.debug(f"Skipping document context summary: {doc_err}")
+
+                # Turn-level: present only on the turn's last message, which
+                # is where the SPA anchors the end-of-turn recap.
+                if turn_duration_ms is not None:
+                    metadata_kwargs["turn_duration_ms"] = turn_duration_ms
 
                 message_metadata = MessageMetadata(**metadata_kwargs)
 
@@ -2304,6 +3514,35 @@ class StreamCoordinator:
                     return part.split(":")[0]
         return None
 
+    @staticmethod
+    def _long_ttl_static_prefix_tokens(main_agent_wrapper: Any, strands_agent: Any) -> Optional[int]:
+        """Size of the tools + system segment when it carries the 1h cache TTL, else ``None``.
+
+        PR-5 (thresholds spec §3.6): Bedrock bills a 1h cache write at 2x base,
+        not the 1.25x the catalog's cacheWritePricePerMtok carries, and usage
+        does not split writes by TTL. The context-attribution breakdown knows
+        the static segment's size, and the read count tells whether it was
+        written this call (see CostCalculator.calculate_message_cost).
+        """
+        try:
+            model_config = getattr(main_agent_wrapper, "model_config", None)
+            predicate = getattr(model_config, "long_ttl_static_prefix", None)
+            if not callable(predicate) or not predicate():
+                return None
+            from agents.main_agent.session.hooks.context_attribution import get_context_breakdown
+
+            breakdown = get_context_breakdown(strands_agent) if strands_agent is not None else None
+            if not breakdown:
+                return None
+            total = 0
+            for partition in breakdown.get("partitions", []) or []:
+                if isinstance(partition, dict) and partition.get("key") in ("system", "tools"):
+                    total += int(partition.get("tokens") or 0)
+            return total or None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"long-TTL static prefix size unavailable: {e}")
+            return None
+
     async def _get_pricing_snapshot(self, model_id: str) -> Optional[Dict[str, Any]]:
         """
         Get pricing snapshot from managed models database
@@ -2332,7 +3571,12 @@ class StreamCoordinator:
             logger.error(f"Failed to get pricing snapshot for {model_id}: {e}")
             return None
 
-    def _calculate_message_cost(self, usage: Dict[str, Any], pricing: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _calculate_message_cost(
+        self,
+        usage: Dict[str, Any],
+        pricing: Optional[Dict[str, Any]],
+        long_ttl_static_prefix_tokens: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Calculate message cost from usage and pricing
 
@@ -2355,7 +3599,9 @@ class StreamCoordinator:
             else:
                 pricing_dict = pricing
 
-            total_cost, breakdown = CostCalculator.calculate_message_cost(usage, pricing_dict)
+            total_cost, breakdown = CostCalculator.calculate_message_cost(
+                usage, pricing_dict, long_ttl_static_prefix_tokens=long_ttl_static_prefix_tokens
+            )
             return {
                 "total": total_cost,
                 "inputCost": breakdown.input_cost,
@@ -2368,7 +3614,12 @@ class StreamCoordinator:
             logger.error(f"Failed to calculate message cost: {e}")
             return None
 
-    async def _calculate_streaming_cost(self, model_id: str, usage: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def _calculate_streaming_cost(
+        self,
+        model_id: str,
+        usage: Dict[str, Any],
+        long_ttl_static_prefix_tokens: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Calculate cost for streaming response to send to client in real-time.
 
@@ -2403,7 +3654,7 @@ class StreamCoordinator:
             )
 
             # Calculate cost using the calculator
-            return self._calculate_message_cost(usage, pricing)
+            return self._calculate_message_cost(usage, pricing, long_ttl_static_prefix_tokens=long_ttl_static_prefix_tokens)
 
         except Exception as e:
             logger.warning(f"Failed to calculate streaming cost: {e}")

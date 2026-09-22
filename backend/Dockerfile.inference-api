@@ -8,6 +8,15 @@ COPY --from=ghcr.io/astral-sh/uv:0.7.12 /uv /uvx /bin/
 
 WORKDIR /app
 
+# Compile every installed package to bytecode at build time. uv skips this by
+# default, so the venv shipped with no .pyc files and every fresh AgentCore
+# micro-VM compiled the whole dependency tree (strands, boto3, sympy behind the
+# calculator tool, ...) on the first message of a new session. The runtime user
+# is non-root and each micro-VM starts from the image layer, so nothing written
+# at runtime survives to the next session — the image is the only place the
+# bytecode can live. See docs/specs/load-test-assessment-2026-09.md §1 fix 2.
+ENV UV_COMPILE_BYTECODE=1
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     gcc=4:14.2.0-1 \
@@ -48,12 +57,29 @@ COPY --from=builder /app/.venv /app/.venv
 # Copy application code
 COPY backend/src /app/src
 
-# Create necessary directories
-RUN mkdir -p /app/output /app/uploads /app/generated_images
+# Precompile our own source the same way the venv was (see UV_COMPILE_BYTECODE
+# above). `-q` keeps the layer log quiet; a syntax error still fails the build,
+# which is the right time to learn about it.
+RUN python -m compileall -q /app/src
 
-# Create non-root user for security (AgentCore Runtime best practice)
-RUN useradd -m -u 1000 -s /bin/bash bedrock_agentcore && \
-    chown -R bedrock_agentcore:bedrock_agentcore /app
+# Create non-root user for security (AgentCore Runtime best practice).
+# Note what is NOT here any more: `chown -R bedrock_agentcore /app`. A recursive
+# chown rewrites every file it touches into a fresh layer, so /app shipped
+# TWICE — on this image that is the venv plus the whole source tree, duplicated
+# for nothing. Code and dependencies now stay root-owned, which is both smaller
+# and safer: a runtime compromise cannot rewrite the source it executes or drop
+# a backdoor into site-packages.
+#
+# This is only possible because nothing writes into the source tree any more.
+# It used to: main.py resolved base_dir from __file__ (landing in /app/src/apis)
+# and os.makedirs() there on every startup, and agents/utils/config.py did the
+# same one level up to hold per-session tool output. That whole local-output
+# mechanism was dead — its writer fired only for two tool names that no longer
+# exist — and has been deleted; generated output goes to S3. There is therefore
+# no writable directory under /app at all.
+# backend/tests/architecture/test_source_tree_not_written.py is the regression
+# guard — if it fails, this image stops booting.
+RUN useradd -m -u 1000 -s /bin/bash bedrock_agentcore
 
 # Switch to non-root user
 USER bedrock_agentcore

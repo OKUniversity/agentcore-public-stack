@@ -19,10 +19,16 @@ from .models import (
     ALLOWED_EXTENSIONS,
     TABULAR_MIME_TYPES,
     TABULAR_EXTENSIONS,
+    PRESENTATION_MIME_TYPES,
+    PRESENTATION_EXTENSIONS,
+    SHEET_PREVIEW_MIME_TYPES,
+    SheetPreview,
+    SheetPreviewResponse,
     INLINE_DOCUMENT_MAX_BYTES,
     get_file_format,
     is_allowed_mime_type,
     is_tabular_file,
+    is_presentation_file,
 )
 
 from .repository import (
@@ -64,10 +70,16 @@ __all__ = [
     "ALLOWED_EXTENSIONS",
     "TABULAR_MIME_TYPES",
     "TABULAR_EXTENSIONS",
+    "PRESENTATION_MIME_TYPES",
+    "PRESENTATION_EXTENSIONS",
+    "SHEET_PREVIEW_MIME_TYPES",
+    "SheetPreview",
+    "SheetPreviewResponse",
     "INLINE_DOCUMENT_MAX_BYTES",
     "get_file_format",
     "is_allowed_mime_type",
     "is_tabular_file",
+    "is_presentation_file",
     # Repository
     "FileUploadRepository",
     "get_file_upload_repository",

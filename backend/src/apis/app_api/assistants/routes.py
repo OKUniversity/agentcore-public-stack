@@ -39,6 +39,8 @@ from apis.shared.assistants.service import (
     assistant_exists,
     create_assistant,
     create_assistant_draft,
+    AssistantListedError,
+    assert_deletable,
     delete_assistant,
     get_assistant_with_access_check,
     list_assistant_shares,
@@ -50,7 +52,8 @@ from apis.shared.assistants.service import (
     update_assistant,
     update_share_permission,
 )
-from apis.shared.assistants.rag_service import augment_prompt_with_context, search_assistant_knowledgebase_with_formatting
+from apis.shared.assistants.kb_access import granted
+from apis.shared.assistants.rag_service import augment_prompt_with_context, resolve_context_cap, search_assistant_knowledgebase_with_formatting
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +156,7 @@ async def create_assistant_endpoint(request: CreateAssistantRequest, current_use
 
         # Convert to response model (excludes owner_id for privacy)
         assistant_dict = assistant.model_dump(by_alias=True, exclude={"ownerId"})
+
         return AssistantResponse.model_validate(assistant_dict)
 
     except Exception as e:
@@ -407,6 +411,15 @@ async def delete_assistant_endpoint(assistant_id: str, current_user: User = Depe
     logger.info("DELETE /assistants/{assistant_id}")
 
     try:
+        # 0. Refuse a listed Agent BEFORE touching anything (§5.2).
+        #
+        # ⚠️ Order is load-bearing. Steps 2 and 3 below are destructive — documents
+        # soft-deleted, sync policies removed — and they run before the record delete. If
+        # the listing check fired down there instead, a refused delete would leave the Agent
+        # gutted but still in the store: exactly the failure the refusal exists to prevent,
+        # with a live listing pointing at a broken Agent.
+        await assert_deletable(assistant_id, user_id)
+
         # 1. List all documents for the assistant
         docs, _ = await list_assistant_documents(
             assistant_id=assistant_id,
@@ -441,6 +454,10 @@ async def delete_assistant_endpoint(assistant_id: str, current_user: User = Depe
 
     except HTTPException:
         raise
+    except AssistantListedError as e:
+        # 409, not 400: the request is well-formed and the caller is allowed — the Agent is
+        # simply in a state that forbids it, and the message says how to change that.
+        raise HTTPException(status_code=409, detail=e.message)
     except Exception as e:
         logger.error(f"Error deleting assistant: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to delete assistant: {str(e)}")
@@ -506,10 +523,20 @@ async def test_chat_endpoint(assistant_id: str, request: AssistantTestChatReques
         session_id = request.session_id or f"test-{uuid.uuid4().hex[:12]}"
 
         # 4. Search vector store for relevant context
-        context_chunks = await search_assistant_knowledgebase_with_formatting(assistant_id=assistant_id, query=request.message, top_k=5)
+        # The permission resolved in step 1 is handed to the facade rather than
+        # re-resolved there (Requirement 25.1): one lookup, and the grant the
+        # retrieval runs under is provably the one this route checked.
+        context_chunks = await search_assistant_knowledgebase_with_formatting(
+            assistant_id=assistant_id,
+            query=request.message,
+            top_k=5,
+            access=granted(assistant_id, user_id, permission),
+        )
 
-        # 5. Augment user message with retrieved context
-        augmented_message = augment_prompt_with_context(user_message=request.message, context_chunks=context_chunks)
+        # 5. Augment user message with retrieved context (engine-aware cap:
+        # managed 8,000, legacy 2,000 — Requirement 3.2 / HANDOFF §5.40).
+        cap = resolve_context_cap(assistant_id)
+        augmented_message = augment_prompt_with_context(user_message=request.message, context_chunks=context_chunks, max_context_length=cap)
 
         # 6. Create agent with assistant's instructions as system prompt
         agent = await get_agent(

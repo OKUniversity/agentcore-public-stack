@@ -9,10 +9,41 @@ Frozen cross-PR contract (must stay in sync with the render Lambda
   HEAD row    : PK=USER#{user_id}  SK=ARTIFACT#{aid}#HEAD
                 + GSI1PK=SESSION#{session_id}
                 + GSI1SK=ARTIFACT#{updated_at}#{aid}   (SessionIndex)
+                + GSI2PK=USER#{user_id}
+                + GSI2SK=ARTIFACT#{updated_at}#{aid}   (UserArtifactsIndex)
   S3 layout   : {user_id}/{aid}/v{n}/index.html
 
 Versions are immutable (no DeleteObject grant in inference-api) — an
 update writes a new version and re-points HEAD.
+
+Immutable, but not permanent: app-api's `ArtifactLifecycleService`
+deletes whole artifacts (every version row, the HEAD row, and every
+share of them) and retitles them. Two consequences for anything written
+here. Rows can vanish between a read and a write, so every write-back on
+an existing row — `set_produced_by_message_index` is the one today —
+must carry `attribute_exists(SK)` rather than resurrect a deleted
+artifact. And `title` is no longer writer-owned: a rename updates it on
+HEAD and on every version row, deliberately touching neither `version`
+(the optimistic lock below) nor `updated_at` (embedded in the GSI sort
+keys, which only this module maintains).
+
+GSI2PK/GSI2SK feed `UserArtifactsIndex` — GSI2PK hash, GSI2SK range,
+queried with ScanIndexForward=False for newest-first. They were stamped
+here for two weeks before that index existed, deliberately: a sparse GSI
+only ever contains rows that already carry its key attributes, so rows
+written before the attributes exist stay invisible to it forever, and
+that omission fails silently (a library page listing only artifacts
+created after the deploy, with no error anywhere). Stamping early shrank
+the manual backfill to the rows predating 2026-09-04, which
+`backend/scripts/backfill_artifact_user_index_keys.py` then stamped.
+
+**Both write paths below must keep stamping them.** A HEAD row that
+loses these attributes on its next update drops out of the index — and
+out of the owner's library — with nothing to indicate it.
+
+Stamped on HEAD rows only, deliberately: one indexed row per artifact
+rather than one per version. Both write paths below must stamp them, or
+an artifact's HEAD loses the attributes on its next update.
 
 Markdown artifacts: when `content_type` is a Markdown type, the model
 authors raw Markdown but S3 stores a self-contained HTML render wrapper
@@ -340,6 +371,8 @@ def create_artifact_record(
                 "updated_at": now,
                 "GSI1PK": f"SESSION#{session_id}",
                 "GSI1SK": f"ARTIFACT#{now}#{artifact_id}",
+                "GSI2PK": pk,
+                "GSI2SK": f"ARTIFACT#{now}#{artifact_id}",
             },
             ConditionExpression="attribute_not_exists(SK)",
         )
@@ -414,6 +447,8 @@ def update_artifact_record(
                 "updated_at": now,
                 "GSI1PK": f"SESSION#{head.get('session_id', '')}",
                 "GSI1SK": f"ARTIFACT#{now}#{artifact_id}",
+                "GSI2PK": pk,
+                "GSI2SK": f"ARTIFACT#{now}#{artifact_id}",
             },
             ConditionExpression="version = :cur",
             ExpressionAttributeValues={":cur": current},

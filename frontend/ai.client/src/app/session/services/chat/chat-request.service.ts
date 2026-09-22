@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { ChatStateService } from './chat-state.service';
 import { ChatHttpService } from './chat-http.service';
 import { MessageMapService } from '../session/message-map.service';
+import { MessageFeedbackService } from '../session/message-feedback.service';
 import { SessionService } from '../session/session.service';
 import { UserService } from '../../../auth/user.service';
 import { ModelService } from '../model/model.service';
@@ -12,13 +13,32 @@ import { SkillService } from '../../../services/skill/skill.service';
 import { FileUploadService } from '../../../services/file-upload';
 import { FileAttachmentData } from '../models/message.model';
 import { OAuthConsentService } from '../../../services/oauth-consent/oauth-consent.service';
+import { SteeringService } from './steering.service';
 import {
   ToolApprovalDecision,
   ToolApprovalService,
 } from '../../../services/tool-approval/tool-approval.service';
+import {
+  UserQuestionResponse,
+  UserQuestionService,
+} from '../../../services/user-question/user-question.service';
+import {
+  BrowserLoginResponse,
+  BrowserLoginService,
+} from '../../../services/browser-login/browser-login.service';
 import { ErrorService } from '../../../services/error/error.service';
 import { SystemPromptsService } from '../../../services/system-prompts/system-prompts.service';
+import { isPreviewSession } from '../../../shared/constants/session.constants';
 import { HttpErrorResponse } from '@angular/common/http';
+
+/**
+ * How long a send will wait for the tool/skill lists before giving up and
+ * assembling the request from whatever has loaded. Long enough to cover a
+ * normal `/tools/` + `/skills/` round trip on a cold page, short enough that a
+ * hung request is a slightly stale prefix rather than a composer that appears
+ * to have swallowed the message.
+ */
+const SELECTION_SOURCE_TIMEOUT_MS = 4000;
 
 export interface ContentFile {
   fileName: string;
@@ -35,6 +55,7 @@ export class ChatRequestService implements OnDestroy {
   private chatHttpService = inject(ChatHttpService);
   private chatStateService = inject(ChatStateService);
   private messageMapService = inject(MessageMapService);
+  private messageFeedbackService = inject(MessageFeedbackService);
   private sessionService = inject(SessionService);
   private userService = inject(UserService);
   private modelService = inject(ModelService);
@@ -43,6 +64,9 @@ export class ChatRequestService implements OnDestroy {
   private fileUploadService = inject(FileUploadService);
   private oauthConsentService = inject(OAuthConsentService);
   private toolApprovalService = inject(ToolApprovalService);
+  private userQuestionService = inject(UserQuestionService);
+  private browserLoginService = inject(BrowserLoginService);
+  private steering = inject(SteeringService);
   private errorService = inject(ErrorService);
   private systemPromptsService = inject(SystemPromptsService);
   private router = inject(Router);
@@ -55,11 +79,19 @@ export class ChatRequestService implements OnDestroy {
     this.toolApprovalService.setResumeHandler((interruptId, decision, context) =>
       this.resumeFromToolApproval(interruptId, decision, context?.sessionId),
     );
+    this.userQuestionService.setResumeHandler((interruptId, response, context) =>
+      this.resumeFromUserQuestion(interruptId, response, context?.sessionId),
+    );
+    this.browserLoginService.setResumeHandler((interruptId, response, context) =>
+      this.resumeFromBrowserLogin(interruptId, response, context?.sessionId),
+    );
   }
 
   ngOnDestroy(): void {
     this.oauthConsentService.setResumeHandler(null);
     this.toolApprovalService.setResumeHandler(null);
+    this.userQuestionService.setResumeHandler(null);
+    this.browserLoginService.setResumeHandler(null);
   }
 
   async submitChatRequest(
@@ -67,6 +99,8 @@ export class ChatRequestService implements OnDestroy {
     sessionId: string | null,
     fileUploadIds?: string[],
     assistantId?: string,
+    mentionAgentId?: string,
+    invokedSkillIds?: string[],
   ): Promise<void> {
     // Ensure conversation exists and get its ID
     // Update URL to reflect current conversation
@@ -110,12 +144,23 @@ export class ChatRequestService implements OnDestroy {
     const fileAttachments = this.getFileAttachments(fileUploadIds);
 
     // Create and add user message with file attachments
-    this.messageMapService.addUserMessage(sessionId, userInput, fileAttachments);
+    const userMessage = this.messageMapService.addUserMessage(sessionId, userInput, fileAttachments);
+    // If this send is the retry a down-thumb asked for, link it to the thumb
+    // (an index on the feedback row — never the text).
+    this.messageFeedbackService.consumePendingRetry(sessionId, userMessage);
 
     // Start streaming for this conversation
     this.messageMapService.startStreaming(sessionId);
 
     try {
+      // Wait for the tool/skill selections to settle before assembling the
+      // request. On the first turn of a freshly loaded page these lists may
+      // still be in flight, and a turn built from an empty list discloses no
+      // skills and no tools — then the next turn discloses the real ones and
+      // rewrites the whole cacheable prefix at the cache-write premium. See
+      // `awaitSelectionSources`.
+      await this.awaitSelectionSources();
+
       // Build and send request with file upload IDs and assistant ID.
       // Built inside the try so a synchronous failure (e.g. no model
       // selected) still clears this session's loading state.
@@ -124,6 +169,8 @@ export class ChatRequestService implements OnDestroy {
         sessionId,
         fileUploadIds,
         assistantId,
+        mentionAgentId,
+        invokedSkillIds,
       );
       await this.chatHttpService.sendChatRequest(requestObject);
     } catch (error) {
@@ -133,6 +180,102 @@ export class ChatRequestService implements OnDestroy {
       this.messageMapService.endStreaming(sessionId);
       throw error; // Re-throw to allow caller to handle
     }
+  }
+
+  /**
+   * Send one turn of an embedded preview — the agent designer's live preview,
+   * the marketplace reviewer's test drive — through the SAME path a real chat
+   * turn takes.
+   *
+   * WHY THIS EXISTS RATHER THAN A SEPARATE SERVICE:
+   * The preview used to own a parallel `PreviewChatService` that re-implemented
+   * the SSE consumer. It handled 9 of the ~27 events `processStreamEvent`
+   * dispatches, and every callback in that core is optional — so an event with
+   * no handler is a silent no-op, not an error. The ones it dropped included
+   * `tool_approval_required` and `oauth_required`, which is to say: a tool call
+   * that paused for approval was never surfaced, never answered, and therefore
+   * never dispatched. The pane showed "Thinking" while the backing service was
+   * never called at all. Two implementations of one protocol drift, and only
+   * one of them is exercised daily.
+   *
+   * So preview turns now run on `ChatHttpService` + `StreamParserService` like
+   * everything else. That is safe because the whole chat stack is keyed by
+   * session id — `getMessagesForSession`, `stateFor`, the parser's per-session
+   * state — so the `preview-` session the caller owns is already isolated from
+   * the user's real conversations. Isolation was the only thing the fork bought,
+   * and it was already there for free.
+   *
+   * What this does NOT do, and why it is not just `submitChatRequest`:
+   *  - No navigation. The preview is embedded in the editor; routing to
+   *    `/s/{id}` would throw the user out of the form they are editing.
+   *  - No session-cache registration and no conversation-mode binding. A
+   *    `preview-` session is never persisted, so it must not appear in the
+   *    sidenav or claim the home page's selected mode.
+   *  - No `setViewedSession`. The viewed-session facades drive the main
+   *    composer; pointing them at a preview id would hijack it.
+   *  - A minimal body: an Agent resolves instructions, model, tools, skills and
+   *    memory server-side from its own record, so sending the *viewer's* model
+   *    and tool selections would fight the bindings and test a shape nobody
+   *    will ever run.
+   */
+  async submitPreviewRequest(options: {
+    sessionId: string;
+    agentId: string;
+    message: string;
+    fileUploadIds?: string[];
+    /**
+     * This preview is a marketplace **reviewer** test-driving a submission.
+     *
+     * The invocation path honours it only after re-checking `admin.marketplace`
+     * against the caller's own roles: it resolves the snapshot *under review*
+     * rather than the published-or-draft rule, and bypasses the PRIVATE
+     * visibility check (a PRIVATE agent can sit in the review queue, and an
+     * ordinary read 403s on one).
+     *
+     * ⚠️ Never set from an author-facing surface. A caller without the scope is
+     * refused outright rather than downgraded, so a stray `true` is a 403.
+     */
+    reviewPreview?: boolean;
+  }): Promise<void> {
+    const { sessionId, agentId, message, fileUploadIds, reviewPreview } = options;
+
+    if (!message.trim() || !agentId) {
+      return;
+    }
+
+    this.chatStateService.setChatLoading(sessionId, true);
+
+    const fileAttachments = this.getFileAttachments(fileUploadIds);
+    const userMessage = this.messageMapService.addUserMessage(sessionId, message, fileAttachments);
+    this.messageFeedbackService.consumePendingRetry(sessionId, userMessage);
+    this.messageMapService.startStreaming(sessionId);
+
+    // NOTE: Field name is 'rag_assistant_id' to avoid collision with AWS Bedrock
+    // AgentCore Runtime's internal 'assistant_id' field handling (causes 424).
+    const requestObject: Record<string, unknown> = {
+      message,
+      session_id: sessionId,
+      rag_assistant_id: agentId,
+      // An Agent's model binding overrides this server-side anyway; sending
+      // null keeps the request honest about the client not choosing.
+      model_id: null,
+    };
+
+    if (fileUploadIds && fileUploadIds.length > 0) {
+      requestObject['file_upload_ids'] = fileUploadIds;
+    }
+
+    // Omitted rather than sent as `false`, so an ordinary preview's request
+    // carries no claim about a scope it never had.
+    if (reviewPreview) {
+      requestObject['review_preview'] = true;
+    }
+
+    // No teardown in a catch here, deliberately: `sendChatRequest` owns its
+    // stream's teardown via `finalizeStream`, and duplicating it re-introduces
+    // the supersession race that guard exists to prevent. Nothing above can
+    // throw before that point.
+    await this.chatHttpService.sendChatRequest(requestObject);
   }
 
   /**
@@ -167,6 +310,11 @@ export class ChatRequestService implements OnDestroy {
     this.chatStateService.setChatLoading(sessionId, true);
 
     try {
+      // Same gate as a normal send: a continuation must rebuild the SAME agent
+      // shape as the turn it continues, which means the same tool and skill
+      // selections.
+      await this.awaitSelectionSources();
+
       // Reuse the normal request shape so the backend rebuilds the same
       // model/tools/assistant agent, but with an empty message and the
       // continuation flag. No addUserMessage call → no user bubble. Built
@@ -202,11 +350,59 @@ export class ChatRequestService implements OnDestroy {
     });
   }
 
+  /**
+   * Wait for the tool and skill selections to be loaded before a request is
+   * assembled from them.
+   *
+   * WHY: both lists arrive asynchronously — `ToolService` fetches in its
+   * constructor, `SkillService` lazily on the first composer focus — and until
+   * they land `getEnabledToolIds()` / `getEnabledSkillIds()` answer with an
+   * empty array. That is indistinguishable from "the user turned everything
+   * off", so a message sent a second or two after page load went out with no
+   * skills and a short tool list, and the *next* message went out with the real
+   * ones. Both `toolConfig` and the system prompt changed between turn 1 and
+   * turn 2, so turn 2 missed the prompt cache entirely and re-wrote a ~15k-token
+   * prefix at the cache-write premium — for nothing the user did.
+   *
+   * The wait is bounded and never fails the send. A slow or broken `/tools/` or
+   * `/skills/` response falls back to exactly the previous behaviour (assemble
+   * from whatever is loaded) rather than holding the user's message hostage to
+   * a request that may never return. Once loaded this resolves synchronously in
+   * the microtask sense, so it costs nothing on turn 2 and after.
+   *
+   * It runs AFTER the optimistic UI work (the user's bubble, the streaming
+   * state, the route change) so nothing the user sees is delayed by it.
+   */
+  private async awaitSelectionSources(): Promise<void> {
+    const settled = Promise.all([
+      this.toolService.ensureLoaded(),
+      this.skillService.ensureLoaded(),
+    ]);
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bound = new Promise<void>(resolve => {
+      timer = setTimeout(resolve, SELECTION_SOURCE_TIMEOUT_MS);
+    });
+
+    try {
+      await Promise.race([settled.then(() => undefined), bound]);
+    } catch {
+      // `ensureLoaded` is documented not to reject; a send must not fail here
+      // even if that ever changes.
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
   private buildChatRequestObject(
     message: string,
     session_id: string,
     fileUploadIds?: string[],
     assistantId?: string,
+    mentionAgentId?: string,
+    invokedSkillIds?: string[],
   ) {
     const selectedModel = this.modelService.getSelectedModel();
 
@@ -237,9 +433,21 @@ export class ChatRequestService implements OnDestroy {
       requestObject['enabled_skills'] = enabledSkillIds;
     }
 
-    // Per-model inference param overrides set in the Settings → Advanced
-    // panel. Backend layers these on top of admin defaults and clamps to the
-    // model's bounds; locked params drop the override silently.
+    // Skills the user invoked with a `/` command in the composer. A strict subset of
+    // `enabled_skills` — the menu only offers skills that are already on — so this
+    // changes nothing about what the turn discloses and nothing about the cacheable
+    // prefix. The backend intersects it against the turn's effective set anyway (an
+    // Agent's bindings can still replace that set) and appends a one-line directive to
+    // the user message telling the model to activate the named skill.
+    if (invokedSkillIds && invokedSkillIds.length > 0) {
+      requestObject['invoked_skills'] = invokedSkillIds;
+    }
+
+    // Per-model inference param overrides, set either in the Settings →
+    // Advanced panel or from the model picker's Effort submenu (which writes
+    // the `effort` / `reasoning_effort` param through the same store).
+    // Backend layers these on top of admin defaults and clamps to the model's
+    // bounds; locked params drop the override silently.
     if (!isDefaultModel) {
       const overrides = this.modelService.getInferenceParamOverrides();
       if (Object.keys(overrides).length > 0) {
@@ -255,7 +463,20 @@ export class ChatRequestService implements OnDestroy {
     // Add assistant ID if present
     // NOTE: Field name is 'rag_assistant_id' to avoid collision with AWS Bedrock
     // AgentCore Runtime's internal 'assistant_id' field handling (causes 424 error)
-    if (assistantId) {
+    //
+    // Marketplace D11: an `@`-mention wins for this one turn and rides the SAME field,
+    // with `agent_mention` telling the backend not to treat it as a binding — it skips
+    // the "one assistant per session" validation and does not write session preferences.
+    // Sending it as a *different* field would have meant teaching every downstream step
+    // (RAG, binding resolution, memory injection, the resume snapshot) about a second
+    // way to name the agent running the turn; the flag keeps one.
+    //
+    // A mention beats the bound assistant deliberately: the user just named who they
+    // want, in the composer, for this message.
+    if (mentionAgentId) {
+      requestObject['rag_assistant_id'] = mentionAgentId;
+      requestObject['agent_mention'] = true;
+    } else if (assistantId) {
       requestObject['rag_assistant_id'] = assistantId;
     } else {
       // Forward the active conversation mode for non-assistant turns. The
@@ -321,13 +542,15 @@ export class ChatRequestService implements OnDestroy {
       })),
     };
 
+    this.attachCarriedSteering(resumeRequest, sessionId);
+
     try {
       await this.chatHttpService.sendChatRequest(resumeRequest);
       // The live parser could not attach the resumed `tool_result` to the
       // paused tool card (its `tool_use` block is in the pinned prefix, not
       // in the fresh parser). Reconcile from persisted memory so the card
       // flips from "Running…" to its completed result.
-      await this.messageMapService.reloadMessagesForSession(sessionId);
+      await this.reconcileAfterResume(sessionId);
     } catch (error) {
       this.chatStateService.setChatLoading(sessionId, false);
       this.messageMapService.endStreaming(sessionId);
@@ -380,11 +603,13 @@ export class ChatRequestService implements OnDestroy {
       ],
     };
 
+    this.attachCarriedSteering(resumeRequest, sessionId);
+
     try {
       await this.chatHttpService.sendChatRequest(resumeRequest);
       // Reconcile from persisted memory so the approved/declined tool card
       // shows its result (the live parser can't attach it — see above).
-      await this.messageMapService.reloadMessagesForSession(sessionId);
+      await this.reconcileAfterResume(sessionId);
     } catch (error) {
       this.chatStateService.setChatLoading(sessionId, false);
       this.messageMapService.endStreaming(sessionId);
@@ -397,6 +622,154 @@ export class ChatRequestService implements OnDestroy {
         return;
       }
       throw error;
+    }
+  }
+
+  /**
+   * Resume the paused agent turn after the user answers (or skips) the
+   * clarifying questions.
+   *
+   * Identical in shape to `resumeFromToolApproval`; the only difference is the
+   * response payload, which is a structured object rather than a decision
+   * string. It must never be null — the backend's `ToolContext.interrupt`
+   * only treats a non-null response as an answer, so a null would re-raise the
+   * same interrupt forever. `UserQuestionService` guarantees an object (Skip
+   * sends `{ skipped: true }`).
+   */
+  private async resumeFromUserQuestion(
+    interruptId: string,
+    response: UserQuestionResponse,
+    sessionId?: string,
+  ): Promise<void> {
+    if (!sessionId) {
+      return;
+    }
+
+    this.messageMapService.beginContinuationStreaming(sessionId);
+    this.chatStateService.setChatLoading(sessionId, true);
+
+    const resumeRequest: Record<string, unknown> = {
+      session_id: sessionId,
+      message: '',
+      interrupt_responses: [{ interruptId, response }],
+    };
+
+    this.attachCarriedSteering(resumeRequest, sessionId);
+
+    try {
+      await this.chatHttpService.sendChatRequest(resumeRequest);
+      await this.reconcileAfterResume(sessionId);
+    } catch (error) {
+      this.chatStateService.setChatLoading(sessionId, false);
+      this.messageMapService.endStreaming(sessionId);
+
+      if (this.isExpiredInterruptError(error)) {
+        this.errorService.addError(
+          'Question expired',
+          'The agent paused too long ago to resume this turn automatically. Please send your message again.',
+        );
+        return;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Resume a turn the user paused to sign in to a site the agent could not
+   * reach (`docs/specs/authenticated-web-assessment.md`).
+   *
+   * Identical in shape to {@link resumeFromUserQuestion} — same
+   * `interrupt_responses` envelope, same non-null-response requirement, since
+   * both are tool-raised Strands interrupts. The response is
+   * `{ completed: true }` or `{ skipped: true }`; `BrowserLoginService`
+   * guarantees an object, because a null would re-raise the interrupt forever.
+   *
+   * The expired case is worth its own message: unlike a stale question, a
+   * lapsed sign-in means the backend already released the browser and let the
+   * session become reapable, so "send it again" is genuinely the only way
+   * forward — there is no authenticated session left to hand back.
+   */
+  private async resumeFromBrowserLogin(
+    interruptId: string,
+    response: BrowserLoginResponse,
+    sessionId?: string,
+  ): Promise<void> {
+    if (!sessionId) {
+      return;
+    }
+
+    this.messageMapService.beginContinuationStreaming(sessionId);
+    this.chatStateService.setChatLoading(sessionId, true);
+
+    const resumeRequest: Record<string, unknown> = {
+      session_id: sessionId,
+      message: '',
+      interrupt_responses: [{ interruptId, response }],
+    };
+
+    this.attachCarriedSteering(resumeRequest, sessionId);
+
+    try {
+      await this.chatHttpService.sendChatRequest(resumeRequest);
+      await this.reconcileAfterResume(sessionId);
+    } catch (error) {
+      this.chatStateService.setChatLoading(sessionId, false);
+      this.messageMapService.endStreaming(sessionId);
+
+      if (this.isExpiredInterruptError(error)) {
+        this.errorService.addError(
+          'Sign-in expired',
+          'The browser session ended before the sign-in finished. Please send your message again to start a new one.',
+        );
+        return;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * After a resume, re-read the turn from persisted memory so the paused tool
+   * card flips from "Running…" to its result — except for a preview session,
+   * which has no persisted memory to re-read.
+   *
+   * A `preview-` session resumes **in memory**: the backend skips its metadata
+   * writes for these ids (no `PendingInterrupt`, no `PausedTurnSnapshot`), so
+   * the live parser's own state is the only record of the turn. Calling the
+   * reload here would fetch a session that was never written and replace a
+   * correct in-memory transcript with an empty one.
+   *
+   * The trade-off this accepts: a preview's paused turn does not survive a page
+   * refresh. That is already true of everything else in the pane — the preview
+   * session id is regenerated on load — so refresh-survival was never on the
+   * table for this surface, and the alternative (persisting interrupt state for
+   * sessions defined by not being persisted) would undo the point of the
+   * `preview-` prefix.
+   */
+  private async reconcileAfterResume(sessionId: string): Promise<void> {
+    if (isPreviewSession(sessionId)) {
+      return;
+    }
+    await this.messageMapService.reloadMessagesForSession(sessionId);
+  }
+
+  /**
+   * Carry the composer's queued follow-ups into the turn this resume restarts.
+   *
+   * A paused turn had no running loop to steer, and the pause released its
+   * lease — inbox and all — when the stream closed. The backend seeds these
+   * onto the resumed turn's lease, where the ordinary steering hook injects
+   * them at its first tool boundary and acks them like any other steer. The
+   * composer keeps its copies until that ack lands, so a resume that never
+   * reaches a boundary degrades to the end-of-turn flush rather than losing
+   * them. See docs/specs/mid-turn-steering.md ("Paused turns").
+   */
+  private attachCarriedSteering(
+    request: Record<string, unknown>,
+    sessionId: string,
+  ): void {
+    const carried = this.steering.carriedFor(sessionId);
+    if (carried.length > 0) {
+      request['steering'] = carried;
     }
   }
 

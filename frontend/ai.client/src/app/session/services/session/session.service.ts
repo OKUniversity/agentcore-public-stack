@@ -44,7 +44,7 @@ export interface PendingInterrupt {
    * written before per-tool approval shipped omit this — backend defaults
    * to "oauth" on read.
    */
-  kind?: 'oauth' | 'tool_approval';
+  kind?: 'oauth' | 'tool_approval' | 'user_question';
   /** Id of the assistant message whose tool call triggered this interrupt, if known */
   triggeringMessageId?: string | null;
   /** ISO 8601 timestamp when the interrupt was recorded */
@@ -59,6 +59,16 @@ export interface PendingInterrupt {
   toolInput?: string | null;
   /** (tool_approval) Message to display in the approval prompt */
   message?: string | null;
+  /**
+   * (user_question) JSON-encoded list of questions to re-render.
+   *
+   * A string rather than a structured field for the same reason `toolInput`
+   * is: DynamoDB coerces numbers inside nested objects to Decimal on the way
+   * out, so the backend stores the payload pre-serialized and the client
+   * parses it back. Validate with `validateUserQuestions` after parsing —
+   * never trust it to be renderable.
+   */
+  questions?: string | null;
 }
 
 /**
@@ -79,6 +89,14 @@ export interface MessagesListResponse {
    * so the `mcp-app-frame` survives a refresh. Present only on the first page.
    */
   uiResources?: UiResourceEvent[];
+  /**
+   * Persisted model-generated tool-batch summaries, each shaped like the live
+   * `tool_group_summary` SSE event. Replayed on load to re-seed
+   * ToolInsightService so a reloaded conversation keeps the prose line the
+   * user saw live instead of downgrading to the deterministic formatter.
+   * Present only on the first page.
+   */
+  toolSummaries?: { batchId?: string; toolUseIds?: string[]; summary?: string }[];
 }
 
 /**
@@ -503,6 +521,43 @@ export class SessionService {
     const encoded = encodeURIComponent(interruptId);
     await firstValueFrom(
       this.http.delete<void>(`${this.baseUrl()}/${sessionId}/pending-interrupts/${encoded}`),
+    );
+  }
+
+  /**
+   * Queue a follow-up for injection into the turn streaming right now.
+   *
+   * Mid-turn steering (docs/specs/mid-turn-steering.md). Resolves `true` when
+   * the backend armed the entry against a live turn, `false` when there was
+   * nothing to steer — the turn ended between the user typing and this
+   * landing, or the feature is off in this environment. `false` is not an
+   * error condition: the caller leaves the entry queued and the composer's
+   * existing end-of-turn flush sends it as a normal turn.
+   */
+  async steerRunningTurn(
+    sessionId: string,
+    entryId: string,
+    text: string,
+  ): Promise<boolean> {
+    const response = await firstValueFrom(
+      this.http.post<{ queued: boolean; entryId: string }>(
+        `${this.baseUrl()}/${sessionId}/steer`,
+        { text, entryId },
+      ),
+    );
+    return response?.queued === true;
+  }
+
+  /**
+   * Withdraw a queued follow-up the user removed from the composer.
+   * Idempotent — the backend returns 204 whether or not the entry is still
+   * there, because the user's intent is satisfied either way.
+   */
+  async withdrawSteer(sessionId: string, entryId: string): Promise<void> {
+    await firstValueFrom(
+      this.http.delete<void>(
+        `${this.baseUrl()}/${sessionId}/steer/${encodeURIComponent(entryId)}`,
+      ),
     );
   }
 

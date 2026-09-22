@@ -16,6 +16,8 @@ from typing import List, Optional, Tuple
 
 from .models import AgentBinding, AgentModelConfig, Assistant
 from .serialization import from_ddb, to_ddb_safe
+from apis.shared.dynamo_errors import is_missing_index_error, log_missing_index
+from apis.shared.timestamps import to_iso, utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,7 @@ def _generate_assistant_id() -> str:
 
 def _get_current_timestamp() -> str:
     """Get current timestamp in ISO 8601 format"""
-    return datetime.now(timezone.utc).isoformat() + "Z"
+    return utc_now_iso()
 
 
 async def create_assistant_draft(owner_id: str, owner_name: str, name: Optional[str] = None) -> Assistant:
@@ -91,6 +93,7 @@ async def create_assistant(
     emoji: Optional[str] = None,
     bindings: Optional[List[AgentBinding]] = None,
     model_settings: Optional[AgentModelConfig] = None,
+    tagline: Optional[str] = None,
 ) -> Assistant:
     """
     Create a complete assistant with all required fields
@@ -134,6 +137,7 @@ async def create_assistant(
         status="COMPLETE",
         bindings=bindings,
         model_settings=model_settings,
+        tagline=tagline,
     )
 
     # Store the assistant
@@ -319,12 +323,12 @@ async def bump_last_used_at(assistant_id: str, throttle_hours: int = 24) -> bool
         from botocore.exceptions import ClientError
 
         now_dt = datetime.now(timezone.utc)
-        floor = (now_dt - timedelta(hours=throttle_hours)).isoformat() + "Z"
+        floor = to_iso(now_dt - timedelta(hours=throttle_hours))
         table = boto3.resource("dynamodb").Table(assistants_table)
         table.update_item(
             Key={"PK": f"AST#{assistant_id}", "SK": "METADATA"},
             UpdateExpression="SET lastUsedAt = :now",
-            ExpressionAttributeValues={":now": now_dt.isoformat() + "Z", ":floor": floor},
+            ExpressionAttributeValues={":now": to_iso(now_dt), ":floor": floor},
             ConditionExpression=(
                 "attribute_exists(PK) AND (attribute_not_exists(lastUsedAt) OR lastUsedAt < :floor)"
             ),
@@ -466,6 +470,7 @@ async def update_assistant(
     image_url: Optional[str] = None,
     bindings: Optional[List[AgentBinding]] = None,
     model_settings: Optional[AgentModelConfig] = None,
+    tagline: Optional[str] = None,
 ) -> Optional[Assistant]:
     """
     Update assistant fields (deep merge)
@@ -520,6 +525,8 @@ async def update_assistant(
         updates["bindings"] = bindings
     if model_settings is not None:
         updates["model_settings"] = model_settings
+    if tagline is not None:
+        updates["tagline"] = tagline
 
     # Always update the updated_at timestamp
     updates["updated_at"] = _get_current_timestamp()
@@ -572,8 +579,29 @@ async def _update_assistant_cloud(assistant: Assistant, table_name: str) -> None
         expression_attribute_values = {}
         expression_attribute_names = {}
 
-        # Fields that should never be updated (immutable or composite keys)
-        immutable_fields = {"PK", "SK", "GSI_PK", "GSI_SK", "GSI2_PK", "GSI2_SK", "assistantId", "createdAt", "ownerId"}
+        # Fields that should never be updated (immutable or composite keys).
+        #
+        # GSI5_* and ``listing`` belong to the marketplace write path
+        # (``assistants.listing_repository``) and must NOT be rewritten from here.
+        # Reads hydrate ``Assistant`` (extra="allow") straight from the raw item, so the
+        # index keys round-trip as extra model fields; without this guard a routine author
+        # edit would re-write a stale GSI5 key onto a delisted agent and silently put it
+        # back in the store. ``listing`` is excluded for the same reason in the other
+        # direction: a stale in-memory copy must not clobber a concurrent review decision.
+        #
+        # GSI7_* belongs to the managed-KB migration write path
+        # (``apis.shared.kb_backend.records``). Unlike GSI5, those keys live on a
+        # separate item (``SK = KB#{app_kb_id}``) rather than on this METADATA item, so
+        # this path cannot reach them today — the entry is here so the invariant "GSI
+        # keys are never written from the generic update" holds uniformly, and a reader
+        # does not have to know which index lives on which item to trust it.
+        immutable_fields = {
+            "PK", "SK",
+            "GSI_PK", "GSI_SK", "GSI2_PK", "GSI2_SK", "GSI5_PK", "GSI5_SK",
+            "GSI7_PK", "GSI7_SK",
+            "assistantId", "createdAt", "ownerId",
+            "listing",
+        }
 
         # Always update updatedAt
         update_parts.append("updatedAt = :updated_at")
@@ -834,30 +862,113 @@ async def _list_user_assistants_cloud(
         return all_assistants, next_page_token
 
     except ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code", "Unknown")
-        logger.error(f"Failed to list user assistants from DynamoDB: {error_code} - {e}")
+        # Already fail-soft for every ``ClientError``; the missing-index case is split out
+        # only so the log names the index rather than leaving someone to decode a botocore
+        # repr while a deploy is half-landed.
+        if is_missing_index_error(e):
+            log_missing_index("OwnerStatusIndex", "this user's own agents")
+        else:
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
+            logger.error(f"Failed to list user assistants from DynamoDB: {error_code} - {e}")
         return [], None
     except Exception as e:
         logger.error(f"Failed to list user assistants from DynamoDB: {e}", exc_info=True)
         return [], None
 
 
+class AssistantListedError(Exception):
+    """A hard delete refused because the Agent carries a marketplace listing (§5.2).
+
+    Separate from returning ``False`` (which means "not found / not yours") because the
+    caller has to tell these apart: one is a 404, the other is a 409 whose message names the
+    way forward.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+async def assert_deletable(assistant_id: str, owner_id: str) -> None:
+    """Raise ``AssistantListedError`` if this Agent's listing forbids deletion (§5.2).
+
+    Exists so a caller that does destructive work *before* the record delete can refuse
+    up front. ``/assistants/{id}`` soft-deletes documents and removes sync policies first,
+    so discovering the refusal at the record write would leave the Agent gutted and still
+    in the store — worse than either outcome on its own.
+
+    Silent when the Agent is missing or not the caller's: that is the delete path's own 404,
+    and pre-empting it here would turn "not found" into "not deletable".
+    """
+    existing = await get_assistant(assistant_id, owner_id)
+    if existing:
+        _assert_listing_allows_delete(existing)
+
+
+def _assert_listing_allows_delete(existing) -> None:
+    """The §5.2 rule itself, so the guard and the delete cannot disagree."""
+    listing = getattr(existing, "listing", None)
+    state = getattr(listing, "state", None) if listing else None
+    if state is None or state == "private":
+        return
+    # The message names the path forward rather than just refusing — an author who is told
+    # "no" without being told "do this instead" files a ticket.
+    #
+    # ⚠️ Naming a path puts this string under the state machine's authority, and it drifted:
+    # ``taken_down`` was told to "take it back to private" while ``ALLOWED_TRANSITIONS`` had
+    # no ``taken_down → private`` edge, so the advice was for a door that did not exist.
+    # ``test_every_refusal_names_a_transition_the_machine_allows`` now derives the claim from
+    # the table, so the next divergence fails a test instead of reaching an author.
+    nudge = (
+        "Request withdrawal first, then delete it once an admin has removed it from the store."
+        if state in ("published", "withdrawal_requested")
+        else "Take it back to private first, then delete it."
+    )
+    raise AssistantListedError(
+        f"This agent can't be deleted while it has a marketplace listing ({state}). {nudge}"
+    )
+
+
 async def delete_assistant(assistant_id: str, owner_id: str) -> bool:
     """
     Delete an assistant permanently (hard delete)
+
+    ⚠️ **Refused while a listing exists** (version-snapshots §5.2). Ownership alone used to
+    be enough, so an author could hard-delete an approved Agent straight out of the store —
+    the same unilateral removal that ``withdrawal_requested`` exists to stop, except
+    irreversible and taking the review history with it.
+
+    What this earns is that **nothing live or pending is deleted out from under the store**:
+    ``published`` refuses, ``withdrawal_requested`` refuses because a requested withdrawal is
+    not a granted one, and ``in_review`` refuses because a reviewer is mid-decision. Only
+    ``private`` (or no listing at all) may be deleted, and reaching ``private`` is an explicit
+    act — so unpublication can never be a side effect of a delete.
+
+    ⚠️ What it does **not** earn, despite an earlier claim here, is that an author cannot
+    delete their way out of a takedown record. ``taken_down`` still refuses, but the author
+    now walks ``taken_down → private`` and deletes — and before that edge existed they walked
+    ``taken_down → in_review → private`` and deleted, which cost them one junk entry in the
+    review queue and cost the record exactly nothing. The takedown note lives on the listing
+    block, so it dies with the Agent either way. Making that survive needs a row that is not
+    the Agent's own, not a missing edge in ``ALLOWED_TRANSITIONS``.
 
     Args:
         assistant_id: Assistant identifier
         owner_id: User identifier (for ownership verification)
 
     Returns:
-        True if deleted successfully, False otherwise
+        True if deleted successfully, False if not found or not owned
+
+    Raises:
+        AssistantListedError: the Agent has a listing that is not ``private``
     """
     # Verify ownership first
     existing = await get_assistant(assistant_id, owner_id)
 
     if not existing:
         return False
+
+    _assert_listing_allows_delete(existing)
 
     assistants_table = os.environ.get("DYNAMODB_ASSISTANTS_TABLE_NAME")
     if not assistants_table:
@@ -883,6 +994,39 @@ async def _delete_assistant_cloud(assistant_id: str, table_name: str) -> bool:
 
         dynamodb = boto3.resource("dynamodb")
         table = dynamodb.Table(table_name)
+
+        # Child rows first. Marketplace problem reports (D15) live under this same
+        # partition precisely so they never outlive what they concern — and an orphaned
+        # *open* report is worse than untidy: it keeps its sparse GSI6 key, so it would
+        # sit in the admin queue forever pointing at an Agent nobody can open. Best
+        # effort, because failing to tidy up must not make the Agent undeletable; the
+        # queue projection flags a row whose Agent is gone so an admin can still clear it.
+        try:
+            from .reports import delete_reports_for_agent
+
+            await delete_reports_for_agent(assistant_id)
+        except Exception:
+            logger.warning(
+                f"Failed to delete reports for assistant {assistant_id}; "
+                "the admin queue will show them as orphaned",
+                exc_info=True,
+            )
+
+        # Version snapshots are child rows for the same reason, and were missed when they
+        # shipped: without this a deleted Agent leaves its whole version history behind,
+        # invisible but permanent. Invisible because a deletable Agent's listing is
+        # ``private``, so its versions carry no store key — which is exactly why nothing
+        # would ever surface the leak.
+        try:
+            from .version_repository import delete_versions_for_agent
+
+            await delete_versions_for_agent(assistant_id)
+        except Exception:
+            logger.warning(
+                f"Failed to delete versions for assistant {assistant_id}; "
+                "the snapshots will be orphaned in the table",
+                exc_info=True,
+            )
 
         table.delete_item(Key={"PK": f"AST#{assistant_id}", "SK": "METADATA"})
 
@@ -1318,9 +1462,12 @@ async def list_shared_with_user(user_email: str) -> List[Assistant]:
         return assistants
 
     except ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code", "Unknown")
-        if error_code == "ResourceNotFoundException":
-            logger.debug(f"SharedWithIndex GSI not found - sharing feature may not be deployed yet")
+        # The "not deployed yet" case used to be matched on ``ResourceNotFoundException``,
+        # which real DynamoDB never raises for a missing *index* — it raises
+        # ``ValidationException``, so that branch only ever fired under moto and the
+        # intended debug-level path logged at ERROR in production instead.
+        if is_missing_index_error(e):
+            log_missing_index("SharedWithIndex", "agents shared with this user")
         else:
             logger.error(f"Error listing shared assistants: {e}")
         return []

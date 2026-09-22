@@ -74,6 +74,30 @@ TOOL_CATALOG: Dict[str, ToolMetadata] = {
         category=ToolCategory.UTILITIES,
         icon="calculator",
     ),
+    "ask_user_question": ToolMetadata(
+        tool_id="ask_user_question",
+        name="Clarifying Questions",
+        description="Pause and ask the user multiple-choice questions when a request is ambiguous, then continue with their answer.",
+        category=ToolCategory.UTILITIES,
+        icon="question-mark-circle",
+    ),
+
+    # --- Built-in Tools (Browser) ---
+    "browse_web": ToolMetadata(
+        tool_id="browse_web",
+        name="Web Browser",
+        description="Browse the web in a real Chrome browser: navigate pages, read JavaScript-rendered content, fill forms, and click through multi-step flows.",
+        category=ToolCategory.SEARCH,
+        icon="globe-alt",
+    ),
+
+    "request_user_login": ToolMetadata(
+        tool_id="request_user_login",
+        name="Browser Sign-In",
+        description="Hand the browser to the user so they can sign in to a site the agent cannot reach, then continue browsing the authenticated session.",
+        category=ToolCategory.SEARCH,
+        icon="key",
+    ),
 
     # --- Built-in Tools (Code Interpreter) ---
     "generate_diagram_and_validate": ToolMetadata(

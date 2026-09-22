@@ -7,7 +7,11 @@ import { ModelCatalogPage } from './model-catalog.page';
 import { ManagedModelsService } from './services/managed-models.service';
 import { CuratedModelPrefillService } from './services/curated-model-prefill.service';
 import { AddCuratedModelDialogComponent } from './components/add-curated-model-dialog.component';
-import { CURATED_BEDROCK_MODELS, CURATED_MANTLE_MODELS } from './models/curated-models';
+import {
+  CURATED_BEDROCK_MODELS,
+  CURATED_BEDROCK_RESPONSES_MODELS,
+  CURATED_MANTLE_MODELS,
+} from './models/curated-models';
 
 function createMockManagedModelsService(overrides: Partial<{
   isModelAdded: (modelId: string) => boolean;
@@ -232,5 +236,210 @@ describe('ModelCatalogPage', () => {
     resolveCreate({ id: 'created' });
     await inFlight;
     expect(page.addingKey()).toBeNull();
+  });
+
+  // These guard a mismatch that shipped and stayed live for months: every
+  // curated Claude template declared the `global.*` rates while its `modelId`
+  // named a `us.*` (Regional/CRIS) inference profile, which prices ~10% higher.
+  // Nothing failed — the numbers were merely wrong, everywhere downstream.
+  describe('curated Bedrock pricing', () => {
+    // The CRIS tier a model id resolves to drives its rate card, so the two
+    // must agree on every list that declares a tier — not just Bedrock's.
+    const tieredModels = [...CURATED_BEDROCK_MODELS, ...CURATED_BEDROCK_RESPONSES_MODELS];
+
+    it('declares a pricingTier that matches the tier its modelId names', () => {
+      for (const model of tieredModels) {
+        const expected = model.template.modelId.startsWith('global.') ? 'global' : 'regional';
+        expect(`${model.key}:${model.pricingTier}`).toBe(`${model.key}:${expected}`);
+      }
+    });
+
+    it('derives cache rates from base input at Bedrock\'s published multipliers', () => {
+      for (const model of tieredModels) {
+        const t = model.template;
+        if (!t.supportsCaching) continue;
+        const input = t.inputPricePerMillionTokens;
+        expect(t.cacheWritePricePerMillionTokens).toBeCloseTo(input * 1.25, 6);
+        expect(t.cacheReadPricePerMillionTokens).toBeCloseTo(input * 0.1, 6);
+      }
+    });
+  });
+
+  describe('curated bedrock-responses (OpenAI family) entries', () => {
+    it('renders them on their own tab', () => {
+      const page = createComponent();
+      page.selectTab('bedrock-responses');
+
+      expect(page.visibleModels().map(m => m.key)).toEqual(
+        CURATED_BEDROCK_RESPONSES_MODELS.map(m => m.key),
+      );
+      expect(CURATED_BEDROCK_RESPONSES_MODELS.length).toBeGreaterThan(0);
+    });
+
+    it('never ships supportsCaching false — the provider forces it true', () => {
+      // `false` here is not a preference but a false statement: these models
+      // cache implicitly server-side and it cannot be turned off. Its only
+      // effect would be to clear the cache rates, pricing cached tokens at
+      // $0.00 while AWS bills them in full.
+      for (const model of CURATED_BEDROCK_RESPONSES_MODELS) {
+        expect(`${model.key}:${model.template.supportsCaching}`).toBe(`${model.key}:true`);
+      }
+    });
+
+    it('pins maxInputTokens to the 272K short-context boundary', () => {
+      // Load-bearing pricing, not just a cap: above 272K these models bill
+      // input at 2x and output at 1.5x, and a CuratedModel holds one flat rate
+      // per bucket. Raising this silently opens the second price card.
+      for (const model of CURATED_BEDROCK_RESPONSES_MODELS) {
+        expect(`${model.key}:${model.template.maxInputTokens}`).toBe(`${model.key}:272000`);
+      }
+    });
+
+    it('routes over the Responses API, which is the only surface that caches', () => {
+      for (const model of CURATED_BEDROCK_RESPONSES_MODELS) {
+        expect(`${model.key}:${model.template.apiMode}`).toBe(`${model.key}:responses`);
+        expect(`${model.key}:${model.template.provider}`).toBe(`${model.key}:bedrock-responses`);
+      }
+    });
+
+    it('declares only the MEASURED supportedParams, never a guessed one', () => {
+      // Supersedes an earlier invariant that required NO spec at all. The bar
+      // was never "no spec" — it was "no invented spec": a declared spec flips
+      // the #915 guard from permissive to restrictive, so a guess silently
+      // blocks params the model really accepts. AWS still publishes no
+      // parameter table, so this spec comes from probing all four ids in
+      // us-west-2 on 2026-09-12 (see the block comment on the array).
+      //
+      // If a future sibling is added without re-probing, this fails — which is
+      // the point.
+      for (const model of CURATED_BEDROCK_RESPONSES_MODELS) {
+        const params = model.template.supportedParams?.params;
+        expect(params, `${model.key} must declare a measured spec`).toBeTruthy();
+
+        // The endpoint's own 400 enumerates exactly these, identically on all four.
+        expect(`${model.key}:${params!['reasoning_effort'].allowed?.join(',')}`).toBe(
+          `${model.key}:none,low,medium,high,xhigh,max`,
+        );
+
+        // Measured 400: "Unsupported parameter: 'temperature' is not supported
+        // with this model." Declared false so the request never carries them.
+        expect(`${model.key}:${params!['temperature'].supported}`).toBe(`${model.key}:false`);
+        expect(`${model.key}:${params!['top_p'].supported}`).toBe(`${model.key}:false`);
+
+        expect(`${model.key}:${params!['max_tokens'].supported}`).toBe(`${model.key}:true`);
+
+        // `medium` pins what the provider was already doing implicitly —
+        // measured at ~376 reasoning tokens unset vs ~308 for medium, so this
+        // is cost-neutral-to-cheaper rather than an increase. A default must
+        // stay a member of `allowed` or the backend drops it.
+        expect(`${model.key}:${params!['reasoning_effort'].default}`).toBe(
+          `${model.key}:medium`,
+        );
+        expect(params!['reasoning_effort'].allowed).toContain(
+          params!['reasoning_effort'].default,
+        );
+      }
+    });
+
+    it('curates GPT-6 Astra on the Short Context rate card', () => {
+      // The 272K cap is covered by the family loop above; this pins the rates
+      // that cap keeps correct. Geo CRIS Short Context is $11.00 / $55.00 —
+      // Long Context (1.05M) is $22.00 / $82.50, and the tier is chosen by the
+      // request's actual token count, so nothing but the cap keeps a single
+      // flat rate per bucket true.
+      const astra = CURATED_BEDROCK_RESPONSES_MODELS.find(m => m.key === 'gpt-6-astra');
+
+      expect(astra?.template.modelId).toBe('us.openai.gpt-6-astra');
+      expect(astra?.template.inputPricePerMillionTokens).toBeCloseTo(11.0, 6);
+      expect(astra?.template.outputPricePerMillionTokens).toBeCloseTo(55.0, 6);
+    });
+
+    it('declares Astra\'s published output cap and cutoff, which its siblings lack', () => {
+      // Astra's card publishes `Max output tokens: 128,000` and an April 30,
+      // 2026 cutoff; every GPT-5.6 card states neither, which is why the
+      // family default is null for both. Inheriting the default here would
+      // discard two numbers AWS actually publishes.
+      const astra = CURATED_BEDROCK_RESPONSES_MODELS.find(m => m.key === 'gpt-6-astra');
+
+      expect(astra?.template.maxOutputTokens).toBe(128_000);
+      expect(astra?.template.knowledgeCutoffDate).toBe('2026-04-30');
+
+      for (const sibling of CURATED_BEDROCK_RESPONSES_MODELS.filter(m => m.key !== 'gpt-6-astra')) {
+        expect(`${sibling.key}:${sibling.template.maxOutputTokens}`).toBe(`${sibling.key}:null`);
+      }
+    });
+  });
+
+  it('curates GPT-5.4 on Mantle with caching on and no write fee', () => {
+    // Its model card publishes a cache-read rate with an em dash for cache
+    // write. Inheriting mantleDefaults()' supportsCaching:false priced its
+    // cached tokens at $0.00 while AWS billed them — the bug that had to be
+    // fixed by hand in prod.
+    const gpt54 = CURATED_MANTLE_MODELS.find(m => m.key === 'gpt-5-4');
+
+    expect(gpt54?.template.supportsCaching).toBe(true);
+    expect(gpt54?.template.cacheReadPricePerMillionTokens).toBeCloseTo(0.275, 6);
+    expect(gpt54?.template.cacheWritePricePerMillionTokens).toBe(0);
+  });
+
+  describe('curated picker placement', () => {
+    const ALL = [
+      ...CURATED_BEDROCK_MODELS,
+      ...CURATED_MANTLE_MODELS,
+      ...CURATED_BEDROCK_RESPONSES_MODELS,
+    ];
+
+    // Demoted = superseded by a newer sibling ON THE SAME PROVIDER SURFACE, or
+    // specialist enough that it isn't a general chat default. Everything else
+    // stays at the picker's top level. This list is a change-detector: adding a
+    // model or re-ranking one should be a deliberate edit here, not a drift.
+    //
+    // "Same surface" is load-bearing. GPT-5.4 (mantle) looks superseded by the
+    // GPT-5.6 family until you notice those are bedrock-responses — a different
+    // provider an install may not use at all. Demoting it left Mantle with no
+    // featured model but a specialist coding one, which the family check below
+    // now catches. A template default cannot assume what else gets added.
+    const DEMOTED = ['claude-sonnet-4-6', 'qwen3-coder-30b', 'gpt-5-6-luna'];
+
+    it('demotes exactly the superseded and specialist models', () => {
+      const demoted = ALL.filter(m => m.template.isFeatured === false)
+        .map(m => m.key)
+        .sort();
+      expect(demoted).toEqual([...DEMOTED].sort());
+    });
+
+    it('leaves featured models undeclared so they inherit the backend default', () => {
+      // `isFeatured` defaults true server-side. Featured rows say nothing
+      // rather than `true`, so the default stays in exactly one place.
+      for (const model of ALL) {
+        if (DEMOTED.includes(model.key)) continue;
+        expect(
+          model.template.isFeatured,
+          `${model.key} should not declare isFeatured`,
+        ).toBeUndefined();
+      }
+    });
+
+    it('keeps a featured model in every provider family', () => {
+      // A catalog tab whose every entry is demoted would put an entire
+      // provider behind the submenu, which is never the intent.
+      for (const [label, group] of [
+        ['bedrock', CURATED_BEDROCK_MODELS],
+        ['mantle', CURATED_MANTLE_MODELS],
+        ['bedrock-responses', CURATED_BEDROCK_RESPONSES_MODELS],
+      ] as const) {
+        const featured = group.filter(m => m.template.isFeatured !== false);
+        expect(featured.length, `${label} must keep a featured model`).toBeGreaterThan(0);
+      }
+    });
+
+    it('does not let two featured models both claim to be the most capable', () => {
+      // GPT-6 Astra outranks (and out-prices) GPT-5.6 Sol in the same catalog,
+      // so Sol's copy must not say "most capable".
+      const featuredCopy = ALL.filter(m => m.template.isFeatured !== false)
+        .map(m => m.template.shortDescription ?? '');
+      const superlatives = featuredCopy.filter(d => /most capable/i.test(d));
+      expect(superlatives).toEqual([]);
+    });
   });
 });

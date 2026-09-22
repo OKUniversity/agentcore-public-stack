@@ -6,7 +6,6 @@ DynamoDB operations for file metadata and user quota tracking.
 
 import os
 import logging
-from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional, Tuple
 
@@ -14,6 +13,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from .models import FileMetadata, UserFileQuota, FileStatus
+from apis.shared.timestamps import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,7 @@ class FileUploadRepository:
                 ExpressionAttributeNames={"#status": "status"},
                 ExpressionAttributeValues={
                     ":status": status.value if isinstance(status, FileStatus) else status,
-                    ":now": datetime.now(timezone.utc).isoformat() + "Z",
+                    ":now": utc_now_iso(),
                 },
                 ConditionExpression="attribute_exists(PK)",
                 ReturnValues="ALL_NEW",
@@ -137,6 +137,40 @@ class FileUploadRepository:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return None
             logger.error(f"Error updating file status {upload_id}: {e}")
+            raise
+
+    async def update_file_digest(
+        self, user_id: str, upload_id: str, digest: dict
+    ) -> Optional[FileMetadata]:
+        """Store a ``DocumentDigest`` map on the file row (``SET digest``).
+
+        Idempotent last-write-wins; ``None`` when the row no longer exists
+        (the file was deleted while the digest was being built).
+        """
+        return self.update_file_digest_sync(user_id, upload_id, digest)
+
+    def update_file_digest_sync(
+        self, user_id: str, upload_id: str, digest: dict
+    ) -> Optional[FileMetadata]:
+        """Synchronous body of :meth:`update_file_digest` — the restore path
+        persists a lazily built digest from synchronous code (see
+        :meth:`list_session_files_sync`)."""
+        try:
+            response = self._table.update_item(
+                Key={"PK": f"USER#{user_id}", "SK": f"FILE#{upload_id}"},
+                UpdateExpression="SET digest = :digest, updatedAt = :now",
+                ExpressionAttributeValues={
+                    ":digest": self._convert_floats_to_decimals(dict(digest)),
+                    ":now": utc_now_iso(),
+                },
+                ConditionExpression="attribute_exists(PK)",
+                ReturnValues="ALL_NEW",
+            )
+            return FileMetadata.from_dynamo_item(response["Attributes"])
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return None
+            logger.error(f"Error updating file digest {upload_id}: {e}")
             raise
 
     async def delete_file(self, user_id: str, upload_id: str) -> Optional[FileMetadata]:
@@ -257,6 +291,19 @@ class FileUploadRepository:
         Returns:
             List of FileMetadata
         """
+        return self.list_session_files_sync(session_id, status)
+
+    def list_session_files_sync(
+        self, session_id: str, status: Optional[FileStatus] = None
+    ) -> List[FileMetadata]:
+        """Synchronous body of :meth:`list_session_files`.
+
+        The session manager's restore path (``TurnBasedSessionManager.initialize``)
+        runs synchronously inside the Strands agent constructor, under a
+        running event loop it cannot re-enter, and needs the session's upload
+        rows to rehydrate stripped documents. boto3 is synchronous anyway; the
+        async method is a thin wrapper over this.
+        """
         try:
             query_params = {
                 "IndexName": "SessionIndex",
@@ -285,6 +332,51 @@ class FileUploadRepository:
 
         except ClientError as e:
             logger.error(f"Error listing files for session {session_id}: {e}")
+            raise
+
+    async def list_session_file_stats(self, session_id: str) -> List[dict]:
+        """Content-free upload stats for one session — admin diagnostics.
+
+        Same ``SessionIndex`` query as :meth:`list_session_files`, but projects
+        only ``uploadId, sessionId, sizeBytes, mimeType, source, status,
+        createdAt``. ``filename``, ``s3Key`` and ``s3Uri`` carry the user's
+        chosen file name and never leave DynamoDB on this path. Returns plain
+        dicts (``sizeBytes`` as ``int``), not ``FileMetadata``, because that
+        model requires the very fields this read refuses to fetch.
+        """
+        from apis.shared.observability.content_policy import (
+            FILE_ROW_PROJECTION,
+            build_projection,
+            strip_content,
+        )
+
+        projection, names = build_projection(FILE_ROW_PROJECTION)
+        try:
+            query_params = {
+                "IndexName": "SessionIndex",
+                "KeyConditionExpression": "GSI1PK = :pk",
+                "ExpressionAttributeValues": {":pk": f"CONV#{session_id}"},
+                "ProjectionExpression": projection,
+                "ExpressionAttributeNames": names,
+            }
+            response = self._table.query(**query_params)
+            items = response.get("Items", [])
+            while "LastEvaluatedKey" in response:
+                query_params["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+                response = self._table.query(**query_params)
+                items.extend(response.get("Items", []))
+
+            stats: List[dict] = []
+            for item in items:
+                row = strip_content(dict(item))
+                size = row.get("sizeBytes")
+                if isinstance(size, Decimal):
+                    row["sizeBytes"] = int(size)
+                stats.append(row)
+            return stats
+
+        except ClientError as e:
+            logger.error(f"Error listing file stats for session {session_id}: {e}")
             raise
 
     # =========================================================================
@@ -333,7 +425,7 @@ class FileUploadRepository:
                 ),
                 ExpressionAttributeValues={
                     ":userId": user_id,
-                    ":now": datetime.now(timezone.utc).isoformat() + "Z",
+                    ":now": utc_now_iso(),
                     ":size": size_bytes,
                     ":one": 1,
                 },
@@ -364,7 +456,7 @@ class FileUploadRepository:
                 ),
                 ExpressionAttributeValues={
                     ":userId": user_id,
-                    ":now": datetime.now(timezone.utc).isoformat() + "Z",
+                    ":now": utc_now_iso(),
                     ":negSize": -size_bytes,
                     ":negOne": -1,
                 },

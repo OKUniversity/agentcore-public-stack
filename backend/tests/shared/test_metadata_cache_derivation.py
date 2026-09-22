@@ -3,6 +3,7 @@
 cache-efficiency counters ``_bump_session_aggregates`` adds to the session row.
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -20,7 +21,7 @@ from apis.shared.sessions.models import (
 NOW = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _metadata(input_t=100, output_t=50, cache_read=0, cache_write=0, with_pricing=True):
+def _metadata(input_t=100, output_t=50, cache_read=0, cache_write=0, with_pricing=True, prints=None, agent_id=None):
     pricing = None
     if with_pricing:
         pricing = PricingSnapshot(
@@ -30,7 +31,16 @@ def _metadata(input_t=100, output_t=50, cache_read=0, cache_write=0, with_pricin
             cache_read_price_per_mtok=0.30,
             snapshot_at=NOW.isoformat(),
         )
+    extra = {}
+    if prints is not None:
+        extra["prefixFingerprints"] = {
+            "toolConfigHash": prints[0],
+            "systemPromptHash": prints[1],
+        }
+    if agent_id is not None:
+        extra["turnAgentId"] = agent_id
     return MessageMetadata(
+        **extra,
         token_usage=TokenUsage(
             input_tokens=input_t,
             output_tokens=output_t,
@@ -63,15 +73,24 @@ class _FakeTable:
         return {}
 
 
-def _prev_row(seconds_ago, cache_read=0, cache_write=0):
+def _prev_row(seconds_ago, cache_read=0, cache_write=0, prints=None, agent_id=None):
+    """A prior cost row. ``prints`` is (toolConfigHash, systemPromptHash)."""
     ts = (NOW - timedelta(seconds=seconds_ago)).isoformat()
-    return {
+    row = {
         "timestamp": ts,
         "tokenUsage": {
             "cacheReadInputTokens": Decimal(cache_read),
             "cacheWriteInputTokens": Decimal(cache_write),
         },
     }
+    if prints is not None:
+        row["prefixFingerprints"] = {
+            "toolConfigHash": prints[0],
+            "systemPromptHash": prints[1],
+        }
+    if agent_id is not None:
+        row["turnAgentId"] = agent_id
+    return row
 
 
 class TestDeriveCacheObservability:
@@ -132,12 +151,120 @@ class TestDeriveCacheObservability:
         assert result["wastedUsd"] == 0.0
         assert result["cacheGapSeconds"] == 30
 
-    def test_query_targets_previous_row_descending_limit_1(self):
+    def test_query_reads_a_descending_window_of_recent_rows(self):
+        """Newest-first, and wide enough to see past an interleaved mention turn.
+
+        Was ``Limit=1`` until #753: the predecessor that decides the TTL question
+        is the last call with the *same prefix*, which is not always the last
+        call, so one row is not enough to answer it.
+        """
         table = _FakeTable()
         self._derive(table, _metadata(cache_write=100))
         assert table.query_kwargs["IndexName"] == "SessionLookupIndex"
         assert table.query_kwargs["ScanIndexForward"] is False
-        assert table.query_kwargs["Limit"] == 1
+        assert table.query_kwargs["Limit"] == md._CACHE_PREDECESSOR_LOOKBACK
+        assert md._CACHE_PREDECESSOR_LOOKBACK > 1
+
+    # --- #753: the TTL clock runs from the same-prefix predecessor ---------
+
+    def test_interleaved_prefix_does_not_report_a_ttl_expiry_as_avoidable(self):
+        """The bug: an `@`-mention between two plain turns hid the real expiry.
+
+        Reproduces the measured dev case. The plain turn's own prefix was last
+        written 320s ago (expired); a mention ran 100s ago under a *different*
+        prefix. Classifying against "the previous call" saw 100s, called it
+        avoidable, and booked real dollars of waste that nothing could have
+        avoided.
+        """
+        table = _FakeTable([
+            _prev_row(seconds_ago=100, cache_write=4000, prints=("agentcfg", "agentsys")),
+            _prev_row(seconds_ago=320, cache_read=3000, cache_write=1000, prints=("basecfg", "basesys")),
+        ])
+        result = self._derive(
+            table, _metadata(cache_write=6000, prints=("basecfg", "basesys"))
+        )
+        assert result["cacheStatus"] == "miss_ttl_expired"
+        assert result["wastedUsd"] == 0.0
+        # The chronology stays honest: 100s since the previous call, but the
+        # entry that decided the verdict was 320s old.
+        assert result["cacheGapSeconds"] == 100
+        assert result["cachePrefixGapSeconds"] == 320
+
+    def test_same_prefix_within_ttl_is_still_avoidable(self):
+        """The fix must not suppress the bug class the metric exists for."""
+        table = _FakeTable([
+            _prev_row(seconds_ago=30, cache_write=4000, prints=("agentcfg", "agentsys")),
+            _prev_row(seconds_ago=60, cache_read=4000, cache_write=1000, prints=("basecfg", "basesys")),
+        ])
+        result = self._derive(
+            table, _metadata(cache_write=6000, prints=("basecfg", "basesys"))
+        )
+        assert result["cacheStatus"] == "miss_avoidable"
+        assert result["wastedUsd"] == round((5000 / 1_000_000) * 3.45, 6)
+        assert result["cachePrefixGapSeconds"] == 60
+
+    def test_no_same_prefix_predecessor_in_window_classifies_conservatively(self):
+        """An unseen predecessor is treated as expired, never as avoidable.
+
+        Under-reporting waste keeps the metric trustworthy; crying wolf is what
+        made it useless.
+        """
+        table = _FakeTable([
+            _prev_row(seconds_ago=10, cache_write=4000, prints=("othercfg", "othersys")),
+        ])
+        result = self._derive(
+            table, _metadata(cache_write=6000, prints=("basecfg", "basesys"))
+        )
+        assert result["cacheStatus"] == "miss_ttl_expired"
+        assert result["wastedUsd"] == 0.0
+
+    def test_prefix_gap_omitted_when_it_equals_the_previous_call_gap(self):
+        """No redundant field on the common path — same prefix, adjacent calls."""
+        table = _FakeTable([
+            _prev_row(seconds_ago=45, cache_read=4000, cache_write=1000, prints=("basecfg", "basesys")),
+        ])
+        result = self._derive(
+            table, _metadata(cache_write=6000, prints=("basecfg", "basesys"))
+        )
+        assert result["cacheStatus"] == "miss_avoidable"
+        assert result["cacheGapSeconds"] == 45
+        assert "cachePrefixGapSeconds" not in result
+
+    def test_calls_without_fingerprints_fall_back_to_previous_call(self):
+        """Hook disabled or a non-Bedrock provider: behave exactly as before #753."""
+        table = _FakeTable([
+            _prev_row(seconds_ago=60, cache_read=4000, cache_write=1000, prints=("basecfg", "basesys")),
+        ])
+        result = self._derive(table, _metadata(cache_write=6000))  # no prints
+        assert result["cacheStatus"] == "miss_avoidable"
+        assert result["cacheGapSeconds"] == 60
+
+    def test_partial_miss_when_a_sliver_read_masks_a_prefix_rewrite(self):
+        # The compaction-spiral shape: the previous call cached 11k + 190k, and
+        # this one reads back only the 11k tools+system segment while re-writing
+        # the whole history 60s later. Before `partial_miss` this row said
+        # `hit` / $0.00 — 56 times, for $27 of writes.
+        table = _FakeTable([_prev_row(seconds_ago=60, cache_read=11_278, cache_write=190_000)])
+        result = self._derive(table, _metadata(cache_read=11_278, cache_write=190_000))
+
+        assert result["cacheStatus"] == "partial_miss"
+        assert result["cacheGapSeconds"] == 60
+        # The 11,278 tokens it did read come off the previously-cached cap.
+        assert result["wastedUsd"] == round((190_000 / 1_000_000) * 3.45, 6)
+
+    def test_a_healthy_turn_reading_its_prefix_is_still_a_hit(self):
+        table = _FakeTable([_prev_row(seconds_ago=60, cache_read=190_000, cache_write=4_000)])
+        result = self._derive(table, _metadata(cache_read=190_000, cache_write=4_000))
+
+        assert result["cacheStatus"] == "hit"
+        assert result["wastedUsd"] == 0.0
+
+    def test_a_partial_miss_after_a_cold_gap_is_not_charged_as_waste(self):
+        table = _FakeTable([_prev_row(seconds_ago=3600, cache_read=11_278, cache_write=190_000)])
+        result = self._derive(table, _metadata(cache_read=11_278, cache_write=190_000))
+
+        assert result["cacheStatus"] == "hit"
+        assert result["wastedUsd"] == 0.0
 
     def test_failure_returns_empty_never_raises(self):
         class _Boom:
@@ -203,6 +330,131 @@ class TestBumpSessionAggregatesCacheCounters:
         assert values[":cacheRead"] == 0
         assert values[":cacheWrite"] == 0
         assert values[":avoidableMiss"] == 0
+        assert values[":partialMiss"] == 0
+
+    @pytest.mark.asyncio
+    async def test_partial_misses_roll_up_as_a_split_of_the_wasted_total(
+        self, session_lookup
+    ):
+        table = _FakeTable()
+        meta = _metadata(cache_read=11_278, cache_write=190_000)
+        await self._bump(table, meta, {"cacheStatus": "partial_miss", "wastedUsd": 0.437})
+
+        expr = table.update_kwargs["UpdateExpression"]
+        values = table.update_kwargs["ExpressionAttributeValues"]
+        assert "partialMissCount :partialMiss" in expr
+        assert "partialMissUsd :partialWasted" in expr
+        assert values[":partialMiss"] == 1
+        assert values[":avoidableMiss"] == 0
+        # A subset, not a deduction: the dollars are in both.
+        assert values[":wasted"] == Decimal("0.437")
+        assert values[":partialWasted"] == Decimal("0.437")
+
+    @pytest.mark.asyncio
+    async def test_an_avoidable_miss_contributes_no_partial_miss_dollars(
+        self, session_lookup
+    ):
+        table = _FakeTable()
+        await self._bump(
+            table, _metadata(cache_write=5000), {"cacheStatus": "miss_avoidable", "wastedUsd": 0.02}
+        )
+        values = table.update_kwargs["ExpressionAttributeValues"]
+        assert values[":partialMiss"] == 0
+        assert values[":wasted"] == Decimal("0.02")
+        assert values[":partialWasted"] == Decimal("0")
+
+
+class TestSessionPartialMissAccumulation:
+    """The running per-session total the $5/24h alarm reads.
+
+    The incident spent $27 over five days at ~$0.43 a turn — never enough to
+    step a fleet-wide sum. The rollup bump is the only place that knows the
+    session's cumulative figure, so it emits it from the values the update
+    already returns rather than paying for another read.
+    """
+
+    @pytest.fixture
+    def session_lookup(self, monkeypatch):
+        async def _fake_get_session(session_id, user_id, table):
+            return {"SK": f"S#{session_id}"}
+
+        monkeypatch.setattr(md, "_get_session_by_gsi", _fake_get_session)
+
+    class _ReturningTable(_FakeTable):
+        def __init__(self, attributes):
+            super().__init__()
+            self._attributes = attributes
+
+        def update_item(self, **kwargs):
+            self.update_kwargs = kwargs
+            return {"Attributes": self._attributes}
+
+    @pytest.fixture
+    def emf_output(self):
+        """Capture the EMF logger's stdout lines.
+
+        Not capsys: the logger binds its handler to sys.stdout at import time,
+        before capsys swaps it out.
+        """
+        import io
+        import logging
+
+        from apis.shared.observability import emf
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        emf._emf_logger.addHandler(handler)
+        try:
+            yield stream
+        finally:
+            emf._emf_logger.removeHandler(handler)
+
+    async def _bump(self, table, observability):
+        await md._bump_session_aggregates(
+            session_id="sess-1",
+            user_id="user-1",
+            message_metadata=_metadata(cache_read=11_278, cache_write=190_000),
+            table=table,
+            cache_observability=observability,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_bump_asks_for_the_updated_counters(self, session_lookup):
+        table = self._ReturningTable({"partialMissUsd": Decimal("0")})
+        await self._bump(table, {"cacheStatus": "partial_miss", "wastedUsd": 0.437})
+        assert table.update_kwargs["ReturnValues"] == "UPDATED_NEW"
+
+    @pytest.mark.asyncio
+    async def test_emits_the_running_total_once_a_session_has_partial_miss_waste(
+        self, session_lookup, emf_output
+    ):
+        table = self._ReturningTable(
+            {"partialMissUsd": Decimal("6.11"), "partialMissCount": Decimal(14)}
+        )
+        await self._bump(table, {"cacheStatus": "partial_miss", "wastedUsd": 0.437})
+
+        record = json.loads(emf_output.getvalue().strip())
+        assert record["SessionPartialMissUsd"] == 6.11
+        assert record["sessionId"] == "sess-1"
+        assert record["sessionPartialMissCount"] == 14
+
+    @pytest.mark.asyncio
+    async def test_stays_silent_for_a_session_with_no_partial_miss_waste(
+        self, session_lookup, emf_output
+    ):
+        # Almost every session. A metric that is 99% zeros makes the
+        # Maximum-statistic alarm read as noise.
+        table = self._ReturningTable({"partialMissUsd": Decimal("0")})
+        await self._bump(table, {"cacheStatus": "hit", "wastedUsd": 0.0})
+        assert emf_output.getvalue() == ""
+
+    @pytest.mark.asyncio
+    async def test_a_table_that_returns_nothing_is_not_an_error(self, session_lookup):
+        # `_FakeTable` (and an older table client) returns no Attributes.
+        table = _FakeTable()
+        await self._bump(table, {"cacheStatus": "partial_miss", "wastedUsd": 0.437})
+        assert table.update_kwargs is not None
 
 
 class TestKillSwitch:
@@ -243,3 +495,69 @@ class TestKillSwitch:
             cache_observability={"cacheStatus": "miss_avoidable", "wastedUsd": 0.01},
         )
         assert capsys.readouterr().out == ""
+
+
+class TestAgentSwitchDimension:
+    """#756 — whether a prefix re-write is *explained*.
+
+    An `@`-mention hands one turn to a different Agent (Marketplace D11), swapping the
+    system prompt and toolConfig and so genuinely re-writing the prefix. That is
+    indistinguishable on the row from the nondeterministic-ordering regression the
+    fingerprints exist to catch — both flip `toolConfigHash` and `systemPromptHash`
+    together. The flag is what tells them apart.
+
+    It never changes `cacheStatus` or `wastedUsd`: the tokens really were spent, and
+    hiding them would understate the cost of mentions, which is worth measuring.
+    """
+
+    def _derive(self, table, meta):
+        return md._derive_cache_observability(
+            session_id="sess-1", table=table, timestamp=NOW.isoformat(),
+            message_metadata=meta,
+        )
+
+    def test_a_mention_turn_is_flagged_as_switched(self):
+        table = _FakeTable([_prev_row(30, cache_read=4000, agent_id=None)])
+        result = self._derive(table, _metadata(cache_write=5000, agent_id="ast-mention"))
+
+        assert result["agentSwitched"] is True
+        # …and the spend is still reported in full.
+        assert result["cacheStatus"] == "miss_avoidable"
+        assert result["wastedUsd"] > 0
+
+    def test_returning_to_plain_chat_is_also_a_switch(self):
+        """The turn *after* a mention pays a re-write too, and for the same reason."""
+        table = _FakeTable([_prev_row(30, cache_read=4000, agent_id="ast-mention")])
+        result = self._derive(table, _metadata(cache_write=5000, agent_id=None))
+
+        assert result["agentSwitched"] is True
+
+    def test_the_same_agent_twice_is_not_a_switch(self):
+        """A bound conversation: every turn runs the same Agent, so a miss is unexplained
+        and should stay that way — this is the case the metric exists to surface."""
+        table = _FakeTable([_prev_row(30, cache_read=4000, agent_id="ast-bound")])
+        result = self._derive(table, _metadata(cache_write=5000, agent_id="ast-bound"))
+
+        assert "agentSwitched" not in result
+
+    def test_plain_chat_throughout_is_not_a_switch(self):
+        table = _FakeTable([_prev_row(30, cache_read=4000)])
+        result = self._derive(table, _metadata(cache_write=5000))
+
+        assert "agentSwitched" not in result
+
+    def test_the_first_call_of_a_session_is_never_a_switch(self):
+        """Nothing to have switched *from*."""
+        result = self._derive(_FakeTable(), _metadata(cache_write=5000, agent_id="ast-1"))
+
+        assert "agentSwitched" not in result
+
+    def test_a_switch_that_still_hit_the_cache_is_flagged_but_costs_nothing(self):
+        """The flag describes the turn, not the verdict — the rollup only counts it
+        against a miss, so a hit contributes no explained waste."""
+        table = _FakeTable([_prev_row(30, cache_read=4000, agent_id="ast-a")])
+        result = self._derive(table, _metadata(cache_read=4000, agent_id="ast-b"))
+
+        assert result["agentSwitched"] is True
+        assert result["cacheStatus"] == "hit"
+        assert result["wastedUsd"] == 0.0

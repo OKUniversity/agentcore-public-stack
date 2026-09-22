@@ -13,6 +13,11 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 from agents.main_agent.core import ModelConfig, SystemPromptBuilder, AgentFactory
 from agents.main_agent.session import SessionFactory
 from agents.main_agent.session.hooks import (
+    AgentStatusHook,
+    ContextLedgerHook,
+    ToolCensusHook,
+    DisplayTextHook,
+    SteeringHook,
     StopHook,
     OAuthConsentHook,
     MCPExternalApprovalHook,
@@ -27,6 +32,8 @@ from agents.main_agent.tools import (
 from agents.main_agent.multimodal import PromptBuilder
 from agents.main_agent.streaming import StreamCoordinator
 from apis.shared.tools.scoped_ids import base_tool_id
+
+from apis.shared.observability.build_stages import mark_stage
 
 logger = logging.getLogger(__name__)
 
@@ -155,12 +162,17 @@ class BaseAgent(ABC):
         # prior turns; only the system-prompt date line shifts.
         self._construction_snapshot["system_prompt"] = system_prompt
 
+        # Sub-stages of `agent_build` (docs/specs/turn-latency-preamble.md).
+        # A no-op unless the inference-api turn path installed a recorder.
+        mark_stage("prompt")
+
         # Initialize tool registry and filter
         self.tool_registry = create_default_registry()
         self.tool_filter = ToolFilter(self.tool_registry)
 
         # Register external MCP tool IDs from enabled tools
         self._register_external_mcp_tools()
+        mark_stage("registry")
 
         # Initialize gateway integration
         self.gateway_integration = GatewayIntegration()
@@ -172,12 +184,16 @@ class BaseAgent(ABC):
         self.session_manager = SessionFactory.create_session_manager(
             session_id=session_id, user_id=self.user_id, caching_enabled=self.model_config.caching_enabled
         )
+        # Conversation restore from AgentCore Memory happens in here, so this
+        # is a prime suspect for the cold build and has never been timed.
+        mark_stage("session_mgr")
 
         # Initialize streaming coordinator
         self.stream_coordinator = StreamCoordinator()
 
         # Create the agent (subclass-specific)
         self._create_agent()
+        mark_stage("finalize")
 
     @abstractmethod
     def _create_agent(self) -> None:
@@ -193,6 +209,8 @@ class BaseAgent(ABC):
         original_message: Optional[str] = None,
         interrupt_responses: Optional[List[Dict[str, Any]]] = None,
         continue_truncated: bool = False,
+        turn_agent_id: Optional[str] = None,
+        turn_lease: Any = None,
     ) -> AsyncGenerator[str, None]:
         """Stream agent responses. Subclasses must implement.
 
@@ -271,8 +289,15 @@ class BaseAgent(ABC):
 
         Includes:
         - StopHook: Always enabled, cancels tool execution on user stop
+        - SteeringHook: Injects a follow-up queued mid-turn at the next tool
+          boundary
+        - DisplayTextHook: Stores the user's original message for UI display
+          as soon as their turn is appended, so an augmented prompt is never
+          what the UI renders for an interrupted turn
         - OAuthConsentHook: Pauses the agent (Strands interrupt) when an
           OAuth-gated MCP tool is about to run without a cached token
+        - AgentStatusHook: Records model/tool boundaries so the UI can say what
+          the agent is doing while the turn streams
         - Approval hooks: Gate dangerous operations for user confirmation
 
         Returns:
@@ -282,6 +307,27 @@ class BaseAgent(ABC):
 
         # Always-on: session cancellation
         hooks.append(StopHook(self.session_manager))
+
+        # Mid-turn steering: a follow-up the user typed while this turn was
+        # streaming is injected into the tool-result message at the next tool
+        # boundary. Registered unconditionally and inert unless the turn's
+        # lease carries a queued entry; MID_TURN_STEERING_ENABLED=false makes
+        # it return immediately. See docs/specs/mid-turn-steering.md.
+        # Held on the wrapper so the stream coordinator can drain the
+        # injections it confirmed and emit `steering_applied` for each. The
+        # hook itself holds no per-turn state beyond that ack — the lease is
+        # read off the session manager every boundary.
+        self.steering_hook = SteeringHook(self.session_manager)
+        hooks.append(self.steering_hook)
+
+        # Persist the user's own words (`displayText`) the moment their turn
+        # enters history, so an augmented prompt — RAG context, attachment
+        # guidance, an `<interruption_note>` — never becomes what the UI shows
+        # for a turn that doesn't finish. Held on the wrapper so the stream
+        # coordinator can arm it per turn and skip its own end-of-turn write
+        # once this has done it.
+        self.display_text_hook = DisplayTextHook()
+        hooks.append(self.display_text_hook)
 
         # OAuth consent gate for external MCP tools. Registered unconditionally;
         # the hook is a no-op for tools that don't have a registered provider.
@@ -295,8 +341,35 @@ class BaseAgent(ABC):
         # Per-turn context-token attribution (system / tools / messages).
         # Best-effort; computes the breakdown on BeforeModelCallEvent and
         # stashes it on the agent for the stream coordinator to surface on the
-        # final metadata SSE event.
-        hooks.append(ContextAttributionHook())
+        # final metadata SSE event. The session id keys a process-level memo
+        # of the stable split, so an Agent rebuilt for this session (cache
+        # bypass, @-mention, memory binding) adopts it instead of re-counting.
+        hooks.append(ContextAttributionHook(session_id=self.session_id))
+
+        # Live narration of what the agent is doing (model call / tool call
+        # boundaries) plus Strands-measured per-tool durations. Held on the
+        # wrapper so the stream coordinator can drain the transitions into
+        # `agent_status` SSE events, and the closed tool batches into the
+        # tool-summary side-channel. Registered unconditionally; the callbacks
+        # return immediately when AGENT_STATUS_ENABLED=false.
+        self.agent_status_hook = AgentStatusHook()
+        hooks.append(self.agent_status_hook)
+
+        # Content-free tool census (tool name → calls/errors per model call).
+        # Held on the wrapper so the stream coordinator can read each call's
+        # tally at turn end and persist it on that call's cost row for the
+        # admin session profile. Non-drained, per-turn only. Registered
+        # unconditionally; the callbacks return immediately when
+        # COST_DIAGNOSTICS_ENABLED=false.
+        self.tool_census_hook = ToolCensusHook()
+        hooks.append(self.tool_census_hook)
+
+        # Per-model-call context ledger: the conversation window's cumulative
+        # trim count and the compaction decisions taken since the previous
+        # call. Same shape and lifecycle as the census — read per call at
+        # turn end, persisted on the cost row, off with the same kill switch.
+        self.context_ledger_hook = ContextLedgerHook()
+        hooks.append(self.context_ledger_hook)
 
         # Per-model-call prompt-cache prefix fingerprints (toolConfig /
         # system prompt / history hashes). Best-effort; the stream
@@ -433,7 +506,12 @@ class BaseAgent(ABC):
             # gateway's runtime per-tool ids (`gateway_<target>___<tool>`)
             # before the FilteredMCPClient can match them.
             gateway_tool_ids = self._expand_gateway_tool_ids(gateway_tool_ids)
-            gateway_client = self.gateway_integration.get_client(gateway_tool_ids)
+            # The JWT-authorized Gateway needs *this user's* access token per
+            # invocation — there is no machine-identity fallback. Passed
+            # explicitly (never cached globally) so tokens can't cross users.
+            gateway_client = self.gateway_integration.get_client(
+                gateway_tool_ids, auth_token=self.auth_token
+            )
             if gateway_client:
                 local_tools = self.gateway_integration.add_to_tool_list(local_tools)
 

@@ -11,6 +11,7 @@ import {
   CreateInferenceJobRequest,
   DownloadResponse,
 } from '../models/fine-tuning.models';
+import { parseIso } from '../../utils/date';
 
 /**
  * State service for the user-facing fine-tuning feature.
@@ -62,8 +63,8 @@ export class FineTuningStateService {
   /** Quota usage percentage (0-100). */
   readonly quotaUsedPercent = computed(() => {
     const a = this.access();
-    if (!a?.monthly_quota_hours || !a.current_month_usage_hours) return 0;
-    return Math.min(100, (a.current_month_usage_hours / a.monthly_quota_hours) * 100);
+    if (!a?.monthly_quota_usd || !a.current_month_usage_usd) return 0;
+    return Math.min(100, (a.current_month_usage_usd / a.monthly_quota_usd) * 100);
   });
 
   /** Total number of training jobs. */
@@ -341,6 +342,6 @@ export class FineTuningStateService {
 
   /** Sort jobs by created_at descending (newest first). */
   private sortByCreatedDesc<T extends { created_at: string }>(jobs: T[]): T[] {
-    return [...jobs].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    return [...jobs].sort((a, b) => parseIso(b.created_at).getTime() - parseIso(a.created_at).getTime());
   }
 }

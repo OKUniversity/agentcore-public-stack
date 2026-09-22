@@ -49,6 +49,18 @@ export interface SpaDistributionConstructProps {
  *     ALL_VIEWER_EXCEPT_HOST_HEADER pass cookies + CSRF + auth headers
  *     untouched. compress=false to preserve `text/event-stream`.
  *
+ *     compress=false does NOT mean `/api/*` responses travel uncompressed:
+ *     it means CloudFront doesn't compress *for* us. app-api gzips its own
+ *     JSON (`apis/shared/middleware/compression.py`), where the response's
+ *     content type is known rather than guessed from a path pattern, and
+ *     CloudFront passes an origin's `Content-Encoding` straight through.
+ *     Accept-Encoding reaches the origin because CACHING_DISABLED leaves
+ *     EnableAcceptEncodingGzip/Brotli off — with both off, CloudFront
+ *     treats Accept-Encoding as an ordinary header, and
+ *     ALL_VIEWER_EXCEPT_HOST_HEADER forwards it verbatim. Turning
+ *     compress=true on would put the edge back in front of the SSE stream
+ *     and gain nothing the origin isn't already doing.
+ *
  * Security headers:
  *   - X-Content-Type-Options, X-Frame-Options=DENY (default-deny iframe
  *     embedding), Referrer-Policy=strict-origin-when-cross-origin, HSTS
@@ -156,9 +168,21 @@ export class SpaDistributionConstruct extends Construct {
         runtime: cloudfront.FunctionRuntime.JS_2_0,
         comment:
           'Strip /api prefix before forwarding requests to the app-api ALB origin',
+        // `x-forwarded-prefix` tells app-api what this function removed, so a
+        // redirect it generates for itself (Starlette's trailing-slash
+        // `redirect_slashes`, chiefly) can be put back on the public URL by
+        // `ProxiedRedirectMiddleware`. Without it those redirects come out as
+        // `http://api.<domain>/<path>` — the origin's own hostname, over plain
+        // HTTP, missing the `/api` prefix — and the browser blocks them as
+        // mixed content, so the caller silently gets nothing.
+        //
+        // Set unconditionally (not only on the stripping branches) so a
+        // viewer-supplied `X-Forwarded-Prefix` is always overwritten rather
+        // than passed through to the origin.
         code: cloudfront.FunctionCode.fromInline(`
 function handler(event) {
   var req = event.request;
+  req.headers['x-forwarded-prefix'] = { value: '/api' };
   if (req.uri === '/api') {
     req.uri = '/';
   } else if (req.uri.indexOf('/api/') === 0) {
@@ -184,6 +208,57 @@ function handler(event) {
       keepaliveTimeout: cdk.Duration.seconds(60),
     });
 
+    // Security headers for the /api/* behavior. Distinct from the SPA policy
+    // above: an API response must never be usable as a *document*, and the SPA
+    // policy's `frame-src` allowances are irrelevant here.
+    //
+    // This matters because /api/* is served from the SAME origin as the SPA, so
+    // any API response a browser can be navigated to is a potential document on
+    // the SPA's origin. app-api serves user-uploaded bytes (skill resources,
+    // agent icons, exports); without `nosniff` a browser may re-sniff those
+    // bytes into text/html, and without a CSP an HTML-typed body would execute
+    // script with the viewer's session cookie and CSRF token. The app-api routes
+    // apply the same controls per-response — this policy is the origin-wide
+    // backstop so a future route cannot regress the whole origin.
+    //
+    // `default-src 'none'` is the load-bearing directive: in a document it
+    // blocks inline `<script>`, external script, and every fetch, so an
+    // HTML-typed API body has no way to reach the SPA's session even if a
+    // browser does render it. `sandbox` is deliberately NOT set here (unlike on
+    // the skill-resource responses themselves, which are only ever read over
+    // XHR): the edge policy covers every /api/* response including
+    // `Content-Disposition: attachment` bodies and OAuth navigations, and an
+    // opaque-origin directive on that whole surface risks breaking a download
+    // for no additional protection over `default-src 'none'`.
+    const apiResponseHeadersPolicy = new cloudfront.ResponseHeadersPolicy(
+      this,
+      'ApiResponseHeadersPolicy',
+      {
+        responseHeadersPolicyName: getResourceName(config, 'api-headers'),
+        comment: 'Security headers for /api/* (same-origin document defense)',
+        securityHeadersBehavior: {
+          contentTypeOptions: { override: true },
+          frameOptions: {
+            frameOption: cloudfront.HeadersFrameOption.DENY,
+            override: true,
+          },
+          referrerPolicy: {
+            referrerPolicy: cloudfront.HeadersReferrerPolicy.NO_REFERRER,
+            override: true,
+          },
+          strictTransportSecurity: {
+            accessControlMaxAge: cdk.Duration.seconds(31536000),
+            includeSubdomains: true,
+            override: true,
+          },
+          contentSecurityPolicy: {
+            contentSecurityPolicy: "default-src 'none'; frame-ancestors 'none'",
+            override: true,
+          },
+        },
+      },
+    );
+
     const apiBehavior: cloudfront.BehaviorOptions = {
       origin: appApiOrigin,
       viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
@@ -192,6 +267,7 @@ function handler(event) {
       cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
       originRequestPolicy:
         cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+      responseHeadersPolicy: apiResponseHeadersPolicy,
       compress: false,
       functionAssociations: [
         {

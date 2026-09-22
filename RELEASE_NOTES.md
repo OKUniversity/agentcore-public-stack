@@ -1,3 +1,2951 @@
+# Release Notes — v1.23.0
+
+**Release Date:** September 20, 2026
+**Previous Release:** v1.22.0 (September 14, 2026)
+
+---
+
+> 🏗️ **A CDK deploy is required.** This release adds two constructs (browser policy, turn-latency observability), a new `agent-templates` table, a CSP change for the MCP sandbox, and a synth-time guard on the uploads bucket. Deploy order is unchanged: `platform.yml` → `backend.yml` → `frontend-deploy.yml`. **No GSI operation** — the one new table is created with no indexes, so no existing table is updated. **No data backfill.**
+>
+> 🛠️ **Operator step — set `CDK_BROWSER_URL_BLOCKLIST` per environment.** The browser URL blocklist previously hardcoded `instructure.com` and the deploy pipeline never forwarded the variable. It now ships **empty** and is supplied per environment. Any environment that uses the browser tool and needs a blocklist must set this variable **before** deploying, or browser sessions can reach any host and the RBAC grant on `browse_web` / `request_user_login` becomes the only control. The synth log prints the list, or warns when it is empty — read it after the deploy. See Deployment notes.
+>
+> ⚠️ **Managed knowledge bases: this deploy applies `CDK_MANAGED_KB_MIGRATION_ENABLED` wherever it is already set to `true`.** The variable is read at deploy time, so an environment where it was set since the last platform deploy gets the Upgrade card on **this** release. Nothing migrates on its own — enrolment is a user-initiated `POST` — but the card becomes visible and users can opt their knowledge bases in one at a time. Confirm the value you want before deploying.
+>
+> 🔑 **`request_user_login` ships off.** Browser sign-in handover is the most restrictive default in the tool catalog: it is its own catalog entry with `enabledByDefault: false`, because while a takeover is live the user has a fully interactive Chromium running inside your AWS account with your egress. Grant it to named staff or evaluator roles, never by default.
+
+---
+
+## Highlights
+
+The agent stops working in silence. **Live turn narration** replaces the cycling "Thinking…" placeholder with what is actually happening — which tool is running, how long it took, and a one-line model-written summary of each finished tool batch ("Found the Syllabus Acknowledgment assignment in BIO 101"). The detail that makes it feel live rather than retrospective is the concurrent drain: status transitions are merged into the SSE stream against a short timer instead of between agent yields, so "Using list_assignments" reaches the client **while that tool is running** rather than after its result. A three-tool browse turn used to narrate nothing for 4.5 seconds. None of it costs anything against the model — nothing the status layer produces reaches the prompt.
+
+And it stops paying to re-read what it already knows. **Document context offload** was the largest single cost item in the fleet: attachments were 31% of production spend, because an attached PDF is re-sent in full on every subsequent turn at the cache-write premium. Now the bytes are replaced by a structured digest and a `document_read` tool pulls back exactly the pages the model asks for. On a 60-page canary the prefix went from **109.1K tokens to roughly 15K** — an 86% drop — and the feature turned out to work *far* better than its own spec predicted, because the instrument was hiding it: `documentTokens` estimated `bytes/4` and Bedrock dual-encodes each PDF page as an image on top of the text layer, understating documents by about **14×**. That is fixed, and every analytic built on it moved with it.
+
+Alongside it, a five-part **compaction overhaul**: thresholds are now model-relative rather than fixed token ceilings that scaled wrong across models, the summary is bounded at 8k tokens, cuts are parked post-turn and applied in place when the prefix re-write is free, oversized tool results are offloaded to S3 at intake with a preview left in context, and the static prefix can take a selective 1-hour cache TTL — priced honestly against the 2× write premium that buys.
+
+**Browser sign-in handover** is the release's one genuinely new user-facing capability. When the agent hits a site it cannot reach, it pauses the turn and hands the user a live, interactive browser to sign in, then continues in the authenticated session. While the user holds it, the automation stream is `DISABLED` at the service — the agent *provably* cannot act, rather than being trusted not to. It ships off by default behind its own RBAC tool id, with a MANAGED Chromium URL blocklist as the second control.
+
+**Response feedback** closes the loop the cost drill-down opened: content-free thumbs joined to cost rows, six reason buckets, retry-with-correction as the consequence behind a thumbs down, implicit copy/continue signals, and fleet-level attribution that reads down-thumb rate by config arm — so "which model/tool/skill combination is actually worse" becomes a number rather than an argument.
+
+Rounding out the release: **`.docx`, `.pptx`, `.csv` and `.xlsx` previews** in a docked pane, **Agent Templates**, a performance pass worth about **500ms off the pre-stream window** (the session row was being read eight times per turn), and a test-integrity fix worth calling out — **25 test cases across 6 files were making real authenticated AWS calls**, hidden by fail-open error handling. An off-box socket guard now blocks them, and the suite runs in half the time.
+
+---
+
+## Browser sign-in handover
+
+The agent can now pause a turn and hand the user a live, interactive browser to sign in to a site it cannot reach — then continue browsing the authenticated session. It is the answer to the class of task that used to dead-end: anything behind an institutional login, an MFA prompt, or a consent screen no automation should be clicking on a user's behalf.
+
+### Backend
+- `agents/builtin_tools/browser/request_user_login` — raises the interrupt from the **tool itself** via `ToolContext`, the same shape as `ask_user_question`. Strands routes it through `_stop_for_interrupts`, so the `PausedTurnSnapshot`, the resume route and the `PendingInterrupt` breadcrumb (`kind: "browser_login"`) need no special case.
+- New `browser_login_required` SSE event, emitted after `message_stop` alongside `oauth_required` and `user_question_required`. Resume posts `{completed: true}` / `{skipped: true}` — always an object, **never null**, or the interrupt re-raises forever.
+- **The event deliberately carries no URL.** `generate_live_view_url` signs with SigV4 *query* auth and caps at 300 seconds, so a minted URL is dead before a human reacts and dead again on reload. app-api mints one per request instead, owner-scoped by conversation, and `assert_no_url` enforces the absence on the interrupt, the event and the persisted row rather than trusting it.
+- While the user holds the browser the automation stream is **`DISABLED` at the service** — the agent cannot act, as a property of the system rather than a promise. The idle reaper exempts the session until `deadlineAt` and no further, which is what stops a walked-away-from takeover billing to its TTL.
+
+### Frontend
+- A first-party sign-in viewer with **no third-party code**: DCV is streamed into a viewer page the SPA frames, sized from the `viewport` the event carries (DCV's `remoteWidth`/`remoteHeight` must match the session viewport or the stream crops, and a second copy of `1280x800` in the SPA is a copy that will drift). Full-screen, and it says plainly that it can be driven.
+
+### Infrastructure
+- `browser-policy-construct.ts` — an S3-backed **MANAGED** Chromium policy object applied per browser session. `URLBlocklist` is a flat list of Chromium URL-filter patterns; a bare host blocks that host on every scheme, port and path.
+- `ConnectBrowserLiveViewStream` is granted on `*`, as AWS requires.
+- `connect-src` in the MCP sandbox CSP now allows `data:` and `blob:` so DCV can load its decoder.
+
+### Gating
+Two independent controls, and the tool needs both. `BROWSER_TAKEOVER_ENABLED` is the kill switch; `request_user_login` is its **own catalog entry** with `enabledByDefault: false` — deliberately separate from `browse_web`, because RBAC granularity is one `tool_id` and an *action* on `browse_web` would have shipped an interactive browser in your AWS account to every user who can browse.
+
+---
+
+## Document context offload
+
+An attached PDF used to be re-sent in full on every subsequent turn, at the cache-write premium. Attachments were **31% of production spend**. Now the bytes are replaced by a structured digest, and a `document_read` tool pulls back exactly the pages the model asks for.
+
+### Backend
+- `document_read` — page ranges and pattern search over an attached document, hard-capped at 20 pages per call.
+- `DocumentDigest` built at upload and persisted on `FileMetadata`: an outline plus a bounded abstract, rendered into context in place of the document.
+- The **restore** path rehydrates stripped documents as digests, and the **live** path offloads unpinned documents once the prefix re-write is free. Both route through one gate, so a single flag read governs them.
+- `estimate_document_tokens` — PDFs count `max(pages × PDF_PAGE_TOKEN_ESTIMATE, bytes/4)`, wired into every consumer of that quantity so a row and a decision can never disagree.
+
+### Measured
+On a 60-page canary in dev: prefix **109.1K → ~15K**. Every mechanism fired correctly — digest-only from turn 2, a `document_read` on turn 3 pulling one page in 170ms, the slice ageing out exactly at `DOCUMENT_SLICE_MAX_TURNS`.
+
+### The instrument was hiding the win
+`documentTokens` estimated `bytes/4`, which ignores that Bedrock **dual-encodes each PDF page as an image** on top of the text layer — understating documents by about **14×**. It reported documents as ~6% of the prefix when they were ~86%. Fixed, with every downstream analytic moved with it.
+
+### Hardened during validation
+An independent sweep of the merged epic produced six findings, all closed before this release: the PDF token estimate above; `DOCUMENT_READ_ENABLED=false` not being coupled to the offload and rehydrate paths (pulling the one kill switch an operator would reach for left the live path still evicting bytes — strictly worse than pre-epic behaviour); **ReDoS in pattern mode**, where a valid but catastrophic regex ran unbounded; an inline byte budget sitting exactly on the quota it existed to stay under; and a soft digest token cap that XML-escaping could overshoot.
+
+### Rollout
+`DOCUMENT_OFFLOAD_ROLLOUT_PERCENT` defaults to **100**. The `crc32(session_id) % 100` bucket exists so an evaluation can run concurrent arms; at 100 there is no control arm, only before/after across the release boundary. Set it lower in an environment where you want both.
+
+---
+
+## Compaction overhaul
+
+Five parts, shipped together, all with kill switches.
+
+- **Model-relative thresholds** (`COMPACTION_MODEL_RELATIVE_ENABLED`) — the cut point scales with the model's window instead of a fixed token ceiling that was right for one model and wrong for the rest. Floor-seeking, with hysteresis so a session does not oscillate across the threshold.
+- **Bounded summary** (`COMPACTION_SUMMARY_MODEL_ENABLED`) — capped at 8k tokens, with per-cut metrics.
+- **Deferred apply** (`COMPACTION_DEFERRED_APPLY_ENABLED`) — cuts are parked post-turn and applied in place when the prefix re-write is free, so compaction stops paying for a re-write it could have had for nothing.
+- **Tool-result offload at intake** (`TOOL_RESULT_OFFLOAD_ENABLED`) — oversized tool results go to S3 with a text preview left in context. `document_read` is exempt: offloading the page slice the model just asked for would undo the read and cost a second round trip.
+- **Selective 1h prompt-cache TTL** on the static prefix, behind a flag and priced against the 2× write premium a 1-hour TTL costs.
+
+The compaction ledger records forced cuts, floor-unreachable decisions, in-place applies and head-of-turn promotions, so a cut's cost is attributable after the fact rather than inferred.
+
+---
+
+## Live turn narration
+
+### `agent_status`
+`thinking` / `tool_start` / `tool_end` phases from `AgentStatusHook`, carrying Strands' own measured `durationMs` and `ok=false` for both a raised exception and a result with `status: "error"`. There is deliberately **no "responding" phase** — the SPA already knows text is streaming from the deltas, and a backend-derived duplicate of a fact the client holds first-hand would only disagree at the edges. Durations are live-only and **not persisted**: a reloaded conversation shows summaries without timings, where a client-invented number would be one the user could not trust.
+
+The concurrent drain is what makes it feel live. Status transitions are merged against a short timer rather than between agent yields, so a status line reaches the client while its tool is still running — a three-tool browse turn previously narrated nothing for 4.5 seconds.
+
+### `tool_group_summary`
+A Nova Micro side-channel task structured exactly like `session_title`: its own Bedrock call on its own messages, concurrent with the agent stream, so it **never appends to the conversation** and adds nothing to the cacheable prefix. Persisted as `TSUM#` rows reusing an existing GSI — zero new infrastructure — and replayed on `GET /messages`, because the event never re-streams. Deliberately **not** written onto the message content blocks: that is the Converse payload, and a display string there would be paid at model rates on every subsequent turn.
+
+With `TOOL_SUMMARIES_ENABLED=false` the SPA's deterministic client-side formatter still renders ("Listed 4 assignments"), so absence is a downgrade in specificity, never a blank.
+
+### Turn timing
+Thinking time and a turn recap, shown in the loader's slot on the latest turn only. The recap is measured from the turn, not the stream.
+
+---
+
+## Response feedback
+
+### Backend
+- Content-free thumbs on assistant messages, persisted as `F#` rows and joined to the turn's cost rows. Turn-class precedence is full > retrieved > digest.
+- Six reason buckets on a down-thumb, plus an explicit/implicit signal discriminator.
+- **Implicit signals** — copy and continue, recorded as unweighted positive signal.
+- **Eval sampling** — down-thumbed turns feed AgentCore Evaluations. **Opt-in at both CDK and runtime**, and deliberately so: it sends real conversations to an AWS-managed judge, which is a scoping decision each environment makes explicitly. An unset GitHub Actions variable cannot enable it.
+
+### Frontend
+- Copy and thumbs reveal on response hover rather than occupying the transcript permanently.
+- **Fleet-level attribution** — down-thumb rate by config arm (model, tools, skills), and a down-thumb reason split on the per-session cost profile.
+
+---
+
+## File previews
+
+`.docx`, `.pptx`, `.csv` and `.xlsx` render in a docked pane — uploaded or generated, and the pane opens automatically on a file the turn just created.
+
+- **`.docx`** via `docx-preview` 0.4.0. Office Online was evaluated and rejected; the renderer needs a detached container to mount correctly.
+- **`.pptx`** via `pptx-preview` 1.0.7, with `echarts` stubbed through a local shim to keep it out of the bundle.
+- **`.csv`** as a data grid, and **`.xlsx`** read server-side with `openpyxl` — which needs two passes, or formulas render blank.
+- One docked rail, extracted into `DockedPaneService` so the preview and artifact panes share it.
+
+---
+
+## Agent Templates
+
+A create-form prefill backed by an admin-managed template store, so a new agent can start from a curated shape rather than an empty form. New `agent-templates` table, no GSIs.
+
+---
+
+## 🐛 Bug fixes
+
+- **Currency in prose rendered as math.** `$4.50 … $9.00` made KaTeX treat everything between the two amounts as a formula, swallowing the prose. An earlier HTML-entity workaround (`$` → `&#36;`) never actually worked — `marked` strips it — and it leaked the entity into generated files, where a user would find `&#36;` in a document the agent wrote. Both are removed and the delimiter handling is fixed at the source.
+- **A new frontend build was not actually served.** The deploy sent no `Cache-Control`, so CloudFront kept serving the old bundle. Hashed filenames do not save you here: `index.html` itself is the stale object, and it is what points at the hashes.
+- **The system-prompt date line carried the hour**, so the cacheable prefix was re-written every hour, for the life of every session, in every conversation.
+- **Deleted conversations were invisible to the admin cost drill-down**, so a user's session list did not reconcile against their total.
+- **A first-turn race re-wrote the prompt-cache prefix** — the chat turn was assembled before the tool and skill lists resolved. The turn now waits for them.
+- **`DOCUMENT_READ_ENABLED=false` left two of three paths running.** It was read only at the tool-injection gate, so pulling the kill switch left restore emitting handles for a tool that was not injected, and left the live path still evicting bytes — strictly worse than pre-epic behaviour, where live bytes never left.
+- **ReDoS in `document_read` pattern mode.** A valid but catastrophic pattern compiled and ran unbounded; the search runs in `asyncio.to_thread`, so the turn hung to the 600s SSE timeout. Now a structural check refuses nested unbounded quantifiers and degrades to literal search (with a note on the payload, so a literal result is never passed off as the regex one), plus a scan budget between lines and pages. **Residual by construction:** a single `re.search` cannot be interrupted, so the budget bounds the walk, never one pathological line.
+- **Synth passed with no CORS rule on the uploads bucket.** A truthy-but-empty origin list (`","`) produced a green synth and no rule at all — the guard existed and the value slipped past it.
+- **Browser policy fixes** — `MANAGED` was being sent at session level, which broke every session; the policy object key was double-prefixed; the caller needed read on the policy object, not just the browser; the live view connected once per `postMessage` instead of once; SigV4 parameters were sent twice; the stream socket was unsigned; the display was sized before the first frame; two live-view URLs were minted per open; and an error was painted over an already-live stream.
+- **Colour steps that failed AA** in light mode — file-type chip text and success-state text both moved to the passing ramp step.
+
+---
+
+## ⚡ Performance
+
+- **~500ms off the pre-stream window.** Instrumentation opened the preamble stage first and showed it was **494ms of a 641–678ms handler total**. The cause was not what anyone guessed: the session row was being read **eight times per turn**, and 445ms of a 455ms stage was DynamoDB reading one item over and over. Reading it once fixed it. A second pass found boto3 clients being rebuilt per call at 1.5ms each, ~21ms and about 20% of the 95ms the warm preamble then cost; quota now takes session cost from the row the preamble already read.
+- **Bytecode precompiled** in the app-api, inference-api and Lambda images. `pip` compiles by default and `uv` does not, so first-touch import was silently being paid at runtime on the first message.
+- **CountTokens bounded on the reply path**, and the model id is no longer swapped mid-call. A throttle now costs one failed request rather than a 5.8-second stall.
+- **Long-term memory through a bounded client**, and the session's own summary is no longer re-fetched on every user message — it re-injected a conversation the model already held, at a lookup per message.
+- **Agent cache widened** to four more injected tool families, and spreadsheet-analysis sessions became cacheable by carrying `assistant_id` in the key. That cohort is the dominant one.
+- **gzip on app-api JSON**, with SSE explicitly passed through un-buffered so response headers are not delayed.
+- **mermaid lazy-loaded** out of the eager scripts bundle; app-api and inference-api ship code root-owned, and app-api no longer ships `/app` twice.
+
+---
+
+## 🔒 Security
+
+- **No test reaches AWS.** 25 test cases across 6 files were making **real authenticated AWS calls** against whatever credentials the runner had, hidden because the code paths fail open — a real call that succeeded looked identical to a mocked one, and a real call that failed was swallowed. An off-box socket guard in `tests/conftest.py` now blocks outbound connections, the quarantine has been burned down, and the suite runs in **half the time**. tiktoken is warmed before the guard arms.
+- **The browser URL blocklist is a security control supplied from outside the repo**, so a deploy that ships an empty one now says so in the synth log rather than failing silently.
+
+---
+
+## ⚠️ Breaking changes
+
+None for end users. Two configuration changes operators must act on:
+
+1. **`CDK_BROWSER_URL_BLOCKLIST` is now required** for any environment that needs a browser blocklist. It previously defaulted to `instructure.com` in code. See Deployment notes.
+2. **`request_user_login` must be granted** to the roles that should have it. It ships `enabledByDefault: false` and is its own catalog entry.
+
+---
+
+## 🏗️ Infrastructure
+
+- **`browser-policy-construct.ts`** — S3-backed MANAGED Chromium policy object for browser sessions, with `ConnectBrowserLiveViewStream` granted on `*` (AWS requires the wildcard).
+- **`turn-latency-observability-construct.ts`** — EMF metrics decomposing the pre-stream window into named stages, so a latency fix is provable rather than asserted.
+- **New `agent-templates` table** — created with **no GSIs**, so no existing table takes a GSI operation in this release.
+- **MCP sandbox CSP** — `connect-src` allows `data:` and `blob:` for the DCV decoder.
+- **Uploads bucket CORS** — synth now fails rather than producing a bucket with no CORS rule.
+- **Platform Stack deploy triggers** on the assets it actually deploys.
+
+---
+
+## 📦 Dependencies
+
+| Component | Package | From | To |
+|---|---|---|---|
+| Backend | `openpyxl` | — | 3.1.5 (new) |
+| Frontend | `docx-preview` | — | 0.4.0 (new) |
+| Frontend | `pptx-preview` | — | 1.0.7 (new) |
+| Frontend | `echarts` | — | local stub shim |
+
+`echarts` is a `pptx-preview` peer that would otherwise pull a large charting library into the bundle for slides that rarely contain charts; the shim needs to be a top-level `file:` dependency to resolve.
+
+---
+
+## 🧪 Test coverage
+
+**19,500+ lines** of test changes across **163 files**, including the off-box socket guard and the quarantine burn-down, 39 tests for `document_read` pattern safety, 7 for the `DOCUMENT_READ_ENABLED` coupling, and a seed/catalog parity test that fails when a tool is catalogued without a row in the bootstrap seeder.
+
+---
+
+## 🚀 Deployment notes
+
+**Deploy order:** `platform.yml` (CDK) → `backend.yml` → `frontend-deploy.yml`.
+
+**Before deploying:**
+
+1. **Set `CDK_BROWSER_URL_BLOCKLIST`** on every environment that needs a browser blocklist — comma-separated hostnames, e.g. `instructure.com,vendor.example.com`. It is a GitHub Actions **environment** variable. Unset resolves to an empty list, and the RBAC grant becomes the only control.
+
+   Chromium's `URLBlocklist` matches on **host**, not on the service behind it, so a site is only as blocked as its hostname list is complete. Prefer the registrable domain (`instructure.com` covers `.test.` and `.beta.` instances) and enumerate vendor, vanity-CNAME, regional and mobile hostnames before you consider an entry done. Do **not** block a vendor's institutional sign-in page — reaching a login page is exactly what an accessibility or VPAT review needs to do; block where it leads.
+
+2. **Confirm `CDK_MANAGED_KB_MIGRATION_ENABLED`** is the value you want. It is read at deploy time, so an environment where it was set to `true` since the last platform deploy gets the Upgrade card on this release. Nothing migrates on its own — enrolment is a user-initiated `POST` — but the card appears and users can opt in.
+
+3. **Decide `DOCUMENT_OFFLOAD_ROLLOUT_PERCENT`.** It defaults to **100**. Leave it there to ship the feature to every session; set it lower in an environment where you want a concurrent control arm to measure against.
+
+**After deploying:**
+
+- **Read the synth log for the blocklist line.** It prints `Browser URL blocklist (N): …`, or warns that the list is empty. An empty list on an environment that expected one means the variable did not reach the synth.
+- **Grant `request_user_login`** to the roles that should have browser sign-in handover. `seed_bootstrap_data.py` **skips any tool row that already exists**, so in an environment whose catalog predates this release the row is created only if it was never there; the grant is always a separate step.
+- **`list_spreadsheets` and `analyze_spreadsheet`** are now in the seeder. Existing environments already have these rows (they were created by hand) and the seeder will skip them; a **fresh** deployment gets them for the first time.
+
+**No data backfill is required.** **No GSI operation** is performed against an existing table.
+
+**Kill switches.** Every feature in this release ships with one, and all default on except where noted: `BROWSER_TAKEOVER_ENABLED`, `AGENT_STATUS_ENABLED`, `AGENT_STATUS_LIVE_DRAIN_ENABLED`, `AGENT_PREPARING_PHASE_ENABLED`, `TOOL_SUMMARIES_ENABLED`, `DOCUMENT_READ_ENABLED`, `DOCUMENT_OFFLOAD_ENABLED`, `DOCUMENT_REHYDRATE_ENABLED`, `DOCUMENT_DIGEST_ENABLED`, `TOOL_RESULT_OFFLOAD_ENABLED`, `COMPACTION_MODEL_RELATIVE_ENABLED`, `COMPACTION_SUMMARY_MODEL_ENABLED`, `COMPACTION_DEFERRED_APPLY_ENABLED`, `RESPONSE_FEEDBACK_ENABLED`, `ATTACHMENT_TURN_GUARD_ENABLED`, `ATTACHMENT_TOOL_AUTOENABLE_ENABLED`, `TURN_LATENCY_METRICS_ENABLED`, `INFERENCE_WARMUP_ENABLED`. Opt-in (default **off**): `FEEDBACK_EVAL_SAMPLING_ENABLED`, `MEMORY_SUMMARY_NAMESPACE_RETRIEVAL_ENABLED`, `BEDROCK_RESPONSES_EXPLICIT_CACHE_ENABLED`.
+
+---
+
+# Release Notes — v1.22.0
+
+**Release Date:** September 14, 2026
+**Previous Release:** v1.21.0 (September 13, 2026)
+
+---
+
+> ✅ **No CDK deploy required.** The only infrastructure changes in this release are a jest config and a version bump. Deploy `backend.yml` then `frontend-deploy.yml`. No new AWS resources, no GSI operation, no SSM parameter, no IAM change, no data backfill.
+>
+> 🛠️ **One operator step, per environment: enable the Clarifying Questions tool.** `seed_bootstrap_data.py` **skips any tool row that already exists**, so flipping `enabledByDefault: True` in the seed reaches a fresh bootstrap only. Wherever an `ask_user_question` row is already in the catalog, an admin has to turn it on; wherever the row has never existed, the seed will create it enabled — but a role whose `grantedTools` is not `*` still needs the grant added. Without this, the feature ships invisible: the model simply keeps asking in prose, exactly as before. See Deployment notes.
+>
+> ⚠️ **An `@`-mention now binds the conversation.** Mentioning an Agent into an **empty** thread binds it, like launching from its card; mentioning into a thread that **already has messages** opens a **new** conversation with that Agent. There is no third outcome — the mention no longer runs one turn and reverts. This reverses design decision D11 on measured evidence, and it retires a failure mode where the Agent's tools vanished silently after the first turn. See Breaking changes.
+>
+> 🗂️ **Nothing carries forward from v1.21.0's backfill note if you have already run it.** If you have *not*, `backend/scripts/backfill_tool_catalog_index.py` is still required in that environment — it is unaffected by this release, but the tool catalog's sparse-index read still answers "nothing matched" rather than "something is wrong".
+
+---
+
+## Highlights
+
+The agent can stop guessing. **Clarifying questions** ship end to end: when a request is genuinely ambiguous, the agent pauses the turn, the SPA renders a multiple-choice picker inline in the transcript, and the answer resumes that same tool call — surviving a page refresh. The tool itself worked from the second PR; the interesting part is that the model almost never reached for it — 4 times in 24 deliberately ambiguous requests. Rewording the tool description and moving it in the tool list both stayed inside the noise band. A short system-prompt clause, added only when the tool is actually in the turn's effective list, took it to **24/24 on ambiguous requests while leaving clear requests at 0/18** — it asks when asking helps, and does not turn direct questions into interrogations.
+
+Administrators can now follow a cost number to its cause. The **cost drill-down** closes the gap between "top users by cost" and the per-session anatomy: user → conversations → session profile, with 15 diagnosis rules that encode classifications prior quota investigations reached by hand, a per-call context trajectory chart with the compaction threshold always in view, and a "Copy diagnostic JSON" button meant to be handed to a model for a second opinion. It is **content-free by construction** — a denylist of every content-bearing attribute on the session, cost and upload row families, enforced by a test that walks every admin cost response model and a moto test that seeds real content and proves none of it comes back.
+
+Two silent data bugs are fixed, both of the worst shape: invisible, cumulative, and delayed. Deleting a knowledge-base document **while it was still uploading permanently stranded its byte reservation** — every cancelled upload shaved bytes off that assistant's allowance forever, and would have surfaced months later as "uploads stopped working" with no failure anywhere near the deletes that caused it. And **born-managed provisioning could not tell an established legacy agent from a new one** — legacy KBs share one S3-Vectors index and never write a `KB_Record` — so an established agent's *next* upload was mistaken for its first, flipping retrieval to an empty managed KB and stranding the existing corpus.
+
+Generated documents are downloadable again. A `.docx` from `create_word_document` rendered a card whose button worked while the markdown link beside it returned `AccessDenied`: the tool result handed the model a ~1,400-character presigned S3 URL, and the model re-emitted it in prose truncated at the `?`. Signed URLs no longer go anywhere they can be copied or persisted, which also drops that tool result from ~1,500 to ~330 characters **inside the cacheable prefix, for the life of the session**.
+
+---
+
+## Clarifying questions
+
+When a request is genuinely ambiguous, the agent stops and asks instead of guessing — and the user answers with two clicks rather than by retyping the request.
+
+### Backend
+
+- `agents/builtin_tools/ask_user_question.py` — the tool. Unlike `oauth_required` and `tool_approval_required`, the interrupt is raised by the **tool itself** through `ToolContext`, not by a `BeforeToolCall` hook. Strands routes both through `_stop_for_interrupts`, so the `PausedTurnSnapshot`, the resume route and the `PendingInterrupt` breadcrumb (`kind: "user_question"`, questions JSON-encoded) needed no special case.
+- `apis/shared/user_questions/models.py` — the question schema, and the normalizer that **strips model-supplied Other/Skip options**. The picker always offers both, so a model that includes them produces duplicates. The same module discourages a second round of questions.
+- New `user_question_required` SSE event, emitted after `message_stop` in the same `done` block as `oauth_required`. Payload `{type, interruptId, toolUseId, questions}`, each question `{header, question, multiSelect, options: [{label, description?}]}`.
+- The resume contract has one sharp edge, and it is pinned by tests: the POSTed `response` must **always be an object**, never `null`. `ToolContext.interrupt` only treats a non-`None` response as an answer, so a null re-raises the interrupt forever. "Skip" sends `{skipped: true}`.
+- `apis/shared/sessions/metadata.py` — the breadcrumb that lets a pending prompt survive a reload.
+- `chat_agent.py` — `_system_prompt_for(tools)` appends the guidance clause. Three deliberate choices: gated on the tool so a user without it never carries an instruction to call it; keyed on the **post-filter** tool list rather than the request's `enabled_tools`, because the two diverge (`ToolFilter` drops a catalog id the registry does not know — `canvas_faculty` does this in dev today) and keying on the request would advertise a tool absent from `toolConfig`; and applied to the prompt handed to the agent, **never** to `self.system_prompt`, which is snapshotted for resume and hashed into the agent cache key.
+
+Three approaches were measured and ruled out, recorded so they are not retried: rewording the tool description (44–56%, inside a 17–44% baseline band), moving the tool's position in the list (25–38%), and removing the prompt's "Cost Awareness" clause (38%). Only the system-prompt clause escapes the noise, so the text is load-bearing in that position and ships byte-identical to what was measured, with a test pinning it.
+
+### Frontend
+
+- `services/user-question/user-question.service.ts` and `user-question-prompt.component.ts` — the picker in the transcript: full-width, one stroke on a selected option, Other and Skip always offered.
+- `stream-parser-core.ts` / `stream-parser-types.ts` — `user_question_required` parsing.
+- `session/user-question-hydration` — rehydrates a pending prompt from `GET /messages` after a refresh, so a reload lands back on the question rather than a turn that can never finish.
+
+### Cost
+
+The tool spec is a constant in the cacheable `toolConfig` prefix (~630 tokens) and the questions travel on the SSE channel only — just the one-line formatted answer block re-enters the conversation. The system-prompt clause is ~63 tokens, constant per configuration. Gated by `ASK_USER_QUESTION_ENABLED` (default on with a kill switch); while off the tool is never registered, so the model falls back to asking in prose.
+
+Spec: `docs/specs/ask-user-question.md`.
+
+---
+
+## Admin cost drill-down
+
+An admin can start from a user, list their conversations **without reading any of them**, and open one for the diagnostic profile a developer — or a model handed the JSON — needs to find cost-effectiveness work.
+
+### Backend
+
+- `apis/shared/observability/content_policy.py` — the denylist of every content-bearing attribute on the session/cost/upload row families, three aliased allowlist projections, and the walkers. Enforced two ways: a test that walks **every** admin cost response model (one named exemption, `TopSessionCost.title`, kept by decision) and a moto test that seeds content and proves none of it returns.
+- `GET /admin/costs/users/{id}/sessions` and `GET /admin/costs/sessions/{id}/profile`, scope `admin.costs`. Unrecorded cost renders `costKnown=false` — never `$0`, which would read as "this conversation was free."
+- `admin/costs/diagnoses.py` — 15 pure rules with numeric evidence and a stated fix: prefix spiral, partial-miss heavy, over-threshold, summary over budget, prompt/`toolConfig` mutation, agent-cache bypass, attachment-heavy, and more.
+- `get_session_cost_records` now projects the twelve attributes the anatomy consumes, which closes the `citations[].text` read on the existing path.
+- Top-users enrichment (email, tier, quota %) replaces a hard-coded `None`.
+
+No new table, no GSI operation, no feature flag — read-only, admin-only, and it degrades to "not tracked" wherever a counter predates the session.
+
+### Frontend
+
+- `/admin/users/:userId` gains a **Conversations** section (owned by the costs feature, rendered only for admins holding `admin.costs`): period and sort controls, per-row model, tools on, a context bar against the window, cost with share of the user's month, cache waste, and a severity dot for the diagnoses that fired. A row opens the anatomy.
+- `/admin/costs/sessions/:id` gains a **profile band** (messages, model calls and mix, tool calls, attachments, compactions, peak context of window, write:read), an expandable **Diagnoses** list (severity chip, headline, code, suggestion, evidence, ref), a **context trajectory chart** with the compaction threshold always in view, a back-to-user link, and **Copy diagnostic JSON**. The profile loads independently of the anatomy, so one failing does not hide the other.
+
+Verified in-browser against dev data: 93 conversations listed for September's top user, profile + diagnoses + chart rendered, dark mode through both levers, and the copy produced a 15.8 KB document with no denylisted keys.
+
+### The one signal that had to be recorded
+
+Which tools a conversation called, how often, and how often they failed could not be derived from existing rows. `ToolCensusHook` tallies tool name → `{calls, errors}` per model call using the same cycle counter `AgentStatusHook` uses; the stream coordinator attaches each call's tally to that call's `C#` cost row as `toolCalls`. `toolCallCount` / `toolErrorCount` ride the existing session-aggregate `UpdateItem` alongside `totalCost`, and a monotonic `compactionCount` rides the compaction-state update — the persisted `compaction` map is last-write-wins and cannot count occurrences.
+
+Everything here is **additive attributes on rows the turn already writes**: no table, no index, no backfill, and nothing reaches the prompt, so the cacheable prefix is untouched. Sessions that predate it read "not tracked" rather than `0`. Gated by `COST_DIAGNOSTICS_ENABLED` (default on with a kill switch).
+
+Spec: `docs/specs/admin-cost-drilldown.md`.
+
+---
+
+## Knowledge base — storage usage, and two silent data bugs
+
+### Storage usage on the KB card
+
+The agent's knowledge-base card now shows how much of the byte cap is in use. `_resolve_kb_usage` reads the `KB_Record` once: managed KBs report their bytes and the binding's effective cap (the min of owner tier and per-KB ceiling); legacy S3-Vectors KBs are uncapped and show "X stored" with no denominator and no colour ramp. Green / yellow / red at <75 / 75–90 / ≥90%. Best-effort throughout — a record-read failure never breaks the documents list.
+
+### Deleting mid-upload leaked bytes, permanently
+
+The request-time byte reservation is released on every abandon path except one: deletion. Ingestion reaching terminal, a client-reported upload failure and the stale sweep all release; a deleted document reached none of them, so its reservation was stranded forever. Each cancelled upload permanently shaved bytes off that assistant's allowance — surfacing months later as "uploads stopped working", with no failure anywhere near the deletes that caused it, which is exactly what `byte_cap.release`'s own docstring warns about. `soft_delete_document` now releases through `release_reservation_if_managed`, whose `settle_once` stamp makes it exactly-once against the other three paths.
+
+The same delete also popped **five "Not found" dialogs**. The polling loop tolerates five consecutive 404s and the component already handled `DOCUMENT_NOT_FOUND` cleanly — but the global `errorInterceptor` pops a dialog for every failed request *before* any caller's catch runs, so correct handling was invisible and the user got one dialog per tolerated retry. The poll's reads now set `SUPPRESS_ERROR_TOAST`, and the loop is finally stoppable: `deleteDocument` had always dropped the id from `pollingDocuments`, but that signal was display-only and the running loop never read it.
+
+**Known and deliberately not fixed here:** neither ingestion pipeline checks whether a document is `deleting`. If the S3 PUT completes after the delete, the managed consumer ingests it and writes `complete` over `deleting` — deleted content becomes answerable again and the row returns. That is a data-correctness bug on the live ingest path and needs its own change with its own mutation guards.
+
+### Born-managed provisioned over an established legacy agent
+
+Born-managed treated the absence of a `KB_Record` as "brand-new agent". But legacy KBs are not first-class — they share one S3-Vectors index and never write a record — so an established legacy agent looked identical to a new one. Its **next** upload was therefore mistaken for a first upload, flipping retrieval to an empty managed KB and stranding the existing corpus on the legacy index. The record-is-`None` branch is now guarded on an existing-documents check (`assistant_has_documents`: cheap COUNT, `Limit=1`), provisioning only at zero documents and failing toward legacy on any probe error.
+
+---
+
+## Generated documents download reliably
+
+A `.docx` produced by `create_word_document` rendered a download card whose button worked, while the markdown link the model wrote underneath it returned S3 `AccessDenied` (reported on prod session `6b247682`). The conversation shows why: the tool result handed the model a ~1,400-character presigned S3 URL, and the model re-emitted it in prose **truncated at the `?`** — signature gone. Two turns in that one session did it. The card's own button was on a clock too: the signature expired an hour after the message was written, so reopening an older thread would have failed the same way.
+
+Signed URLs no longer go anywhere they can be copied or persisted:
+
+- The office tools and `workspace_write` put `upload_id` in the card payload instead of a presigned URL, and the summary tells the model the card is already on screen so it does not compose a link of its own. **The tool result drops from ~1,500 to ~330 characters — per document, in the cacheable prefix, for the life of the session.**
+- New `GET /files/{uploadId}/download` on app-api: cookie-authed, owner-scoped, 302 to a freshly minted presigned URL with `Cache-Control: no-store`. A link to it works for as long as the file does.
+- The SPA card resolves `upload_id` through that route and falls back to recovering the upload id out of a legacy `download_url`'s S3 key, so cards already persisted in conversations heal on render. The global `marked` `renderer.link` rewrites raw user-files S3 hrefs the same way — which fixes the links already sitting in shipped conversations.
+
+Verified against dev: the route 302s for an owned file and 404s otherwise, the minted URL serves 200 while the truncated form is 403, and the exact link from the bug report renders as `/api/files/{uploadId}/download` while unrelated links are untouched.
+
+---
+
+## 🐛 Bug fixes
+
+- **A mentioned Agent silently lost its tools after the first turn.** The thread still looked like the Agent's while its tools, skills and model were gone, and nothing surfaced the change — not the UI, and not the model, which cannot know its own toolset shrank. Asked to use a tool it had used a moment earlier it got `Unknown tool: create_rubric`, and told the user to toggle that tool in the picker: a confident wrong diagnosis sending them to fix a setting that was already correct. Fixed by the binding change under Breaking changes.
+- **"Continue" after a `max_tokens` truncation dropped the Agent entirely** — on the path users are explicitly told to use. The SPA was already resending `rag_assistant_id` (`continueTruncatedTurn`'s own comment says "so the backend rebuilds the same model/tools/assistant agent"); only a `not is_continuation` guard discarded it, so a properly launched Agent finished its reply with none of its tools, skills, model or instructions. The block now runs for a continuation, with binding validation and persistence skipped (it binds nothing new) and RAG skipped (the turn carries an empty message, so a KB search would spend a query on `""`).
+- **19 of 51 chat greetings wrapped to a second line.** The greeting heading sits in a 616px text column at `text-4xl/tight`, and because it types out a character at a time, the wrap happened in full view and pushed the composer down mid-animation. Twenty offenders rewritten shorter, keeping the voice. Two were stock `DEFAULT_GREETING_TEMPLATES` entries pinned verbatim by a golden spec — "How can I help you today, {name}?" wrapped for any first name of 8 characters or more, so the pin was preserving a bug. A new `greeting-line-length.spec.ts` holds the line: jsdom has no font metrics, so it sums per-character advance widths captured from the real InterVariable woff2 in the app's own `<h1>`, which tracks browser layout to within ±7px across 455 name/greeting combinations. Narrow viewports are deliberately out of scope — below ~720px the column is the viewport, and no greeting worth writing fits a phone on one line.
+- **The KB storage usage bar showed for legacy (Classic) KBs**, which are uncapped and have no denominator to show.
+- **Cost diagnostics crashed the scheduled-runs image** — `feature_flags` was not shipped in `Dockerfile.scheduled-runs`.
+
+---
+
+## 🔒 Security
+
+- **The remaining log-injection sinks are sanitized.** User-controlled values reaching `logger` calls in admin role pins, model icons, fine-tuning routes, sessions, skills (routes, service and user service), tool discovery, and the inference-api chat routes now pass through `scrub_log()`.
+- **The nightly workflow's ref allowlist is guarded by a test** — `tests/supply_chain/test_nightly_ref_allowlist.py` pins which refs the nightly build may check out, so widening it is a reviewed change rather than an edit nobody notices.
+
+---
+
+## ⚠️ Breaking changes
+
+### An `@`-mention binds the conversation instead of borrowing one turn
+
+Mentioning an Agent used to run **that turn** as the Agent and silently revert the next one. A mention now *means* "talk to this Agent", with two outcomes and no third:
+
+| Thread state | What a mention does |
+|---|---|
+| **Empty** | The Agent **binds** the conversation, exactly like launching it from its card. Safe, because there is no history for the binding to misrepresent. |
+| **Has messages** | The message opens a **new conversation** with that Agent, and the SPA says so. The Agent cannot be bound to history written under other instructions. |
+
+This reverses design decision D11 rather than repairing an oversight — D11 chose the per-turn reading deliberately. **What changed is the evidence.** Measured on prod `sessions-metadata` via `turnAgentId` on the `C#` rows: of **247 mentions, 247 started the conversation.** Zero were mid-thread consults; zero mentioned a second Agent inside a thread bound to a first. (Dev: 60 of 61.) The borrow was paying an invisible failure mode for a case that has never occurred.
+
+**Migration:** none required. Persisting `preferences.assistant_id` is necessary but not sufficient — every turn's Agent is resolved from the request, the SPA's only carrier is the `assistantId` query param, and the self-heal that refills it from preferences runs on session *load*. So the SPA now sets the param and stops sending `agent_mention` at all. The backend still honours that flag for clients that predate this change, and `binds_conversation` gains `thread_is_empty` so a stale tab mentioning into a fresh thread lands where a current one does. The thread lookup runs only for mention turns, so no bound-Agent turn pays a query it cannot act on.
+
+**Two known costs retire with the borrow:** the ~$0.12-per-mention prefix re-write (a bound conversation swaps once and stays, instead of swapping back), and the history fork, where the mention agent and the plain agent were two cached instances that never saw each other's turns.
+
+A resume still skips the binding block, and always did keep its tools — it rebuilds from `PausedTurnSnapshot`, replaying the original turn's exact `enabled_tools` / `system_prompt` / `enabled_skills` to reconstruct the same prompt-cache key. Worth stating because resume rows carry no `turnAgentId`, so a census of "turns with no Agent" reads them as losses and overcounts badly.
+
+The rule lives in one testable place at each end — `mention-routing.ts` on the client, `agent_binding_policy.py` on the server.
+
+Spec: `docs/specs/agent-marketplace.md` (D11 + Phase 7 notes).
+
+### The chat send button is an up arrow
+
+Cosmetic, listed only because it changes a control users reach for without looking.
+
+---
+
+## 🏗️ Infrastructure
+
+**No CDK deploy is required for this release.** The only files that changed under `infrastructure/` are `jest.config.js` and the version in `package.json`. No new AWS resources, no GSI operation, no SSM parameter, no IAM change.
+
+Two new environment variables are read by the backend, and **both default to enabled when unset**, so neither needs to be plumbed to ship the features:
+
+| Variable | Default | Effect when `false` |
+|---|---|---|
+| `ASK_USER_QUESTION_ENABLED` | on | The tool is never registered, never reaches `toolConfig`, and the agent falls back to asking in prose |
+| `COST_DIAGNOSTICS_ENABLED` | on | No census / counter attributes are written; the admin profile reads "not tracked" rather than `0` |
+
+Flipping `ASK_USER_QUESTION_ENABLED` changes `toolConfig` and therefore re-writes the cacheable prefix once for each session in flight at the time — the ordinary cost of a deploy-time tool change, not a per-turn one.
+
+---
+
+## 🔧 CI/CD
+
+The PR gate got meaningfully faster, without giving up any coverage or type safety.
+
+- **Backend pytest runs in parallel.** `pytest -n auto` fans ~3k tests across all runner cores instead of running single-threaded. The suite is xdist-safe: moto mocks and hypothesis are per-worker, and no test mutates shared on-disk state. `-v` is dropped from `backend/pytest.ini`, which had produced thousands of `PASSED` lines with no diagnostic value. The nightly coverage run (`scripts/backend/test.sh`) stays serial on purpose.
+- **Infra jest is transpile-only.** `isolatedModules` stops each jest worker re-type-checking the whole project — the dominant cost of the infra suite, and the long pole once backend went parallel. Type safety is preserved by adding a single `tsc --noEmit` step to the infra CI job; previously only ts-jest enforced it on PRs, with `tsc` running only in `teardown.yml`. Workers stay at 2 — the `--maxWorkers` bump regressed 2.5×. There is no `const enum` in the tree, so `isolatedModules` is safe.
+
+---
+
+## 📦 Dependencies
+
+| Component | Package | From | To |
+|---|---|---|---|
+| Backend (dev) | `pytest-xdist` | — | 3.6.1 |
+
+---
+
+## 🧪 Test coverage
+
+**5,500+ lines of new tests**, including 17 new backend test modules and 9 new frontend specs:
+
+- **Clarifying questions** — the tool, the question models and the Other/Skip normalizer, the SSE events, an end-to-end interrupt/resume integration test, the system-prompt guidance (pinned byte-identical to what was measured), the SPA service, and refresh rehydration.
+- **Cost drill-down** — the content policy walked across every admin cost response model, a moto test that seeds content and proves none returns, the diagnosis rules, the drill-down routes, the session-profile and user-sessions services, top-users enrichment, and content-free projections; plus the trajectory chart, the conversations component and the profile util on the frontend.
+- **Tool census** — the hook, the stream-coordinator attach, persistence, and the session-manager rollups.
+- **Knowledge base** — 6 tests covering reservation release on delete across the paths that must not double-settle, and the born-managed mutation guards.
+- **Downloads** — the new route (owned / not-owned / legacy-key recovery), the download URL util, and the card renderer.
+- **Mention routing** — the client-side rule, matched against the server-side `agent_binding_policy` tests.
+- **Greetings** — 455 name/greeting combinations measured against real font advance widths.
+- **Supply chain** — the nightly ref allowlist.
+
+---
+
+## 🚀 Deployment notes
+
+**Deploy order:** `backend.yml` → `frontend-deploy.yml`. **Skip `platform.yml`** — there is no infrastructure change in this release.
+
+### Required: enable the Clarifying Questions tool, per environment
+
+The feature is otherwise invisible. `seed_bootstrap_data.py` **skips any tool row that already exists** (`Tool '…' already exists — skipped`), so the seed's `enabledByDefault: True` only takes effect on a fresh bootstrap.
+
+1. Check whether the environment's tool catalog already has an `ask_user_question` row.
+   - **It does** (any environment where the seed has run since this release's first PR): flip it on in the admin tool catalog. The seed will not do it for you.
+   - **It does not**: run `seed_bootstrap_data.py`, which creates it enabled.
+2. Confirm the grant. The tool ships `isPublic: False`. The `default` role carries `grantedTools: ["*"]` and so picks it up automatically; **any role with an explicit tool list needs `ask_user_question` added.** Per the RBAC rule in `CLAUDE.md`, the grant lives on the role record — listing the role on the tool grants nothing.
+3. Verify by sending a deliberately ambiguous request and confirming the picker renders.
+
+To opt an environment out entirely instead, set `ASK_USER_QUESTION_ENABLED=false`.
+
+### No backfill in this release
+
+No `backend/scripts/backfill_*.py` script was added, and the release guard confirms it. The cost-diagnostics counters are additive attributes on rows the turn already writes — sessions that predate them read "not tracked", by design, so there is nothing to populate retroactively.
+
+If v1.21.0's `backfill_tool_catalog_index.py` has **not** yet been run in an environment, it is still outstanding there. Nothing in this release changes it, but the tool catalog's sparse-index read still answers "nothing matched" rather than "something is wrong":
+
+```bash
+AWS_PROFILE=<env> backend/.venv/bin/python backend/scripts/backfill_tool_catalog_index.py \
+    --table <prefix>-app-roles --region us-west-2 --apply
+```
+
+Verify `skipped=0 failed=0`, then confirm with a live `query … --select COUNT` on the index — **not** `describe-table` `ItemCount`, which DynamoDB refreshes roughly every six hours and which therefore reports `0` right after a correct backfill.
+
+### Rollback
+
+Every new surface in this release is additive and read-tolerant. The two kill switches (`ASK_USER_QUESTION_ENABLED=false`, `COST_DIAGNOSTICS_ENABLED=false`) disable the clarifying-questions tool and the cost counters without a redeploy of the previous image. The `@`-mention binding change has no kill switch — it is a code path, and reverting it means reverting the release.
+
+---
+
+# Release Notes — v1.21.0
+
+**Release Date:** September 13, 2026
+**Previous Release:** v1.20.0 (September 9, 2026)
+
+---
+
+> 🏗️ **CDK deploy required.** One new GSI (`EntityTypeIndex`) on the **existing** `{prefix}-app-roles` table, `sagemaker:CreateModel` on the app-api task role, a CloudFront `x-forwarded-prefix` header on the `/api/*` behaviour, one new CloudWatch alarm, and a new app-api task-definition revision. **Exactly one GSI operation on one existing table** — the release guard passes — but the index must reach `ACTIVE` before the catalog read is trustworthy. See Deployment notes.
+>
+> 🗂️ **A backfill must be run, in every environment, as part of this deploy.** `backend/scripts/backfill_tool_catalog_index.py` stamps `EntityTypeIndex` keys on tool rows written before they existed. The tool catalog's read moves onto that sparse index in this same release, and a sparse index answers *"nothing matched"*, not *"something is wrong"* — an unrun backfill looks like a short tool list, not an outage. There is a Scan fallback that covers the zero-result case, but it logs an ERROR and costs an extra read per cache fill; it is a safety net, not the plan. Exact command in Deployment notes.
+>
+> ⚠️ **This release removes the only way to select a Conversation Mode.** The composer's settings drawer is deleted, and the picker meant to replace its Mode control was parked before release pending feedback on its placement. Prod carries one enabled mode — **Guided Learning**, a Socratic tutoring prompt — and its use is accelerating: 1 session in July, 20 in August, **60 in the first 12 days of September**. The backend is entirely untouched, so restoring the control is a revert rather than a rebuild. **This is a decision to take knowingly before deploying**, not a detail to discover afterwards. See Breaking changes.
+>
+> 🎨 **Two brand tokens are now banned in new code.** `dark:text-primary-400` for colored text and `bg-primary-50|100|200` as a tint fill. The `primary` scale is generated from #0033a0 by lightness offset alone and keeps full chroma at every step, so `primary-50` is a saturated mid-blue, not the pale wash its name implies — and both fail WCAG AA. Existing occurrences are swept in this release.
+
+---
+
+## Highlights
+
+Global preferences finally have a home. **Customize** — `/customize/tools`, `/customize/skills`, `/customize/connectors` — replaces the composer's settings drawer, which had been quietly lying about scope: tool and skill enablement is durable, account-wide state, and it lived in a container that reads as "settings for this conversation." A user who switched on a tool to get through one question had changed the `toolConfig` of every future turn, and nothing in the UI said so. Tools and skills now have real detail pages, an MCP server's sub-tools can be enabled one at a time, and typing **`/skill-name`** in the composer invokes a skill for a single message the way `@agent` already did.
+
+Chat stops guessing about itself. A four-tool answer used to render as five separate assistant cards, each paying full chrome, so the actual answer was pushed below the fold; it is now **one card**. The loading indicator's twenty invented phrases ("Pondering", "Consulting the archives") are replaced by two states that are literally true — `Thinking 12s`, `Running browse_web 4s` — fed by a new **`agent_status`** SSE event, and each finished tool batch gets a model-written summary line ("Found the Syllabus Acknowledgment assignment in BIO 101") from a **`tool_group_summary`** side-channel that never touches the conversation or the cacheable prefix.
+
+Three cost reductions land on the same request path. The tool catalog moves off a full-table Scan onto a new sparse index — the `app-roles` table is shared with one preferences row **per user**, so that read's cost had been growing with *enrollment* rather than with the number of tools. Four tenant-global catalogs gain a TTL + single-flight cache, so 300 students signing in together no longer issue 300 concurrent scans. And the per-request user-profile upsert is throttled: one SPA first load had been issuing **24 DynamoDB operations against a single item**, all writing identical values except `last_login_at`.
+
+Two fixes are worth reading even if you don't use what they sit under. Loading any conversation page on a CloudFront deployment logged **blocked mixed content** — Starlette's own trailing-slash redirect, rendered from the internal ALB hostname over plain HTTP, leaking that hostname into a page the user can read while the caller silently got nothing. And the agent designer's preview pane was **silently dropping tool calls**: one requested `upload_course_file` produced ~316 attempts and zero invocations of the backing Lambda, because the preview ran a second SSE parser that implemented 9 of ~27 events and dropped the rest without so much as a parse error.
+
+---
+
+## Customize — a home for global preferences
+
+Tool and skill enablement is per-user, durable and account-wide. Until this release it lived in a ~320px drawer hanging off the composer, which is the wrong container for it in two distinct ways: it presented global state as conversational, and per-tool MCP enablement means a single server can exceed the drawer's comfortable length on its own.
+
+### Frontend
+
+- `customize/tools/customize-tools.page.ts`, `customize/skills/customize-skills.page.ts` — search, category chips and a responsive grid, borrowing the browse idiom from `agents/discover`. Both read the existing root services, so a toggle here and (while it lived) the drawer stayed in sync with **no new endpoints and no new state**.
+- `customize/tools/customize-tool-detail.page.ts` — `/customize/tools/:toolId`. The full description, an MCP server's tools one by one with their own switches, the prompts and resources the server exposes, and the catalog facts behind it. The drawer's tab strip did not come along: tabs existed because the pane was 320px, and on a page Tools / Prompts / Resources / About are stacked sections that find-in-page can reach. The problem tabs were solving — a 48-tool server — is solved directly, with a filter box above eight sub-tools.
+- `customize/skills/customize-skill-detail.page.ts` — the SKILL.md body rendered expanded (sanitized markdown; it is text the user's own turns already load), supporting files, composed skills, and the advisory `allowed-tools` frontmatter labelled as advisory.
+- `customize/connectors/customize-connectors.page.ts` — moved wholesale from Settings via `git mv`, so history follows. Connecting an account and enabling the tools that need it are one user intent; the Tools tab marks a tool "connect", and the place to act on that had lived under a different top-level page.
+- `customize/components/customize-card.component.ts`, `customize-tabs.component.ts` — the shared card (with a `detailLink` input) and tab strip.
+
+A deliberate hazard the pages are written around: **the Agent binding lock is conversation-scoped state held on root singletons that `session.page.ts` never releases on teardown**, so a user arriving from an agent-bound chat carries it. A global preference page must not consult it. These pages read `tools()` / `skills()` and `isEnabled` rather than the `visible*` / `isShownEnabled` display shims, and write with `respectAgentLock: false`. Without that, the catalog would show the Agent's bound subset and every switch would silently do nothing.
+
+The detail page is a new component rather than a port of the drawer's `ToolDetailComponent`, for the same reason: the drawer was conversation-scoped and wrote through the Agent lock, and reusing it would reopen the exact seam this epic exists to close.
+
+### Skills, consolidated
+
+`/my-skills` was a top-level route reachable only by a link-out from `/customize/skills`, so the same noun lived in two places with two different answers to "what skills do I have?" — one page listed what you authored, the other what you could turn on, and neither showed the whole set. Both now live under `/customize/skills`, split by a `scope` query param: **Yours** (authored at any status, plus catalog skills you turned on) and **Discover** (granted catalog skills still off).
+
+No backend change was needed for the merge — it combines `GET /skills/` (accessible + ACTIVE, with the preference) and `GET /skills/mine` (the authored tier at every status). That merge is what keeps a DRAFT skill visible to its author: widening `GET /skills/` to carry drafts would surface them in the composer picker, which the runtime refuses to activate, so a draft would get a dead toggle. It has no toggle at all instead.
+
+### Backend
+
+- `apis/app_api/skills/routes.py` — new `GET /skills/{id}` and `GET /skills/{id}/resources/{filename}`, access-checked by `resolve_accessible_skill_ids`, the same resolution that builds the picker. The only per-skill read that existed was owner-scoped, so a catalog skill granted to you 404'd there. The response omits `ownerId` and `allowedAppRoles` on purpose.
+- Both register **below** every `/mine` route. `SKILL_ID_PATTERN` matches the literal string `mine`, so the reverse order turns `GET /skills/mine` into a lookup for a skill named "mine".
+
+### Routing traps, each covered by a test
+
+`/settings/connectors` stays as a redirect rather than a deletion — it is in bookmarks and the schedules page linked users straight to it — and must be declared **before** the `settings` route, whose `loadChildren` would otherwise swallow the path and land the user on the settings shell with no matching child. Likewise `customize/skills/new` must stay above `customize/skills/:skillId`. Both failures are silent, which is why both are asserted.
+
+---
+
+## Slash commands — invoking a skill for one message
+
+Typing `/web-research` in the composer invokes that skill for that message: the sibling of the `@`-mention, with the same menu shape, keyboard handling and rides-one-turn semantics. The menu's last row is "Browse skills →".
+
+**Scope is what makes it cheap.** Only skills the user already has enabled can be invoked, so the invoked skill is already in `enabled_skills` and the system prompt, `toolConfig` and `<available_skills>` block are **byte-identical** whether or not a command was used. The cacheable prefix is untouched; the entire cost is one line appended to the turn's user message — which is exactly what the prompt-cache contract in `CLAUDE.md` asks of anything added to the model call path.
+
+**The composer text is the binding.** Unlike the `@` menu there is no remembered pick: the invoked set is derived from the text, so a hand-typed command works like a menu pick and the chip cannot disagree with what is sent. The chip's ✕ edits the text, because that is where the binding lives.
+
+`/` is ordinary punctuation, so a command must start a word **and** not be followed by another `/`. That second clause is what keeps `/usr/bin/env` prose — an absolute path starts a word exactly like a command does. The rule is implemented three times (composer token, `findSkillCommands`, thread renderer) and all three must agree.
+
+### Backend
+
+`GET /skills/` now serves the runtime activation `slug` rather than letting the SPA re-derive it. `invoked_skills` on the invocation request is intersected against the turn's **effective** set — re-run after Agent bindings can replace it — and becomes a directive appended last, riding `original_message` so the thread shows only what the user typed.
+
+Spec: `docs/specs/skill-slash-commands.md`.
+
+---
+
+## Chat tells you what it is doing
+
+### One card per assistant run
+
+A four-tool answer rendered as five separate assistant cards, each paying full chrome — card padding, a copy button, a metadata row and a 1.5rem gap — so a single response became a column of near-empty boxes with the answer pushed below the fold.
+
+The cause was message boundaries, not the tool rail. The agent loop starts a new Bedrock message at every tool round trip and the SPA rendered one card per message; worse, the existing tool-grouping pass could never fire, because two consecutive tool calls were always in different messages. `AssistantMessageComponent` now takes a **run** of messages and flattens it into one block stream, and `message-list` splits each turn into segments. A tool group deliberately spans message boundaries — only text and reasoning break it, because those are where the agent actually said something.
+
+The trap this has to handle: **Bedrock returns tool results as USER-role messages carrying nothing but `toolResult` blocks.** They render at zero height — invisible — but sit between every pair of assistant messages, so treating them as real user messages breaks the run at every single tool call. They were also already starting a spurious turn group per tool call, which moved the last group's scroll reserve out from under a streaming response. Both are now guarded by `isProtocolScaffolding`. A mid-turn steer is a real user message with real text and still breaks the run, which is correct.
+
+The rail itself now stays **collapsed** while tools run — it used to force itself open on any pending call, so it was at its tallest exactly while the user was watching — and leads with one line that does not grow with the group.
+
+### `agent_status`
+
+A multi-tool turn spends most of its wall-clock time in places the content stream says nothing about. A new `AgentStatusHook` records the boundaries the event loop already crosses (`BeforeModelCall`, `Before`/`AfterToolCall`) and `stream_coordinator` drains them exactly like `steering_applied`, before the event they precede — so "Using list_assignments" reaches the client **while** that tool is running rather than after its result.
+
+Phases are `thinking` (one per event-loop cycle, with `cycle` distinguishing them), `tool_start` and `tool_end`. Durations come from Strands' own `AfterToolCallEvent.duration` rather than being inferred from stream arrival times on the client, and `ok=false` covers both a raised exception and a result with `status: "error"`.
+
+There is deliberately **no `responding` phase**: the SPA already knows text is streaming from the deltas, and a backend-derived duplicate of a fact the client holds first-hand would only disagree at the edges. Durations are live-only and deliberately not persisted — a reloaded conversation shows summaries without timings, where a client-invented number would be one the user could not trust.
+
+It costs nothing against the model: nothing it produces reaches the prompt, so the cacheable prefix is untouched. Gated by `AGENT_STATUS_ENABLED` (default on, kill switch); while off the hook is registered but every callback returns immediately and the SPA stays on its cycling phrases.
+
+### `tool_group_summary`
+
+A Nova Micro summarizer (`apis/shared/tool_summaries/summarizer.py`) turns each finished tool batch into one line naming what was actually found. It is a **side-channel**, structured exactly like `session_title`: its own Bedrock call on its own messages, run concurrently with the agent stream. It never appends to the conversation, so it adds nothing to the cacheable prefix and cannot cause a cache re-write. Spend is one bounded call per batch, with inputs and results truncated at capture in the hook **and** again in the summarizer.
+
+Summaries persist as `TSUM#` rows in the existing sessions-metadata table — reusing the `SessionLookupIndex` GSI, so **zero new infra** — and replay on `GET /messages` as `toolSummaries`, because the live event is emitted once and never re-streams. They are deliberately **not** written onto the message content blocks: that is the Bedrock Converse payload and the cacheable prefix, so a display string there would be paid at model rates on every subsequent turn.
+
+Gated by `TOOL_SUMMARIES_ENABLED`, separately from `AGENT_STATUS_ENABLED`, so a deployment can take one without the other. While off, the SPA's deterministic client-side formatter still renders ("Listed 4 assignments") — absence is a downgrade in specificity, never a blank. That formatter reads the shape of the tool name (`verb_subject`, near-universal across MCP) plus result cardinality, because almost every tool here arrives at runtime from an MCP server and a per-tool table would leave the ones users actually see rendering as raw identifiers.
+
+### The loading indicator
+
+Twenty invented phrases, typed out character by character, were charming and were fiction — identical whether the model was generating, waiting nine seconds on a Canvas round trip, or hung. It now says only what we know: `● Thinking 12s` and `● Running browse_web 4s`. "Running" shows only while a tool really is executing, and the tool's own identifier is the label — the same name the tool rail and the admin catalog use, so humanising it would invent a second name for one thing. It renders in the routine colour, distinct from the amber `model_retry` notice.
+
+---
+
+## MCP prompts and resources
+
+An MCP server exposes three listings — tools, prompts and resources — and this stack had only ever called `tools/list`. Grepping the backend for `prompts/list` or `resources/list` returned nothing, so two thirds of what our servers offer was invisible to every surface in the product.
+
+### Backend
+
+- Capability discovery attempts each listing **independently**, degrading to `supports_*=False` on failure. A server that implements tools but not prompts answers `prompts/list` with a JSON-RPC "method not found" — that is normal, and it must not cost us the resources listing or the whole snapshot. "Offers nothing" and "we could not ask" are recorded as **different facts**, because the UI has to say different things about each.
+- `prompts/get` is now called for the first time anywhere in the stack. `MCPPromptArgument` carries `required` and `description` alongside the name — `_prompt_entries` had been flattening arguments to names alone, which is enough to describe a prompt and not enough to fill one in. `from_dict` accepts a bare string so snapshots taken before this rehydrate rather than break.
+- `POST /admin/tools/{id}/capabilities/refresh` existed and **nothing in the frontend called it**, with no cron or sync job either, so a snapshot was written once by hand and never rewritten. In dev, `canvas_faculty` and `student_myboisestate` were probed at 05:02 UTC and gained their first prompts at 16:01 the same day; both snapshots still read `supportsPrompts=true` with zero prompts, rendering a supported-but-empty state indistinguishable from a server that genuinely offers nothing. `gmail_employee` had never been probed at all.
+
+### Frontend
+
+On a tool's detail page each prompt becomes **Try it** → a field per argument → **Compose** → the server's composition rendered inline, with copy. Prompts and resources stay a read of the stored capability snapshot rather than a live probe — probing opens an MCP session per server, and a 3LO server needs a consent token the browser does not hold — and the snapshot is fetched only for `mcp_external` tools, since nothing else has a server that could be asked. The admin tool list gains a refresh action.
+
+---
+
+## Scoped tool bindings on Agents
+
+An Agent's `binding.ref` accepted only a bare catalog id, so binding an MCP server loaded **every** one of its tools. The live Rubric Builder agent needs 7 of `canvas_faculty`'s 44 and was carrying `grade_submission`, `delete_rubric` and the rest — held back only by wording in its system prompt, which is a fence for ordinary use and none at all against a determined one. It also put ~13.2k of tool definitions in the cacheable prefix every turn where ~1.8k would do.
+
+The scoping machinery already existed and the runtime already honoured it (`scoped_ids.py`, `collect_tool_name_filters`, `load_external_tools`); user-facing tool selection has used it all along. Three things blocked the bindings axis, and the first is the one worth noting: `AppRoleService.can_access_tool` exact-matched the id, so a scoped ref was denied **even for a user holding the whole server**, while its sibling `filter_requested_tools` base-collapsed correctly on the `enabled_tools` axis. The two now agree, which a test asserts directly.
+
+---
+
+## Model picker
+
+### Short descriptions
+
+New `shortDescription` on the managed model (create/update/read plus the DynamoDB create path), surfaced in the admin form and rendered under the model name in the picker, falling back to the provider name when unset — so an uncurated catalog looks exactly as it did. The 10 curated catalog templates are seeded with purpose-written picker copy, deliberately shorter than the catalog card's `tagline`, which is a sentence where this is a fragment.
+
+The 80-char cap is on the create/update models but **not** on the read model: a stored value longer than the cap would otherwise fail validation and take the whole `/models` listing down with it. Bound the input, stay permissive about what is already persisted.
+
+### Effort selection
+
+Surfaces the existing per-model inference-param system rather than inventing a parallel one. The Effort submenu appears only when an admin marked the param supported, left it unlocked, and enumerated `allowed` levels — mirroring `_merge_inference_params`, whose enum branch keeps an override only if it is a member of that set and pins locked params to the admin default. Offering a level the backend would silently discard would show the user a choice that does nothing. Selections write through the same per-model override store every other inference param uses.
+
+### Icons
+
+Every row leads with a left-aligned vendor avatar, set two deliberately different ways. `iconSlug` points at a logo the SPA already ships (anthropic, openai, amazon, meta) — a string on the record, no storage, no round trip, and a crisp theme-aware vector at any size; for a vendor we ship, that is the better answer and not the fallback. An upload covers the rest (an in-house fine-tune, a vendor we ship no logo for): bytes to S3 under `models/{id}/icons/{digest}.{ext}`, with the record carrying only the key — the same 400 KB item-limit lesson agent icons learned. An upload wins over a slug, being the more deliberate act. With neither set the client matches on `providerName`, so every existing model keeps an icon.
+
+### GPT-6 Astra
+
+`us.openai.gpt-6-astra` is registered at the Geo CRIS **Short Context** rate card — $11.00 in / $13.75 cache-write / $1.10 cache-read / $55.00 out per MTok — with `maxInputTokens` inherited at 272,000.
+
+**The cap is load-bearing.** The context price tier is selected by the *actual* token count of the request, so nothing stops us being billed on the Long Context card except staying under the boundary. Crossing it bills input at 2×, output at 1.5× and both cache buckets at 2×, while a `CuratedModel` holds one flat rate per bucket — so raising the cap would silently **under-charge** every long turn. Two card-backed deviations from the GPT-5.6 family defaults: `maxOutputTokens: 128_000` and `knowledgeCutoffDate: '2026-04-30'`, both published where the sibling cards say N/A. `supportedParams` is deliberately still absent — a declared spec flips the guard from permissive to restrictive, and a wrong entry would block a parameter the model accepts.
+
+---
+
+## Knowledge bases
+
+### Chunk inspector
+
+`GET /assistants/{id}/documents/{doc}/chunks` — owner/editor only, read-only, one bounded Retrieve, no new chunking or ingestion path.
+
+This is the tooling half of a decision that was otherwise "guidance, not code": the managed backend's vision step flattens a column-structured flowchart or a 2-D table at ingestion, so a per-column question gets a **confident wrong answer with no trace**, and fixing a managed parser is not on the table. But guidance nobody can verify is not guidance — an owner cannot act on "convert your flowchart to a text table" without first seeing that their flowchart came out wrong. This is where they look.
+
+Three things are deliberate, each mutation-guarded by a test:
+
+1. The document filter is `equals` on `document_id`, **never a prefix operator** — a prefix match for `DOC-1` also admits `DOC-10`, so the operator choice *is* the isolation boundary, not a query-tuning detail.
+2. A post-filter drops any chunk whose `document_id` is not the requested one, on top of the backend filter. Belt and braces, because the failure mode is silent and its blast radius is one owner reading another's document.
+3. **Full chunk text, untruncated.** The existing citation trace caps excerpts at 500 chars, which is exactly why it cannot serve this purpose: a flattened table's damage is usually past the cut, so a truncated excerpt of a mangled table reads like a fine excerpt of a fine table.
+
+### Born-managed knowledge bases
+
+`MANAGED_KB_NEW_DEFAULT` (rollout ladder step 2) was a **no-op**: no backend code read it, and the app-api Lambda never received it. Both are now wired. `maybe_enroll_new_default()` makes a newly finalized agent born managed by reusing `enroll()` — a new agent has no corpus, so migrating an empty one provisions the KB, converges instantly, and promotes through the proven, crash-safe, dispatcher-driven worker, with `catch_up` covering documents uploaded mid-flight. Flag-gated, idempotent, and error-swallowing so it can never fail agent creation.
+
+**Ships dark** (flag default off). Turning it on at fleet scale is gated by the ~10k Bedrock KB per-account quota, since managed is one KB per assistant.
+
+### Byte cap at upload time
+
+The interactive upload path was the last byte-adding path still uncapped (migration was already covered). A request-time pre-check reserves the client-declared size against `min(per_owner_cap, per_kb_ceiling)` **before** creating the `DOC#` row or issuing a presigned URL, returning HTTP 413 with the numbers. The reservation is provisional; an authoritative reconcile at ingestion takes the true size from an S3 HEAD and commits, releases the difference, or fails the document and deletes the orphaned S3 object. `settle_once()` makes commit/release exactly-once across EventBridge redeliveries and racing failure paths. Managed KBs only — legacy S3-Vectors KBs stay uncapped.
+
+---
+
+## Fine-tuning
+
+### Checkpoint and resume
+
+Two things restart a training job: a spot interruption, and SageMaker killing it at `MaxRuntimeInSeconds` — which the dollar-quota clamp makes routine, since a $14 balance buys 3.7h on the 34B instance while a real run needs far longer. Until now `save_strategy="no"` meant the adapter was written only after `trainer.train()` returned, so **either restart produced nothing at all for the money already spent**.
+
+The interval is computed, not fixed. `save_steps` counts *optimizer* steps, and a 34B VLM trains at batch 1 with 16-step accumulation — a 90-sample epoch is about 6 steps. Against a hardcoded `save_steps=50` the longest, most interruption-exposed job in the catalog would never checkpoint, while a text classifier with thousands of steps would checkpoint constantly. `resolve_save_steps` scales to the run's own step count targeting ~10 checkpoints, so an interruption costs at most about a tenth of the run. `save_total_limit=1` keeps the mirror bounded. Checkpoints go to a `checkpoints/` prefix rather than inside the job's output prefix, where SageMaker writes the finished `model.tar.gz`.
+
+### Managed spot
+
+Roughly a 65% discount for a longer queue and the risk of interruption. It is only safe now that checkpointing landed: simulated at a 0.15/hr hazard, a 48h job costs **~3,200 billed hours without checkpointing and ~18 with it**. The two are enforced together — asking for spot with `checkpointing=false` is refused at submit rather than sold.
+
+Off by default. Measured on-demand capacity waits for these GPU families ran 28–58 minutes in us-west-2, and spot draws from the surplus of the same constrained pools, so a researcher who needs a result this afternoon should be able to pay for certainty. `MaxWaitTimeInSeconds` covers waiting for capacity *and* training and must exceed `MaxRuntimeInSeconds`, so it is the runtime plus a four-hour queue allowance; waiting is not billed. `MaxRuntime` itself is untouched — spot must not quietly extend the budget clamp. Cost accounting needs no spot branch: AWS expresses the discount by shrinking `BillableTimeInSeconds` against the same on-demand rate.
+
+### VLM context length
+
+Three of five VLM catalog models could not train on their own defaults. SmolVLM-Instruct spends **1377 tokens on a single image** against a default `context_length` of 1024, so truncation cut the image placeholder run to 891 and the processor rejected the batch — the image alone did not fit in the budget, let alone the prompt. LLaVA-1.6's AnyRes tiling and Qwen2.5-VL's dynamic resolution both go well past the 2048 those entries defaulted to.
+
+A fixed default cannot be right, because the token cost depends on the checkpoint's tiling **and** on the resolution of the images the user uploaded. The trainer now renders a sample of records untruncated, raises the context length to fit, and logs the adjustment, failing only when a single record genuinely exceeds the model's own maximum. Defaults are raised too (2048 for SmolVLM and LLaVA-1.5, 4096 for the three AnyRes/dynamic-resolution models) so the measured path stays a safety net rather than the norm; headroom is close to free because the collator pads to the longest item in the batch, not to `max_length`.
+
+---
+
+## 🐛 Bug fixes
+
+**Loading a conversation page logged blocked mixed content, twice.** `https://dev.boisestate.ai/s/<id>` requested `http://api.dev.boisestate.ai/agents` — a URL built nowhere in the SPA. It was Starlette's own `redirect_slashes` answer to `GET /api/agents/`, rendered from the only things app-api can see behind CloudFront: the ALB's hostname (the `/api/*` behaviour uses `ALL_VIEWER_EXCEPT_HOST_HEADER`), plain HTTP (the ALB terminates TLS), and a path with `/api` already stripped. Every part of that `Location` is wrong — the browser blocks it so the caller silently gets nothing, the internal ALB hostname leaks into a page the user can read, and a client that did follow it would land on a different origin where the `__Host-` BFF cookies are not sent and the request 401s. CloudFront now sets `x-forwarded-prefix: /api` and `ProxiedRedirectMiddleware` restores the public URL. Not specific to `/agents`: `/models/`, `/files/` and `/auth/login/` produced the same thing. (#1074)
+
+**The agent designer's preview silently dropped tool calls.** Measured on dev against the `canvas_faculty` MCP server: one requested `upload_course_file` produced ~316 attempts and **zero** invocations of the backing Lambda; `import_course_package` 647 attempts, zero invocations. The identical calls in the full chat succeeded first try, and nothing was surfaced to the user. The root cause was not a divergent dispatch path but a divergent SSE *consumer* — `PreviewChatService` implemented 9 of the ~27 events `processStreamEvent` dispatches, and every callback in that parser is invoked with `?.`, so an unimplemented handler drops its event in total silence: no error, not even `onParseError`. Among the dropped events were `oauth_required` and `tool_approval_required`, **the two that gate dispatch** — so the tool paused server-side waiting for an answer the preview had no way to ask for. The fork is deleted; both preview surfaces run on `ChatRequestService` / `ChatHttpService` / `StreamParserService`. (#1060)
+
+**Conversation Mode silently stopped applying after a reload.** The session page hydrates the active mode twice on load — provisionally, before metadata arrives, then for real — and the provisional call claimed the session id, so the clobber guard rejected the real hydration. Because chat-request sends `selected_prompt_id` from `activePromptId()`, the mode stopped being applied to every turn after a reload while the stored preference still said it was on. The provisional call now passes `claim:false`; a deliberate "None" still claims, so stale metadata cannot undo it. (#1079)
+
+**Fine-tuning inference had never worked from the deployed app.** Batch Transform is a two-step API — `CreateModel` registers the trained artifact, then `CreateTransformJob` runs against it — and the task role was granted the job actions but not `CreateModel`, so every inference job died at step one with `AccessDeniedException`. It went unnoticed because the failure is invisible from a developer machine: CloudTrail shows every successful `CreateModel` in dev was called by a human's SSO credentials running app-api locally against dev data. The ARN is the subtle part — `sagemaker_service` names the model `model-{job_name}` and `job_name` already starts with the project prefix, so the resource is `model/model-<prefix>-*` with the literal `model-` **ahead of** the prefix; a pattern written to match the training-job and transform-job ARNs looks correct and denies every call. (#1023)
+
+**Connector edits were rejected with an instruction the admin could not follow.** The discovery guard in `update_provider` treated any non-None `oauth_discovery_url` as a discovery change, and a discovery change requires a credential rotation — but the edit form round-trips the discovery URL on every save, so changing scopes, display name, icon or enabled state failed with "Discovery config can only be updated together with a credential rotation." The admin could not comply: the client secret is never readable back. The guard now compares against the stored record, so it means what its error message says. (#1029)
+
+**A fresh deployment would have listed zero tools.** `seed_bootstrap_data.py` hand-builds its tool item instead of calling `ToolDefinition.to_dynamo_item`, so it wrote `GSI1PK`/`GSI1SK` by hand and had no `GSI5PK`. Once the catalog read moved to that sparse index, a freshly bootstrapped deployment — a fork, a new environment, a rebuilt dev — would have listed **nothing**, with no error to notice, and a backfill would not even be the obvious remedy because nothing about that install is legacy. A test now derives the expected key set from the model and asserts the seeder writes all of it. (#1070)
+
+**`/users/me/settings` was read twice on every first load.** `settingsResource` fetched eagerly the moment `UserSettingsService` is injected; `ModelService.findUserDefaultModel` fetched again once `/models` had landed. Measured on dev they land ~280ms apart (t=863ms, t=1146ms) — **sequential, not concurrent**, so a single-flight guard would not have caught the second. `getSettings()` memoizes the promise instead. A rejected read is deliberately not cached, and `updateSettings` drops the memo before reloading. (#1067)
+
+**Nightly Build & Test failed seven consecutive nights** (2026-09-05 → 09-11) after being green the five before. Six filesystem-reading specs failed only under `--coverage`, which the nightly passes and PR CI did not. Under `--coverage`, @angular/build's unit-test builder bundles each spec into a flattened chunk emitted at the **project root** rather than handing Vitest the spec at its own source path, so `import.meta.url` and the `__dirname` shim move with it. That is an absolute relocation, not a fixed-depth shift, so every `resolve(SPEC_DIR, '..')` silently changed meaning: a doc-presence spec read the wrong README, a parity spec ENOENT'd at collection, and two hygiene guards walked the whole package — including generated Tailwind CSS, full of literal hex — and so "found" violations. New `src/testing/project-root.ts` walks up from `process.cwd()` to the directory holding `angular.json`, the same way the Angular CLI locates the workspace. The coverage build now also runs on PR CI. (#1048)
+
+**The new `agentcore-runtime-active-sessions` alarm fired on every load test.** Validated against 7 days of real prod `ActiveSessionCount` it would have fired three times in three nights, every one a planned load test, peaking at 241, 608 and 1404. No threshold fixes that: load tests still trip it at 500, and it only goes quiet around 1500, which is *above* the ~99 sustained by the `/ping` reaper regression the alarm exists to catch. Duration does separate them — the regression sustained ~99 for three months, the load tests ran 15–30 minutes. At threshold 75 over a 60-minute window, simulated firings drop to zero on that week's data while the regression would still be caught. (#1058)
+
+Also: the tool summary no longer eats its closing quote (#1039); the tool row's hover highlight runs the full drawer width (#1042); the tool rail's hover is scoped to the rail (#1043); the prose margin under the tool batch summary is dropped (#1044).
+
+---
+
+## 🔒 Security
+
+**Scoped bindings make an Agent's tool restriction structural.** A bound MCP server previously loaded all of its tools, with the agent's system prompt as the only thing standing between a user and `grade_submission` or `delete_rubric` — prompt wording is a fence for ordinary use and none at all against a determined one. (#1047)
+
+**The chunk inspector's document filter is the isolation boundary.** `equals` on `document_id`, never a prefix operator, because a prefix match for `DOC-1` also admits `DOC-10`; a post-filter backs it up, because the failure mode is silent and its blast radius is one owner reading another owner's document. (#1057)
+
+**WCAG AA contrast sweep.** `dark:text-primary-400` resolves to #1e53c1 and fails AA in dark mode; the repo already generates `--color-primary-accessible-dark` (#437cee) for exactly this. Six legacy occurrences swept across four files, measured with `getComputedStyle` against each site's real composited backdrop — e.g. the agent-form "+Add" text moved from 2.23:1 to 3.90:1, the create-training-job check icon from 2.59:1 to 4.53:1 against a 3.0 threshold. Separately, `bg-primary-50|100|200` as a tint fill measured 4.13:1, 3.52:1, 2.23:1 and 2.63:1 across four real sites, all failing. (#1082, #1091)
+
+---
+
+## ⚡ Performance
+
+### The tool catalog is Queried, not Scanned
+
+The `{prefix}-app-roles` table is shared: tools, skills, roles, role grants, JWT mappings **and one tool-preferences row per user** all live in it. `list_tools` scanned it and filtered, and Scan cost tracks table size rather than result size — so that read's cost grew with **enrollment**, not with the number of tools. Measured on dev: 95 items read to return 24 tools, 17 of them per-user rows. In prod that is thousands of preference rows read to return ~24 tools. The Query reads 24 to return 24, and stays flat as the campus grows.
+
+**The fallbacks are why this is safe to ship, not incidental hardening.** An empty tool catalog is not a degraded experience — every user loses every tool — and both ways this index can fail to answer produce exactly that:
+
+- **The index is absent.** `platform.yml` and `backend.yml` are ordered by nothing, a GSI is still CREATING after CloudFormation reports success, and a rolled-back stack ships its images anyway. Falls back to the Scan. It deliberately does *not* use `dynamo_errors.log_missing_index`: that helper is written for surfaces that degrade to empty and its message says so, which would be a lie here.
+- **The index is present but unpopulated.** This raises nothing at all — the keys are sparse, so a catalog whose backfill has not run indexes nothing and the Query succeeds with **zero rows**. A zero result is therefore treated as suspect and re-read via Scan: if the table really holds tools we serve them and log an ERROR naming the backfill script; if it is genuinely empty (a fresh install before seeding) both agree, at the cost of one extra read per cache fill.
+
+### Tenant-global catalogs are cached
+
+Every SPA first load read four catalogs identical for every user on the deployment — models, tools, system prompts and connectors — none cached, three of the four full table scans. New `apis.shared.caching.config_cache` adds a TTL (60s, via `CONFIG_CACHE_TTL_SECONDS`) plus **single flight**, which is the half that matters under the case this exists for: with a cold cache, 300 simultaneous requests would otherwise issue 300 concurrent scans, and that stampede lands at exactly the moment the burst does. The scans also move onto `asyncio.to_thread` — they were blocking boto3 calls made from `async def`, so each stalled the whole event loop rather than just its own request.
+
+**Entries hold raw DynamoDB items and callers re-parse on every read**, deliberately. Callers mutate what these lists produce: `hydrate_model_roles` documents itself as "mutated in place and returned" and writes `allowed_app_roles` onto each model. Caching parsed objects would hand every caller one shared instance, so an admin opening the models page would write derived, display-only role fields onto the objects then served to every user — and `allowedAppRoles` is precisely the field the RBAC contract says must never be mistaken for a grant. Re-parsing is microseconds of CPU against a 50–100ms round trip.
+
+### The user-profile upsert is throttled
+
+`get_current_user_from_session` fired `sync_user_from_jwt` on every authenticated request, and that upsert is a GetItem followed by a PutItem that rewrites the whole profile row **and its GSI projections**. One SPA first load is 12 API calls, so a single page load issued **24 DynamoDB operations against one item**, writing identical values except `last_login_at`. A classroom signing in together multiplied that by the class size, each student's writes landing on their own hot partition.
+
+Throttling is safe because this was never the authoritative write — the BFF callback's `_sync_user_from_id_token` syncs on every login off the ID token (the only place the full claim set exists), and `POST /users/me/sync` writes through the repository directly. What remained here is a periodic refresh, so it only needs to run periodically: default 5 minutes via `USER_SYNC_THROTTLE_SECONDS`. The claim is recorded **before** the sync runs rather than on completion, because the 12 requests of a page load overlap and a marker written on completion would let most of them through before the first one landed. A brand-new user is unaffected: with no entry recorded, the first request always claims the sync.
+
+This also fixes a latent bug at the same site — the dispatched task was not referenced anywhere, and the event loop holds only a weak reference to a bare `asyncio.create_task(...)`, so the GC could collect it mid-await.
+
+---
+
+## ⚠️ Breaking changes
+
+### The composer settings drawer is gone, and with it the only way to select a Conversation Mode
+
+This is the one item in the release that needs a decision rather than a note.
+
+The Customize epic removed the drawer in stages: Skills and Tools left for `/customize` because they are global; the model picker and inference-param form moved to the composer; agent-lock state moved to the assistant indicator. **Conversation Mode could not follow Skills and Tools** — it applies to *this* conversation, and putting it on a global page would have recreated the exact scope lie the epic exists to fix. So it went the other way, into the composer beside the model and effort controls, replacing the old passive chip that could display an active mode but never select one.
+
+That picker was then **parked before release** (#1088). The placement was verified end to end on dev and works; the reasoning for pulling it is that a permanent composer slot is a bigger commitment than the current evidence supports, and it should come back on user feedback about where it belongs.
+
+The consequence is that this release is the first to carry both the drawer's deletion and no replacement picker. **Prod selects Guided Learning — a Socratic tutoring prompt — through that drawer today**, and use is accelerating: 1 session in July, 20 in August, 60 in the first 12 days of September. After this deploy there is no UI anywhere to select a mode.
+
+Only the control was removed. `SystemPromptsService`, `GET /system-prompts/`, `selected_prompt_id` on `SessionPreferences` and the admin CRUD are all untouched, and sessions that already carry a mode keep applying it. Restoring `ConversationModePickerComponent` is a revert, not a rebuild.
+
+**Three options, in order of preference:** restore the picker before merging; land a replacement placement; or take the regression knowingly with a plan for when the control returns.
+
+### Route redirects
+
+`/settings/connectors` and the three `/my-skills` paths are now redirects rather than pages. Bookmarks and the schedules page's deep link continue to work, and the ordering that keeps them working is asserted by tests — but a fork that has customised either route should re-check it.
+
+### Token bans
+
+`dark:text-primary-400` (colored text and icons) and `bg-primary-50|100|200` (tint fills) must not be used in new code. The `primary` scale is generated from #0033a0 by lightness offset alone and keeps full chroma at every step, so `primary-50` resolves to rgb(118, 179, 255) — a saturated mid-blue, not a wash. Used as a chip, badge, icon tile or selected-row fill it reads as a blue blob behind small text and fails AA. The `state-*` scales **are** real tints (`state-success-50` = rgb(240, 253, 244)), which is exactly why the pattern looked safe by analogy and wasn't. Use `text-primary-accessible dark:text-primary-accessible-dark` and neutral surfaces with the brand blue in the text.
+
+### `last_login_at` granularity
+
+Accurate to within `USER_SYNC_THROTTLE_SECONDS` (default 300) rather than to the last request. Anything reading it as a precise last-seen timestamp should be adjusted or the throttle lowered.
+
+---
+
+## 🏗️ Infrastructure
+
+- **`EntityTypeIndex` on the existing `{prefix}-app-roles` table** — `GSI5PK=ENTITY#{type}`, `GSI5SK=` the item's own PK, `ProjectionType.ALL`. Full projection because the catalog is rebuilt from these rows; an INCLUDE projection would force a base-table read per tool and give back the amplification the index exists to remove. Deliberately generic rather than TOOL-only: `list_roles` and the skills catalog scan the same table for the same reason, and DynamoDB permits only **one GSI creation per `UpdateTable`** — so giving a second entity type its own index later would need its own release, and two accumulating into one release rolls the whole stack back (the 1.12.0 lesson of 2026-08-01). One partition per entity type costs nothing now and leaves that door open. Sparse by construction, so adding it changes nothing until rows are stamped. `infrastructure/gsi-inventory.json` shows exactly one index added to one existing table.
+- **`sagemaker:CreateModel`** on the app-api task role, as its own `SageMakerModelManagement` statement scoped to `arn:aws:sagemaker:<region>:<account>:model/model-<prefix>-*`. Its own statement because the literal `model-` sits ahead of the project prefix, so a pattern that matches the training-job and transform-job ARNs denies every call. Grants only `CreateModel` — `create_model` is the sole model API the service calls. Models are left behind after each transform job, which is a tidiness follow-up, not a reason to grant `DeleteModel` here.
+- **CloudFront `x-forwarded-prefix: /api`** on the `/api/*` behaviour, set unconditionally rather than only on the stripping branches, so a viewer-supplied header is always overwritten rather than passed through to the origin.
+- **`agentcore-runtime-active-sessions` alarm** on `ActiveSessionCount` / `AgentCore.Runtime`, threshold `CDK_OBSERVABILITY_AGENTCORE_ACTIVE_SESSION_THRESHOLD` (default **75**) over 12 evaluation periods — a **60-minute** window, which is what separates a real regression from a load test. Runtime bills memory for a session's whole lifetime and AWS still exposes no API to list or force-terminate one, so session accumulation is the leading indicator; the `/ping` reaper bug ran undetected for three months at 73% of the platform bill. The threshold is deliberately **not** a fraction of the 5,000-session account quota — quota exhaustion is already owned by `agentcore-throttles`.
+- **`MANAGED_KB_NEW_DEFAULT`** threaded into the app-api environment as an explicit `'false'` rather than omitted, for the same visibility reason as its siblings.
+
+---
+
+## 🔧 CI/CD
+
+- **`pending-backfills.yml`** — a new gate on every PR into `main`. `scripts/release/check-pending-backfills.mjs` diffs `backend/scripts/backfill_*.py` against `origin/main` and fails when a script added in the range is not named in `RELEASE_NOTES.md`. There are now six backfill scripts and no step that surfaced "this release needs one run"; they reached the changelog only when whoever wrote it remembered. It cannot verify a backfill was actually *run* — no CI job can — but it guarantees the instruction reaches the person who can.
+- **`tests.yml`** gains a `run_frontend_coverage` input and a `Test frontend (coverage build)` job, which `ci.yml` sets true. The coverage build had been running only in the nightly, which is why six specs could break for seven consecutive nights without a single PR going red.
+- **`platform.yml`** gains job-level `CDK_OBSERVABILITY_AGENTCORE_ACTIVE_SESSION_THRESHOLD`, plumbed through `load-env.sh` like every other observability threshold.
+
+---
+
+## 📦 Dependencies
+
+| Component | Change | From | To |
+|---|---|---|---|
+| Backend (uv constraint) | `mcp` — transitive, via `strands-agents` | unbounded within `>=1.23.0,<2.2` | `<2` |
+
+`mcp` reaches us only through `strands-agents`; we do not depend on it directly. `strands-agents==1.55.0` declares `mcp>=1.23.0,<2.2`, so the resolver was free to cross into 2.x at any time. The only thing holding us on the 1.x line was **incidental**: `mcp` 2.x pulls `httpx2>=2.5.0`, which needs `idna>=3.18`, and we pin `idna==3.15` for an unrelated Dependabot alert. A routine security bump of `idna` would have quietly unblocked the major crossing — nobody would be choosing it, and nothing in that diff would mention MCP.
+
+The crossing lands under `integrations/mcp_apps.py`, which substitutes `strands.tools.mcp.mcp_client.ClientSession` to advertise the MCP Apps UI extension on `initialize`. That seam reaches through a Strands internal into an MCP SDK class and has never been exercised against 2.x, where the transport dependency changed (httpx → httpx2) and the types moved to a separate distribution. The failure is silent: App frame headers degrade to a generic glyph rather than raising. `[tool.uv] constraint-dependencies` bounds the version **if** `mcp` is in the resolution graph, without adding it to our dependency metadata.
+
+---
+
+## 🧪 Test coverage
+
+Roughly 5,000 lines of new backend and frontend tests. Notable scopes: the Customize pages and both detail views (~1,100 lines of specs); `test_tool_catalog_index_read.py` (240 lines) covering both index-absent and index-unpopulated fallbacks; `test_backfill_tool_catalog_index.py` (202 lines) including the idempotency and never-resurrect-a-deleted-row guards; route-ordering assertions for the four redirect/parameterised-route traps, all of which fail silently; `pending-backfills.test.ts` and the infra tests for the new IAM statement and alarm; and a mutation-verified seeder test that derives the expected GSI key set from `ToolDefinition` so the next index added to tools cannot be forgotten in the one place that mirrors the model by hand.
+
+---
+
+## 🚀 Deployment notes
+
+**Order: `platform.yml` (CDK) → wait for the index → run the backfill → `backend.yml` → `frontend-deploy.yml`.**
+
+### 1. Deploy the platform stack
+
+One GSI operation on one existing table. The release guard confirms it:
+
+```bash
+node scripts/release/check-gsi-update-limit.mjs
+```
+
+### 2. Wait for `EntityTypeIndex` to report `ACTIVE`
+
+CloudFormation reporting `UPDATE_COMPLETE` is **not** the same as the index being usable:
+
+```bash
+aws dynamodb describe-table --table-name <prefix>-app-roles \
+  --query 'Table.GlobalSecondaryIndexes[?IndexName==`EntityTypeIndex`].{Name:IndexName,Status:IndexStatus}'
+```
+
+### 3. Run the tool-catalog backfill — required, in every environment
+
+Populates `GSI5PK`/`GSI5SK` on tool rows written before the keys existed. **Dry-run by default; idempotent; guarded by `attribute_not_exists(GSI5PK)` and `attribute_exists(SK)`, so it never resurrects a deleted row and never overwrites one the writer has since stamped.** It touches only tool metadata rows — `CAPABILITIES` snapshots, skills, roles and user preferences are left alone.
+
+```bash
+AWS_PROFILE=<env> backend/.venv/bin/python backend/scripts/backfill_tool_catalog_index.py \
+    --table <prefix>-app-roles --region us-west-2
+```
+
+> Use the backend venv's interpreter, not the system `python` — the script needs `boto3`
+> and a bare `python` fails with `ModuleNotFoundError: No module named 'boto3'`.
+> `uv run --project backend python …` works equally well.
+
+Then, once the dry run looks right:
+
+```bash
+AWS_PROFILE=<env> backend/.venv/bin/python backend/scripts/backfill_tool_catalog_index.py \
+    --table <prefix>-app-roles --region us-west-2 --apply
+```
+
+**Verify `skipped=0 failed=0`, then confirm the index is populated with a live Query.** Run against dev first, then prod.
+
+```bash
+aws dynamodb query --table-name <prefix>-app-roles --index-name EntityTypeIndex \
+  --key-condition-expression "GSI5PK = :pk" \
+  --expression-attribute-values '{":pk":{"S":"ENTITY#TOOL"}}' --select COUNT
+```
+
+> ⚠️ **Do not verify with `describe-table` `ItemCount`.** DynamoDB refreshes table and index
+> item counts roughly every **six hours**, so immediately after a successful backfill it still
+> reads `0` and looks like a failure. A Query is the only live check.
+
+Pair it with a scan for rows the backfill missed — a **partial** backfill is the one case the
+read path's zero-result fallback deliberately does not cover, so it is silent:
+
+```bash
+aws dynamodb scan --table-name <prefix>-app-roles \
+  --filter-expression "begins_with(PK, :p) AND SK = :s AND attribute_not_exists(GSI5PK)" \
+  --expression-attribute-values '{":p":{"S":"TOOL#"},":s":{"S":"METADATA"}}' --select COUNT
+```
+
+That must return `Count: 0`. If the backfill is skipped, the Query returns zero rows, the zero-result fallback re-reads via Scan and logs an ERROR naming this script — so the catalog still serves, but at Scan cost and with a standing error in the logs.
+
+### 4. Decide on the Conversation Mode regression
+
+See Breaking changes. There is no operational workaround after the deploy: sessions that already carry a mode keep applying it, but no user can select or change one. Restore `ConversationModePickerComponent`, land a replacement placement, or accept the regression deliberately.
+
+### 5. Optional configuration
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AGENT_STATUS_ENABLED` | on | `=false` stops `agent_status` emission; the SPA falls back to cycling phrases |
+| `TOOL_SUMMARIES_ENABLED` | on | `=false` stops the Nova Micro side-channel; the SPA's deterministic formatter still renders |
+| `CONFIG_CACHE_TTL_SECONDS` | `60` | Lifetime of the tenant-global catalog cache |
+| `USER_SYNC_THROTTLE_SECONDS` | `300` | Minimum interval between per-request user-profile upserts |
+| `CDK_OBSERVABILITY_AGENTCORE_ACTIVE_SESSION_THRESHOLD` | `75` | Concurrent-Runtime-session alarm threshold, over a 60-minute window |
+| `MANAGED_KB_NEW_DEFAULT` | `false` | Born-managed knowledge bases. Requires the migration worker running; gated at fleet scale by the ~10k Bedrock KB account quota |
+
+### 6. No action required
+
+No new table. No seeder run is required for this release. No agent, session or artifact data migration. The `mcp<2` constraint takes effect on the next `uv sync` with no code change.
+
+---
+
+# Release Notes — v1.20.0
+
+**Release Date:** September 9, 2026
+**Previous Release:** v1.19.1 (September 7, 2026)
+
+---
+
+> 🏗️ **CDK deploy required.** A new Lambda, its role and log group, an EventBridge rule and one SSM parameter for the managed-KB document reconciler; per-model Bedrock quota alarms replacing one account-wide alarm; and a new app-api task-definition revision. **No new table and no GSI operation on any existing table** — nothing has to reach `ACTIVE` before this deploy is safe.
+>
+> 💸 **Default app-api Fargate sizing doubles.** `appApi.cpu` 512 → 1024 and `appApi.memory` 1024 → 2048, per task, at 2 tasks. **A fork that sets nothing pays roughly twice as much for app-api compute after this deploy.** Set `CDK_APP_API_CPU=512` and `CDK_APP_API_MEMORY=1024` to keep the old sizing. See Deployment notes.
+>
+> 🔔 **One alarm disappears and is not automatically replaced.** `{prefix}-bedrock-tpm-quota-usage` is deleted because it was in ALARM roughly 99% of the time and accounted for very nearly all traffic on the alarm topic. Its replacement is per-model and **opt-in**, so an operator who configures nothing loses the leading indicator for quota pressure until they set `CDK_OBSERVABILITY_BEDROCK_TPM_QUOTAS`.
+>
+> 🌐 **A nightly Lambda starts running for every fork, regardless of feature flags.** The managed-KB document reconciler's construct is instantiated unconditionally, so the schedule is created and enabled even with every `managedKb` flag off. It is **report-only** and read-only unless explicitly armed — but it does perform a full `Scan` of the RAG assistants table each night.
+>
+> 🧰 **`browse_web` will not appear until the bootstrap seeder is re-run.** The tool ships registered in code but inert, because tool availability is driven by the DynamoDB catalog. The Seed Bootstrap Data workflow is `workflow_dispatch`-only and is **not** invoked by any deploy pipeline.
+
+---
+
+## Highlights
+
+Two capabilities the platform simply did not have, and one measurement that changes how it should be scaled. **`browse_web`** lets the agent drive a real Chrome browser in the AgentCore Browser sandbox — navigate, read, click, type, screenshot, and hand the user a live view URL to watch the session through. **Generative VLM fine-tuning** adds a fourth task type: instead of classifying an image into a fixed label set, a model can now be taught to *write* about one in an institution's own vocabulary, LoRA-adapted over a 4-bit base so a 34B checkpoint fits on hardware that a full fine-tune would need 550 GB for. Alongside them, a new load-testing harness answers a question nobody could previously answer with evidence, and the answer is uncomfortable: **the campus-scale ceiling is the Bedrock TPM quota, not compute** — a representative production turn consumes ~26,700 quota-counted tokens, so the untouched default quota supports about 225 turns per minute platform-wide and a single 300-student class exceeds it.
+
+Three fixes are worth reading even if you don't use the features they sit under. MCP Apps reach the end of a three-part chain that made every button in an embedded App fail silently after a page reload — and the middle link turned out to be that **AgentCore Runtime rewrites any non-2xx container response to a generic 424 and throws the body away**, which is a constraint on every inference-api handler that reports an error by HTTP status. A managed knowledge base could give confidently wrong answers from documents it had retrieved correctly, because a context cap sized for one chunker silently collapsed a five-chunk retrieval to one. And a security fix closes a sandbox escape in the Calculator tool's expression allowlist, which is enabled by default for every user.
+
+## `browse_web` — the agent drives a real browser
+
+The agent can now use a real Chrome browser rather than fetching a URL and hoping the content is in the HTML. Nine actions, one per call: `navigate`, `extract_text`, `extract_links`, `click`, `type`, `evaluate`, `screenshot`, `live_view`, and `close`. `live_view` returns a URL the user can open to **watch the browser session as it happens**, which turns an opaque multi-step automation into something observable. The tool's own docstring positions it as the expensive fallback to `fetch_url_content`, not a replacement for it.
+
+Two things to be clear about, because the platform's older Browser documentation describes something else. This is **not** Nova Act — there is no separate vision or action model and no new API key. The conversation model itself chooses each action, and the tool is a thin protocol driver. And `BROWSER_TOOL_ENABLED` is a **kill switch that defaults to on**, not an opt-in; what actually keeps the tool dark is that it is seeded `enabledByDefault: False` and, until the catalog row exists, is not offered at all.
+
+### Backend
+
+- `backend/src/agents/builtin_tools/browser/` — new package, three modules, **zero new dependencies**. `browse_tool.py` is the `@tool(context=True)` entry point and its dispatch; `cdp_client.py` is a hand-rolled Chrome DevTools Protocol client (`CdpSession`, `connect`, `command`, `evaluate`, `navigate`, `screenshot`); `session_pool.py` manages acquisition, reconnection, idle reaping and live-view URLs.
+- **Why raw CDP instead of Playwright.** `websockets` is already in the inference-api image as a transitive dependency of `bedrock-agentcore`. Playwright would have added a bundled Node driver to the container for a capability the protocol already provides. The trade-off is stated rather than hidden: interaction is JavaScript-in-page, so `click` calls `el.click()` and `type` sets `el.value` then dispatches `input`/`change` with `bubbles: true` to make Angular and React state update. Pages that need genuinely trusted input — drag, some canvas widgets, some anti-bot forms — will not work.
+- **A rebuilt agent does not start a second browser.** The session identity persists on Strands `agent.state` under `browser_tool.session` as `{sessionId, identifier, startedAt}`, while the live socket stays process-local. A second cached agent for the same conversation reconnects to the same remote session rather than starting — and billing — another one. boto3 calls are wrapped in `asyncio.to_thread` behind a per-session lock.
+- **Budgets exist because the model pays for them in tokens.** Page text caps at 8,000 characters (~2k tokens), `evaluate` results at 4,000, links at 50; truncation messages tell the model to narrow with a selector rather than re-reading. Screenshots are never automatic — `navigate` returns text, and an image requires an explicit `action="screenshot"`. Remote sessions expire at 900s against an AgentCore allowance of 8 hours, and a local idle reap at 600s closes the socket *and* stops the remote session.
+- **URL validation runs before the session pool is touched**, so a refused URL costs nothing. Scheme must be http/https, and `localhost`, `127.0.0.1`, `::1`, `169.254.169.254` (EC2 IMDS) and `metadata.google.internal` are denied outright. There is deliberately **no domain allowlist** in this release: defence-in-depth rests on the browser running in AWS with PUBLIC network mode, unable to reach the deployment VPC. An institution that wants a URL allowlist does not get one yet.
+
+### Infrastructure
+
+**None — and that is the point.** Every resource this needs already existed. `browser-construct.ts` creates the AgentCore Browser, `inference-agentcore-construct.ts` already sets `BROWSER_ID` on the runtime, and the runtime role already carried `ConnectBrowserLiveViewStream` alongside the session APIs, which is why `live_view` works with no IAM change at all. Before this commit the only readers of `BROWSER_ID` were `.env.example` and a startup log line.
+
+### Test Coverage
+
+381 lines in `backend/tests/agents/builtin_tools/browser/test_browse_tool.py`, with no AWS contact: a `FakeWebSocket` that actually speaks CDP covers protocol framing (browser-scoped vs page-scoped commands, target creation, page exceptions surfacing as `CdpError`, idempotent close failing pending futures), seven parametrized URL-validation cases, and nine dispatch tests — including the metadata endpoint being refused *without the pool ever being touched*, and the kill switch short-circuiting before session acquisition.
+
+**Not yet validated against live AWS.** The SigV4 WebSocket handshake, the browser-level CDP endpoint and a real page load cannot be exercised by unit tests, and the authoring session's SSO token had expired. `backend/scripts/probe_agentcore_browser.py` exists to run exactly those five checks (`--discover`, `--keep`); treat it as the verification step before enabling the tool for users.
+
+## Generative VLM fine-tuning
+
+Fine-tuning gains a fourth task type, **Image + text to text**. The three existing tasks all end in a softmax over a fixed class list, so the platform could tell you *which* of your labels an image matched but never produce prose about it. A generative VLM can be taught to answer a question about an image in an institution's own style and vocabulary — reading a form, describing a diagram, drafting a caption — and the pre-flight now accepts any Hub checkpoint tagged `image-text-to-text`, so users can bring their own.
+
+Five models are curated, with per-model defaults chosen rather than inherited:
+
+| Model | Size | Default instance | Notable override |
+|---|---|---|---|
+| `HuggingFaceTB/SmolVLM-Instruct` | 2.2B | ml.g6e.xlarge | `load_in_4bit=false` — bf16 is faster below ~3B |
+| `llava-hf/llava-1.5-7b-hf` | 7B | ml.g6e.xlarge | — |
+| `llava-hf/llava-v1.6-mistral-7b-hf` | 7.6B | ml.g6e.xlarge | `context_length=2048` for AnyRes tiling |
+| `Qwen/Qwen2.5-VL-7B-Instruct` | 8.3B | ml.g6e.xlarge | `context_length=2048` |
+| `llava-hf/llava-v1.6-34b-hf` | 34.8B | ml.g6e.4xlarge | `grad_accum=16`, `lora_r=8` |
+
+LLaVA-1.6 and Qwen get a doubled context length because AnyRes tiling can emit up to 2,880 image tokens against LLaVA-1.5's fixed 576. The 34B model's catalog copy warns to expect multi-hour runs and budget accordingly.
+
+### Backend
+
+- **LoRA, not a full fine-tune, and the arithmetic is the reason.** At roughly 16 bytes per parameter once gradients and AdamW moments are resident, a 34B full fine-tune needs ~550 GB against the 384 GB on the largest instance offered. The frozen base is quantised to 4-bit NF4 (double quant, bf16 compute) and only adapters train. **The artifact is therefore an adapter of a few hundred MB, not a model**: `vlm_adapter.json` records the base model id, quantisation and generation settings, and `model_fn` rebuilds base-plus-adapter with `PeftModel.from_pretrained`, pulling the base from the Hub.
+- **Loss is masked to the response span.** Labels are set to `-100` at pad positions, non-attended positions, image-placeholder token ids, and the whole prompt prefix. Prompt length is measured by rendering each record through the processor's chat template **twice** — once with `add_generation_prompt=True` and no answer, once complete — so the count is a true prefix in the same tokenisation rather than an estimate. `prompt_mask_limit()` clamps to `len-1`, because an all-masked row yields NaN loss that poisons the batch average.
+- **No invented chat format.** `render_chat()` raises if a checkpoint ships no chat template rather than guessing a dialogue shape the model never saw during pre-training.
+- **`check_collation()` collates two records before `Trainer` starts.** The failure it exists to catch is truncation cutting into the image-placeholder run, which makes the placeholder count disagree with the image-feature count and dies in the first forward pass — minutes into a billed GPU, after tens of gigabytes of weight downloads. It re-raises with actionable guidance instead.
+- **Batched generation is deliberately not attempted** (`GENERATION_BATCH_SIZE = 1`). It needs left padding plus a per-architecture agreement about where image placeholders sit relative to the pad run, and getting that subtly wrong produces fluent garbage rather than an error — the worst possible failure for a result file a researcher will treat as data.
+- **Per-family script packaging.** `bitsandbytes==0.50.2` requires torch ≥ 2.4 and the text DLC is torch 2.1, so a single shared requirements file would have broken dependency installation for **every existing text job**. `scripts/sourcedir.tar.gz` becomes `scripts/sourcedir-{text,vision,vlm}.tar.gz`, each carrying its family's requirements packaged under the only filename the DLC installs from. The VLM family maps to the *same* DLC images as vision — the family selects the dependency set, so a future VLM-only image bump cannot re-baseline the image classifiers.
+- The result contract is unchanged in shape. `output_fn` branches on `"generations" in prediction` rather than a caller-supplied flag, emitting `image,prompt,output` through the existing CSV escaping. **The download path and the result viewer needed no changes at all.**
+
+### Frontend
+
+- `create-training-job.page.ts` gains `isGenerative()` and `showImageSize()`, three new controls (LoRA Rank, LoRA Alpha, Quantization) seeded from the model's `default_hyperparameters`, and submits them **only** for a generative task so a classifier's job record carries no dead keys in its hyperparameters panel.
+- The Image Size field is now hidden for generative tasks. The generative trainer never reads `image_size` — the model's own processor decides tiling and resolution — so leaving it visible would have been a control that silently did nothing.
+
+### Infrastructure
+
+None. No CDK deploy for this feature. Two operational notes: the first job of each family writes its own `sourcedir-{family}.tar.gz` under the existing `scripts/` prefix in the same bucket, so no IAM or bucket-policy change is needed and the old `scripts/sourcedir.tar.gz` is simply orphaned; and `pricing.py` already carried both g6e instance types, so the dollar-quota path works unchanged. Operators may still need a **SageMaker service-quota increase for `ml.g6e` training instances**, which no code change can supply.
+
+### Test Coverage
+
+665 lines across five files. `test_vlm_task.py` (285 new lines, ~45 tests) verifies the module imports without torch present and is registered in **both** the training and inference dispatchers, that `render_chat` raises rather than inventing a format, that `prompt_mask_limit` never masks the final position, and that a disabled quantisation config returns `None` *without importing bitsandbytes*. `test_script_packaging_service.py` asserts the VLM archive carries the peft stack and the text archive does **not** carry bitsandbytes. `test_task_types.py` pins the generative tag out of the dual-encoder task. `test_inference_script.py` covers embedded newlines, doubled quotes and commas not splitting a row. `create-training-job.page.spec.ts` (113 lines) covers the conditional controls both ways.
+
+The honest gap: torch, transformers and peft are absent from the backend venv by design, so the collator itself cannot be unit tested. The masking arithmetic was extracted into a pure function and covered there; the collator is guarded at runtime by `check_collation`.
+
+## An App's tool calls, and the 424 that ate their errors
+
+Every button in an embedded MCP App failed after a page reload, and failed *silently* — the user saw the MCP server's own "isn't connected yet" text rather than anything resembling an auth error. Fixing it took three passes, each of which only became visible once the previous one landed, and the middle one is a finding that applies well beyond MCP Apps.
+
+**Why the calls were unauthenticated.** An app-initiated `tools/call` runs `dispatch_app_tool_call`, which speaks to the MCP client directly instead of running the agent's tool loop. Strands therefore never raises `BeforeToolCallEvent`, so `OAuthConsentHook` — the only thing in the system that warms `oauth_token_cache` — never ran. The client's token provider is a pure cache read, so it resolved to `None` and the request went out **with no `Authorization` header at all**. Two things conspired to make this quiet: a server that accepts an unauthenticated `initialize`/`tools/list` (Google Tasks does) still registers its tools, so the App rendered perfectly and only the calls failed; and because no 401 came back, the existing 401-triggered recovery that *would* have warmed the cache from the vault never fired. A server that 401s its `tools/list` would have self-healed. The trigger is any container that has not served a model-driven turn for that user and provider — a reload onto a fresh runtime, a local restart, or a lapsed 3000s cache TTL.
+
+`_ensure_oauth_token` now repeats the hook's warm-the-cache half before dispatch, and distinguishes three outcomes rather than two: an unresolvable provider means "couldn't ask AgentCore", not "user must consent", so the call proceeds unauthenticated instead of false-prompting a connected user. A genuine consent requirement raises **409, never 401** — the SPA's error interceptor treats any 401 as an expired BFF session and would sign a user out over an unconnected connector. An auth-shaped failure clears the cached token and deliberately **does not retry**, because an app call is whatever button the user pressed (`complete_task`, `delete_event`) and a regex-triggered retry could apply a mutation twice. `AUTH_FAILURE_PATTERN` moved to `apis/shared/oauth/auth_failure.py` so the hook and the dispatch cannot drift on what an auth failure looks like.
+
+**Why nobody saw the 409.** Because it never arrived. inference-api runs behind AgentCore Runtime, **which rewrites any non-2xx container response to a generic 424 and discards the body**. The status and the message were destroyed before app-api ever saw them, and the user got:
+
+> Error — Received error (424) from runtime. Please check your CloudWatch logs for more information.
+
+This had made three separate in-repo comments false — one claiming statuses were relayed "verbatim (403 not-app-visible, 409 no consent)", one claiming the SPA relayed `message` verbatim — and it cannot reproduce locally, because a local uvicorn talks to app-api directly with no AgentCore in the path. Errors now cross the boundary as **HTTP 200 plus an `appToolError` envelope**, which app-api unwraps back into the real status. The envelope enforces two properties independently of its callers: an unlisted or malformed status collapses to 502 rather than letting upstream choose a 401, and because an envelope now arrives *with* a 200, the envelope check is placed **before** the provenance-card write so an enveloped error still persists no card. The SPA contract is unchanged — only the one hop that crosses AgentCore changes shape.
+
+**Why the restored message still didn't render.** app-api returned `{"error": "<string>"}`. `ErrorService.handleHttpError` looks for a message in three places: a top-level string `detail`, an `error` key whose value is an **object** carrying `.detail` or `.message`, or a top-level string `message`. A string-valued `error` matches none of them, so `userMessage` stayed undefined and the generic per-status fallback rendered while the real text sat unread in the body. The sharpest part of this is the inversion: AgentCore's 424 body used the key `message`, which *did* match — so "check your CloudWatch logs" was rendered for precisely the reason the useful text was not. The body now carries `detail` alongside `error`, one key for each of the two independent consumers, and needed no SPA change.
+
+The toast now reads: *Authorization required for 'google-tasks'. Connect the account, then try again.*
+
+### Test Coverage
+
+546 lines across the three commits. 30 parametrized guards on the envelope itself, relay tests asserting the real status is restored, that a 401 is never relayed, and that an enveloped error persists no card (with a success control proving the check doesn't swallow success); nine async dispatch tests covering cold-cache warm from the vault, warm-cache skip, consent-to-409 with no dispatch, a disconnected user bypassing a cached token, and an auth-shaped failure clearing the token in exactly one call with no retry.
+
+## MCP Apps stop forgetting
+
+Four changes to how App frames live in a conversation, grouped because they are one story: the host was treating an App as a render-time artifact when it is really a stateful thing with a lifecycle.
+
+**Leaving a conversation and coming back dropped the App to a plain tool card.** Only a hard refresh brought it back. Two mechanisms collided: the session page called `McpAppStateService.reset()` on every route change, and the only thing that re-seeds the registry is the `uiResources` sidecar on `GET /messages` — a request `loadMessagesForSession` deliberately **skips** once a conversation's messages are cached, with no eviction. So every visit after the first reset the registry with no path back, and the inline `ui_resource` SSE event never re-streams. A hard refresh worked only because it destroyed the message cache. The registry is now keyed `sessionId → toolUseId → resource` and never reset on navigation; readers pass the viewed session id, writers pass the streaming session's own id. That second detail fixes a related loss: an App produced by a conversation streaming **in the background** used to be discarded permanently by an `isViewedSession` gate that existed only because of the reset.
+
+**An MCP server shipping a new App version couldn't reach existing conversations.** The stored `UIRES#` row was replayed verbatim forever, which had quietly made the platform the durable store of record for a resource that belongs to the server — including the CSP and permissions the App runs under. An app-initiated tool call now schedules a background revalidation: re-read the resource from the server, rewrite the row, preserve `produced_by_message_index` so a refresh cannot renumber where the frame sits in the thread. It is piggybacked on interaction rather than run on conversation open because re-reading needs a live MCP client, the only path to one is a built agent, and revalidating on open would add a full agent rebuild to a page load that runs no model turn — for every App, whether or not anyone touches it. The consequences are bounded deliberately: the refreshed shell lands on the **next** page load, the work never runs on the response path, a read that fails or returns no HTML leaves the old copy intact, and a new projection-limited `get_provenance` avoids pulling the ~130KB HTML it is about to overwrite. One side effect worth knowing: because `store()` recomputes `ttl` from now, each revalidation extends that row's 90-day expiry.
+
+**An App that saves its state on teardown wasn't getting to.** `dispose()` sent `ui/resource-teardown` and then removed the `message` listener in the same tick, so the View's ack landed on a removed listener and an App that answered teardown by calling a save tool had its `postMessage` dropped. Compounding it, teardown only fired from the frame's `onDestroy`, by which point Angular is removing the iframe in the same tick. `dispose()` now returns a promise that resolves on the ack or after a 1500ms grace window, gating inbound messages on a new `detached` flag rather than `disposed` — the window is live on purpose. A new `McpAppTeardownService` fires `teardownAll()` from the conversation-change effect while the iframe is still alive, swallowing individual rejections so one hung App can't strand the others. This matters more than it looks because the host is deliberately *not* the store of record for App state: a teardown the App never hears about is state nobody saves. Honest limits: a hard refresh or tab close still gets no window, and reparenting the iframe was rejected because moving an iframe in the DOM reloads it, destroying the very state being saved.
+
+**Reloading a conversation with an interactive App produced a wall of static cards.** An App that runs a tool on nearly every user gesture turned the tail of the thread into unbounded provenance noise, detached from where the calls happened and duplicating state the re-mounted App already shows. Those calls now surface on the frame that ran them as a header chip — `3 actions`, or `3 actions · 1 failed` in the danger token — expanding to one collapsed success summary (`board_snapshot ×6, update_task ×2`) with each failure listed separately alongside its error text. Cards whose frame can't render keep a standalone fallback box. Grouping works because a card's `toolUseId` is the *originating* call that produced the App's `ui_resource`, not a per-call id. This remains provenance-only — none of it reaches the model or the prompt.
+
+### Test Coverage
+
+470 lines across the four changes, including an identity assertion that a `cardsFor` miss returns the same frozen array reference (so a miss doesn't churn a computed every change-detection pass), a rewritten bridge test that now asserts the grace window where it previously asserted the same-tick detach, and coverage that a `tools/call` made *in response to* teardown is still proxied while one made after the window is ignored.
+
+## Stranded knowledge-base documents get found
+
+A user uploads a document to a managed knowledge base. They are told it worked. The content really is indexed in Bedrock and really is retrievable. And the assistant will **never** cite it — permanently, silently. This happened twice in dev and both were repaired by hand.
+
+`DOC#` status has exactly one writer, the ingestion consumer. Lambda's async retry is capped at **two** attempts, a hard service limit; when an event dead-letters, the row is left non-terminal (`uploading`, `chunking`, `embedding`) with nothing remaining to revisit it — while Bedrock, indifferent to the consumer's fate, often finished indexing seconds later. Because the retrieval filter serves only `complete` documents, every chunk of that document is dropped from every query.
+
+### Backend
+
+- `document_reconciler.py` walks KB_Records, skips anything not managed or lacking an `awsKbId`, and pages `DOC#` rows to exhaustion. Candidates are the three non-terminal statuses; `complete`, `failed` and **`deleting`** are never candidates, because resurrecting a soft-deleted document would be a data-governance failure rather than a repair.
+- **The grace gate is a pure function of the row's own `updatedAt`, never of discovery time**, and returns "not stuck" on an unparseable or absent timestamp — fail-safe by construction.
+- Classification reuses the ingestion consumer's own probes rather than reimplementing them, so the two cannot drift: in-flight is left alone; a FAILED-family status is marked `failed`; INDEXED or partial gets a **retrievability check first**, and only then `complete`. A document that Bedrock calls indexed but that does not actually come back from a retrieval is deliberately left short of `complete`. `NOT_FOUND` is re-ingested from the row's own `s3Key`. An unrecognised status is treated as in-flight and logged.
+- The retrievability check takes **one reading, not a poll**, and carries the load-bearing `{"equals": {"key": "document_id", "value": …}}` filter — an unfiltered probe confirms the wrong document.
+- **`lambda_handler` ignores an `armed` field in the event and logs a warning**, so `lambda:InvokeFunction` alone cannot turn on writing. Arming is an environment variable, deployed deliberately.
+- Bounds throughout: 25 actions per run by default (ceiling 100), 5,000 records per run, and the action limit is **applied in report-only mode too** so that the report is a trustworthy prediction of what an armed run would do.
+- Five new `{prefix}/ManagedKb` metrics: `KbStrandedDocumentsFound`, `…Completed`, `…Reingested`, `…Failed`, `KbDocumentReconcilerLimitReached`. Found and LimitReached emit in both modes; the three action metrics only on an armed successful write.
+
+### Infrastructure
+
+New `KbDocumentReconcilerLambda` (ARM64, 15-minute timeout, 512 MB) sharing the one byte-stable kb-migration image asset, plus its role, its log group, an EventBridge rule at `cron(0 9 * * ? *)` — 09:00 UTC, roughly 02:00–03:00 America/Denver — and SSM parameter `/{prefix}/kb-migration/document-reconciler-function-name`. IAM is exactly `assistantsTable` read/write, `documentsBucket` **read-only**, and the existing `ManagedKbDirectIngestion` and `ManagedKbRetrieve` grants; provisioning rights and `iam:PassRole` are deliberately withheld and asserted absent by tests. **No new table and no GSI operation on any existing table** — this reuses the RAG assistants table.
+
+Two things operators should know that the commits do not say. **No CloudWatch alarm covers this Lambda** — it is absent from the `LambdaAlarmsConstruct` function list, and none of the five new metrics has an alarm, so a failing nightly run pages nobody; check the log group after the first few nights. And the run performs a **full `Scan`** of the RAG assistants table, because the KbWorkIndex GSI is sparse and deliberately excludes these records — that cost is incurred nightly even with zero managed KBs, on top of the existing daily KB reconciler scan. `MAX_RECORDS_PER_RUN` bounds records *yielded*, not items scanned.
+
+### Test Coverage
+
+677 lines in `test_kb_document_reconciler.py` — 61 collected cases across 13 classes, with no AWS contact (moto plus a stub modelling Bedrock's document view). Coverage includes the arming flag, the grace gate, each terminal transition, terminal rows being ignored, per-run action limits, the retrievability probe's filter, and a mixed run. Infrastructure tests add the nightly rule targeting the right Lambda, the rule being **enabled with every flag off**, and arming independence in both directions — arming the document reconciler does not arm the KB reconciler, or vice versa.
+
+## Campus-scale load testing, and the ceiling it found
+
+The interesting output of this work is not the harness. It is a number.
+
+Against production with Claude Sonnet 5, **a representative turn costs ~26,700 quota-counted tokens** — 384 input, **24,926 cache-read**, 1,372 output — against the ~1,920 that the harness's own naive default profile produces. Cache-read tokens count against the Bedrock TPM quota, which is what makes the gap roughly **14×**: across eight observed invocations, quota-counted tokens ran 16× the sum of input and output alone. At the applied **6,000,000 TPM** quota — the untouched AWS default — that puts the platform-wide ceiling at about **225 turns per minute**, which **a single 300-student class exceeds**. A load test built on the naive profile would have passed comfortably while describing a production workload that throttles.
+
+The consequence is a capacity conclusion no amount of Fargate tuning addresses: raising Sonnet 5's TPM quota from 6M toward ~40M for 1,300 concurrent users is a Service Quotas request, not a code change.
+
+### Backend and tooling
+
+- `tests/load/` is a **separate uv project** with its own lockfile. Putting Locust in `backend/pyproject.toml` would have landed it in `backend/uv.lock` and in the app-api and inference-api image dependency resolution.
+- Users log in through the **real Cognito Hosted UI** authorization-code flow, because `/chat/stream` is cookie-only since the BFF migration — no token can be minted with `initiate-auth`. A generic `HTMLParser` finds the form with a password input and resubmits every hidden field rather than hardcoding Cognito's field names, and password values are never captured.
+- **The metrics that matter are measured client-side.** The native `POST /chat/stream` row measures time to response *headers* only, which for a streamed response is nearly meaningless. Two custom metrics — `SSE chat: time to first token` and `SSE chat: full turn` — are fired from the SSE reader instead. This is the same reasoning the observability guidance gives for why ALB `TargetResponseTime` is a weak signal on this path: the ALB does not consider the request complete until the stream closes. Failure-inside-200 is caught too: a `stopReason: "error"` on `message_stop`, or a stream ending without `done`, both record as turn failures.
+- `validate_host()` hard-fails a non-https target, because the `__Host-`prefixed session and CSRF cookies are Secure-only and `requests` silently drops them — producing a login that appears to succeed and then 401s on every turn.
+- **A `CredentialPool` refuses to start an under-provisioned run.** A `test_start` listener compares Locust's user count to the pool *before the first login* and quits with one clear message, rather than letting users die one at a time mid-ramp. Sharing identities is not merely untidy: shared users share a `user_id`, so session and cost writes collide on one DynamoDB partition, one quota counter and one memory namespace, and the run partly measures its own key collisions. The opt-out is explicit (`AGENTCORE_LOAD_ALLOW_CREDENTIAL_REUSE=1`, strict truthiness so a typo leaves the safe default).
+- `ClassroomBurstShape` runs baseline → spike → hold → drain, twice, 840 seconds at defaults (20 baseline users, spikes to 300 over 30s). The second burst is the point: the first hits cold tasks, an empty prompt cache and 60s scale-out cooldowns, which makes "survives the 9am class" and "survives a class following a class" separately answerable.
+- The representative profile enables 12 of 28 production tools **to inflate the cached prompt prefix, not to be called** — the prompts are general-knowledge questions answerable from weights, because firing Canvas, PeopleSoft and Brave Search at 300–1300× concurrency would load institutional and third-party systems irrelevant to the measurement.
+- `scripts/load-test/watch-tpm.sh` is read-only and reports tokens/min, percentage of the **applied** quota, turns/min and implied tokens/turn, flagging `/UNREPRESENTATIVE` when implied tokens/turn falls below 10,000 — that is, when the profile is lying. It reads 5-minute windows because one observed production minute reported 546,206 quota tokens against a single invocation, more than that model's context window, so per-minute peaks are untrustworthy. It also **warns when the applied quota still equals the AWS default**, meaning no increase ever landed.
+- `scripts/load-test/provision.sh` and `teardown.sh` exist because two platform safety rails correctly block a load test and neither is workaroundable test-side: `FORCE_CHANGE_PASSWORD` prevents scripted Hosted-UI login, and per-user cost quotas hard-stop sustained traffic, after which the run measures quota enforcement rather than the chat path. Like `set-bsu-overrides.sh`, these are **not run by CI**, require confirmation, and support `--dry-run`.
+
+**These scripts mutate live AWS state and teardown is mandatory.** They create real users in the same Cognito pool real people use, and write `unlimited` quota overrides — a **disabled cost control** on a real `user_id`, visible in the admin dashboard under Quota Overrides. Safety rails are worth naming: every manifest username must begin with `loadtest-`, validated across the whole file in one pass **before any delete**, so a hand-edited manifest cannot delete real users nor a subset before failing; overrides are deleted before users; credentials never appear in argv; and the manifest is created empty and `chmod 600` *before* any password is written, outside the repo tree.
+
+Four incidental bugs surfaced along the way, all in the harness rather than the platform: `GET /costs` 404'd every read-only iteration (the router has no root route — the original "verified present" claim was simply wrong, and a 404 fails at near-zero cost while inflating the error rate), `GET /tools` paid a 307 round trip on every call, `provision.sh` reported an unset `AWS_PROFILE` as a wrong project prefix because it discarded AWS's stderr, and the prompts loader stripped blank lines but not comments, so a documented prompts file would have sent its own header to the model as a user turn.
+
+### Test Coverage
+
+608 lines, 53 tests, all pure logic with no AWS, network or load: SSE parsing, config validation, the login-form parser, credential-pool uniqueness and worker partitioning, and the burst shape's timeline, spawn-rate arithmetic and validation. The **provisioning scripts have no automated tests** — verification was manual, and the AWS calls themselves are unexercised.
+
+## 🐛 Bug fixes
+
+- **A managed knowledge base answered confidently and wrongly from documents it had retrieved correctly.** A Major-Core course was described as an elective; on an advising corpus only one of four emphasis areas came from the documents and the other three were invented. `MAX_CONTEXT_CHARS = 2000` was a single shared default adopted "for parity", but Bedrock's chunks are roughly 3× larger than Docling's and the cap truncates per accumulated chunk — so a requested `top_k=5` fit about four legacy chunks and only **one** managed chunk. It was silently a `top_k=1` retrieval, and the neighbours it dropped carried the section header that gave the remaining chunk its meaning. The evaluation that had justified the shared cap covered single-fact lookups only and had explicitly flagged multi-chunk synthesis as untested. Managed KBs now resolve an 8,000-character cap through `resolve_context_cap`, keyed on the same engine resolution the backend selection already uses, so an absent or unreadable record still resolves legacy. All four emphasis areas now come from the documents. Costs roughly 966 extra input tokens per augmented turn on managed KBs (#997)
+- **Retrieval could serve chunks whose parent document status was never verified — including deleted content.** `_filter_vectors_by_document_status` opened with `if not doc_ids: return vectors`. Because `doc_ids` is built per chunk and yields an empty string when the location and both metadata mirrors are absent, a **non-empty** batch in which every chunk resolved to an empty id produced an empty set and returned the vectors **unfiltered**, skipping the DynamoDB status check entirely. Every other unprovable branch in that function already returned `[]`; this one path was overlooked, against a requirement that already mandated failing closed. It now returns `[]` and emits `KbStatusFilterFailClosed`. The trade-off is intended: in that state a query returns nothing rather than unverified content (#998)
+- **A managed-KB document showed the literal "Uploading" for the entire indexing wait.** The managed consumer writes only `uploading` and then `complete`, so the finer-grained legacy vocabulary (`Chunking`, `Embedding`) had nothing to describe. Managed documents now read `Processing` → `Ready`, with `Failed`; legacy keeps its own words. The engine is also now visible directly — a `Managed`/`Classic` badge on the Uploaded Documents panel, and one INFO line per retrieval naming the engine, which previously could only be answered by reading the KB record out of band (#1006)
+- **Voice Mode would have silently switched off** on the `strands-agents` upgrade. 1.55.0 moved the Nova Sonic provider from `strands.experimental.bidi.models.nova_sonic.BidiNovaSonicModel` to `strands.experimental.bidi.models.bedrock.BedrockNovaSonicModel` and flattened its constructor. `voice_agent.py` imports the provider inside `except ImportError: BIDI_AVAILABLE = False`, so a rename is swallowed: voice off everywhere, no crash, one INFO log line. The rename is not in the upstream release notes. The import is now an explicit module import so a future rename fails loudly, and a contract test reads the pinned SDK's source from disk to assert the class, the flattened signature and the five audio-config keys still hold (#1012)
+
+## 🔒 Security
+
+**A sandbox escape in the Calculator tool's expression allowlist** — `strands-agents-tools` 0.8.6 → 0.8.8.
+
+The tool validates a model-supplied expression with an AST allowlist. A string literal is normally rejected, because a string reaching `sympify` gets re-parsed and defeats the restriction entirely. The allowlist carves out one exception: a string *is* trusted as a positional argument to a small set of constructors that parse it as a plain name or numeric literal — `Symbol`, `symbols`, `Rational`, `Integer`, `Float`. Through 0.8.6 that check looked **only at the positional argument and ignored the call's keyword arguments**. Because SymPy's `symbols()` accepts a `cls=` keyword naming the class to apply to each parsed name, `symbols('...', cls=N)` reroutes the string through `sympify` after all — outside the restricted namespace, while the allowlist believes a safe constructor is handling it.
+
+This was live rather than theoretical: `tool_registry.py` registers `calculator` on the default agent and the bootstrap seeder marks it `enabledByDefault: True`, so it is on for every user unless an admin turns it off. Upstream 0.8.8 trusts a string positional only when every keyword on the call is a boolean assumption flag, and treats `**kwargs` unpacking as untrusted outright since it can smuggle in `cls`.
+
+**No CVE or GHSA identifier was issued**; the fix is identified by the version boundary. Ordinary arithmetic and symbolic input is unaffected, and `Symbol('x', positive=True)` still passes. The upgrade was validated by diffing the two wheels: six files differ and only `calculator.py` is in this repo's import graph.
+
+101 lines of regression tests in `backend/tests/security/test_calculator_sandbox.py` — 17 executed cases including the disclosed form, a payload-carrying variant, the `**kwargs` route, and eight legitimate expressions guarding against the fix narrowing real use. The tests import from the *installed* wheel, so a resolver drift below 0.8.8 fails the suite rather than silently reopening the escape.
+
+**This ships through `backend.yml`, not a CDK deploy.** Bumping the pin without shipping a new inference-api image leaves the old wheel running.
+
+## ⚠️ Changed
+
+- **Default app-api Fargate sizing doubles.** `appApi.cpu` 512 → 1024 and `appApi.memory` 1024 → 2048 per task, at 2 tasks. Production had been running 2 × (0.5 vCPU, 1 GB) — 1 vCPU total — and reportedly saturated at around 100 concurrent logins, failing the container health check, pulling a task mid-burst and rejecting requests at roughly 13× latency. Sizing is now per-environment through GitHub Variables, which also fixes a real config-plumbing bug: the loader read only the **nested** `appApi` context object, while `load-env.sh` emits `--context appApi.cpu=…`, which CDK stores as the *flat* key `appApi.cpu`. A direct `cdk synth --context appApi.cpu=…` was therefore accepted and discarded. (In CI the environment variable was already winning, so the blast radius was narrower than it sounds.) **Set `CDK_APP_API_CPU=512` and `CDK_APP_API_MEMORY=1024` to keep the previous sizing** (#1020)
+- **The account-wide Bedrock quota alarm is deleted, and its replacement is opt-in.** See Infrastructure below. A fork that configures nothing has no quota alarm after this deploy (#1016)
+- **`McpAppBridge.dispose()` now returns `Promise<void>`** and accepts an optional grace-period argument, and the bridge keeps serving inbound messages for up to 1500ms after teardown is requested. Internal to the SPA; relevant only to forks that have extended this class (#1003)
+- **Fine-tuning script packaging is per-DLC-family.** `scripts/sourcedir.tar.gz` becomes `scripts/sourcedir-{text,vision,vlm}.tar.gz` in the same bucket and prefix, so no IAM or bucket-policy change is needed. The old object is orphaned — nothing reads or deletes it, and it can be removed by hand (#1014)
+
+## 🏗️ Infrastructure
+
+- **New managed-KB document reconciler Lambda, schedule, role, log group and SSM parameter.** Covered in the spotlight above. The two points to carry into a deploy plan: the construct is instantiated **unconditionally**, so the Lambda and the *enabled* nightly rule are created regardless of every `managedKb` flag — deliberate, because report-only is read-only and the audit period only happens if the schedule runs — and the run performs a nightly full `Scan` of the RAG assistants table even with zero managed KBs. Roughly 6–7 new CloudFormation resources; the 460-resource guard did not trip (#1007, #1008)
+- **Per-model Bedrock TPM quota alarms.** `{prefix}-bedrock-tpm-quota-usage` is deleted and replaced by `{prefix}-bedrock-tpm-quota-usage-<model-slug>`, one per entry in `CDK_OBSERVABILITY_BEDROCK_TPM_QUOTAS`, thresholded at `CDK_OBSERVABILITY_BEDROCK_TPM_QUOTA_PERCENT` (default 75) of that model's own quota. Net resource change is **−1** for a fork that configures nothing. The default map is deliberately empty: quotas differ by two orders of magnitude within a single account, most are adjustable, and any shipped number would be wrong for every fork and stale the first time someone requested an increase. `Maximum` statistic over a 5-minute period against 1-minute data, because the quota is per *minute* and averaging would dilute a real spike below the threshold. Each alarm's description leads with the instruction to confirm the configured quota is still the live one — **it is maintained by hand and nothing checks it** (#1016)
+- `infrastructure/cdk.context.json` added to the `platform.yml` push-paths filter; a sizing edit there previously triggered no deploy (#1020)
+
+## 🔧 CI/CD
+
+- **`CDK_MANAGED_KB_DOC_RECONCILER_ARMED` is now forwarded** from `vars.*` in the platform deploy job's **job-level** `env:`. The flag had been threaded through `load-env.sh` and `config.ts` but never added to the workflow, so `load-env.sh` always saw it unset and never emitted the `--context` flag — the accept-then-silently-ignore failure this repo has now hit three times (#1018)
+- New job-level `CDK_OBSERVABILITY_BEDROCK_TPM_QUOTA_PERCENT` and `CDK_OBSERVABILITY_BEDROCK_TPM_QUOTAS` (#1016)
+- New job-level `CDK_APP_API_CPU`, `CDK_APP_API_MEMORY`, `CDK_APP_API_DESIRED_COUNT`, `CDK_APP_API_MAX_CAPACITY`. `nightly-deploy-pipeline.yml` pins 512/1024/2/4 **literally** rather than from `vars.*`, so a production sizing bump never inflates an ephemeral nightly stack — while `desiredCount` stays at 2 so the shared BFF cookie-key path is still exercised (#1020)
+- **New `Test load suite (pytest)` job on every PR into `develop` and `main`**, plus `locust --list` on both locustfiles. The gate exists because the locustfiles encode the `/chat/stream` payload shape and the SSE event names, so renaming a stream event now fails CI instead of silently producing a load test that reports every turn as never finishing (#1020)
+- `deploy-image-lambda-one.sh` and `backend.yml` gain a `kb-migration-document-reconciler` case (#1008)
+- `shellcheck` 0.9.0 and `actionlint` 1.7.12 added to the dev container and its `HEALTHCHECK` — they compose, since actionlint shells out to shellcheck to lint workflow `run:` blocks. Neither is wired into CI yet; **an existing long-lived dev container will report unhealthy until rebuilt** (#1020)
+
+## 📦 Dependencies
+
+| Component | Package | From | To |
+|---|---|---|---|
+| Backend | `strands-agents` | 1.51.0 | 1.55.0 |
+| Backend | `strands-agents-tools` | 0.8.6 | 0.8.8 |
+| Backend (transitive) | `aws-sdk-bedrock-runtime` | 0.5.0 | 0.11.0 |
+| Backend (transitive) | `smithy-core` | 0.4.0 | 0.8.1 |
+| Backend (transitive) | `smithy-aws-core` | 0.5.0 | 0.11.0 |
+| Backend (transitive) | `smithy-http` | 0.4.0 | 0.5.0 |
+| Fine-tuning VLM image | `peft` | — | 0.20.0 |
+| Fine-tuning VLM image | `bitsandbytes` | — | 0.50.2 |
+| Fine-tuning VLM image | `pillow` | — | 12.3.0 |
+| Load suite (isolated) | `locust` | — | 2.46.4 |
+| Dev container | `shellcheck` | — | 0.9.0 |
+| Dev container | `actionlint` | — | 1.7.12 |
+
+`boto3` and `botocore` are deliberately unchanged at 1.43.68 — 1.55.0 floors well below that and nothing forced a bump. The `strands-agents` upgrade also required two code adaptations beyond the Voice Mode rename: `cache_tools` is deprecated in favour of `CacheConfig(tools_ttl=…)`, and 1.55.0 auto-injects a system cache point guarded by a predicate equivalent to the factory's own — worth verifying because two adjacent cache points are a Bedrock `ValidationException` and a moved system boundary would rewrite the cached prefix and destroy hit rates. The upgrade was checked against dev Bedrock: a request formatted by 1.55.0 read the exact cache entry a 1.51.0-formatted request had just written, and a three-turn session went first-write → hit → hit with constant tool-config and system-prompt hashes.
+
+## 🧪 Test coverage
+
+Roughly **4,100 lines of new tests** across the release:
+
+| Area | Lines | Scope |
+|---|---|---|
+| KB document reconciler | 677 | 61 cases, 13 classes; moto plus a Bedrock document-view stub |
+| Generative VLM fine-tuning | 665 | Task spec, trainer purity, per-family packaging, CSV escaping, SPA controls |
+| Load suite | 608 | 53 tests: SSE, config, login form, credential pool, burst shape |
+| MCP Apps error envelope + OAuth | 546 | 30 envelope guards, 9 async dispatch tests, relay/status restoration |
+| MCP Apps lifecycle | 470 | Retention, revalidation, teardown grace, actions chip |
+| `browse_web` | 381 | CDP framing via a fake that speaks the protocol, URL validation, budgets |
+| Managed-KB engine visibility | 226 | Badge, status vocabulary, retrieval log line |
+| `strands-agents` 1.55.0 | 153 | Provider contract read from the pinned SDK's source on disk |
+| Bedrock quota alarms | 122 | Per-model dimensions, thresholds, context parsing, routing |
+| Calculator sandbox | 101 | 17 cases against the installed wheel |
+| KB cap + fail-closed | 82 | Cap resolution, engine keying, empty-`document_id` batch |
+| app-api sizing config | 75 | Flat vs nested context precedence, unset variable falls through |
+
+Two claims in this release's commit messages are the authors' own methodology rather than independently reproduced here, and are worth reading as such: several describe their tests as "mutation-verified" without a mutation-testing config in the diffs, and the full-suite pass counts (7,940 backend / 2,558 frontend on the fine-tuning branch) were not re-run.
+
+## 🚀 Deployment notes
+
+**A CDK deploy is required**, and both backend images plus the SPA must ship. Order does not matter much, with one exception noted below.
+
+1. **Decide the app-api sizing before deploying Platform.** The committed default changed, so doing nothing is a choice with a bill attached. Set the four GitHub Variables on the deploy job's environment, then confirm the resolved values in the synth log — **changing a GitHub Variable triggers no workflow**, so deploy via `workflow_dispatch`. `cpu` and `memory` must remain a valid Fargate pair (1024 → 2048–8192; 2048 → 4096–16384); an invalid pair is a **failed CloudFormation deploy**, not a silent fallback.
+
+   | Variable | Default if unset |
+   |---|---|
+   | `CDK_APP_API_CPU` | `1024` (was 512) |
+   | `CDK_APP_API_MEMORY` | `2048` (was 1024) |
+   | `CDK_APP_API_DESIRED_COUNT` | `2` |
+   | `CDK_APP_API_MAX_CAPACITY` | `10` |
+
+2. **Restore a Bedrock quota alarm if you want one.** The account-wide alarm is deleted on this deploy and nothing replaces it automatically. Read your live quotas, then set the map — **use the quote-free form**, because `deploy.sh` runs `eval npx cdk synth` and `eval` strips quotes:
+
+   ```bash
+   aws service-quotas list-service-quotas --service-code bedrock \
+     --query "Quotas[?contains(QuotaName,'tokens per minute')]"
+   ```
+
+   ```
+   CDK_OBSERVABILITY_BEDROCK_TPM_QUOTAS=global.anthropic.claude-sonnet-5=40000000,us.anthropic.claude-sonnet-4-20250514-v1:0=200000
+   ```
+
+   JSON is also accepted, but only survives because `load-env.sh` single-quotes it; a value containing a single quote now fails the script loudly rather than degrading to "no alarms, no error". Remember that the configured quota is a hand-maintained number that nothing verifies — `bedrock-invocation-throttles` remains the no-configuration backstop, and it fires on real refusals.
+
+3. **Expect the document reconciler to start running, and read its output before arming it.** The nightly rule is created enabled for every deployment. It is report-only and read-only until `CDK_MANAGED_KB_DOC_RECONCILER_ARMED` is explicitly truthy — unset, empty and `false` all mean off, at every layer. Give it a few nights, read the log group (there is **no alarm** on this Lambda and no alarm on its five metrics), confirm the proposed actions look right, and only then arm it. Armed runs are capped at 25 corrections per night by default. This flag is independent of `CDK_MANAGED_KB_RECONCILER_ARMED`; arming one does not arm the other. Between the CDK deploy and the next `backend.yml` run the rule invokes the no-op bootstrap stub, which is safe.
+
+4. **Re-run Seed Bootstrap Data if you want `browse_web`.** The tool ships registered in code but has no DynamoDB catalog row, and tool availability is driven entirely by that catalog — so without a seed run it never appears in the UI, is never enabled, and is never handed to the agent. The workflow is `workflow_dispatch`/`workflow_call` only and **is not invoked by any deploy pipeline**, so this will not happen as a side effect. The seeder is idempotent and skips existing tool rows. Once seeded, note the shape of the default grant: the seeded `default` role carries a wildcard tool grant, so the tool becomes *granted* to everyone while still requiring each user to enable it in their tool preferences. An institution that wants it restricted should grant per-role rather than rely on the wildcard. Consider running `backend/scripts/probe_agentcore_browser.py` first — the SigV4 WebSocket handshake and a real page load were not exercised against live AWS in this release.
+
+5. **Ship both backend images together.** The MCP Apps error envelope is a contract change between inference-api and app-api. `backend.yml` deploys both from the same commit so the steady state is fine, but a *new* inference-api behind an *old* app-api would relay `200 + {"appToolError": …}` straight to the SPA, where it reads as a successful call with an empty result. The reverse pairing is harmless.
+
+6. **No backfill, no migration, no index to wait for.** Nothing in this release adds or modifies a GSI, and no one-shot script needs running.
+
+Two things this release cannot do for you. If you intend to serve anything like campus scale, **request a Bedrock TPM quota increase now** — the measurement above puts the untouched 6,000,000 TPM default at roughly 225 turns per minute platform-wide, and quota increases have lead time. And if you plan to fine-tune VLMs, check your **SageMaker `ml.g6e` training-instance quota**, which the platform cannot raise on your behalf.
+
+---
+
+# Release Notes — v1.19.1
+
+**Release Date:** September 7, 2026
+**Previous Release:** v1.19.0 (September 6, 2026)
+
+---
+
+> 🏗️ **No CDK deploy required.** No infrastructure changed in this release — `infrastructure/gsi-inventory.json` is byte-identical to `main`, and no table gains or loses an index.
+>
+> ⚠️ **One prerequisite carried forward from 1.19.0, now mandatory.** `UserArtifactsIndex` shipped in 1.19.0 with nothing reading it. This release puts it on the artifact library's read path. Before deploying, the index must report `ACTIVE` **and** `backfill_artifact_user_index_keys.py` must have been applied — an unstamped row is absent from a sparse index, which means an artifact missing from its owner's library. See Deployment notes.
+
+---
+
+## Highlights
+
+A patch release with two MCP Apps fixes and one performance change. Both defects had the same shape — the tool behind an App really ran, and the App showed nothing for it. One relayed an empty result to the iframe because the MCP client returns a dict where the code expected an object; the other hit a torn-down MCP session on any call made between turns and surfaced as an intermittent 502. Separately, the artifact library listing moves off the base table onto `UserArtifactsIndex`, retiring the read amplification and the per-request sort that the index was added to remove.
+
+## 🐛 Bug fixes
+
+- **An MCP App could issue a tool call, have it succeed, and render nothing.** `_serialize_content` read the tool result's content with `getattr`, but Strands' `MCPToolResult` extends `ToolResult` — a `TypedDict`, so what `call_tool_sync` returns at runtime is a plain dict and the attribute lookup found nothing. Every app-initiated `tools/call` therefore relayed `content: []`. Nothing in the chain reported a problem: app-api returned 200, inference-api returned 200, and the MCP server had genuinely run the tool, so a write took effect while the App received nothing to show for it — any App that re-reads state after an edit simply appeared frozen. The dict shape is now handled alongside the attribute one, mirroring the branch `_is_error` already had. The existing dispatch-test fakes were objects carrying a `.content` attribute, which is exactly why the attribute-only path looked correct; the new test uses the dict shape the client really returns (#993)
+- **App-initiated tool calls between turns failed with a 502 that looked intermittent.** Such a call arrives after the turn that built the agent has ended. `routes.py` rebuilds the conversation's agent, but with `cache_write=False` it reads a *cached* agent — and Strands tears that agent's MCP client sessions down when its turn ends. `_resolve_client` then handed back a client whose session was no longer running, `call_tool_sync` raised `MCPClientInitializationError`, and that became an `AppToolCallError(502)` reaching the App as a Bad Gateway. The intermittence was the tell: a call made while the turn was still streaming found the session alive and worked. The call is now wrapped so the client is reconnected for its duration and left as it was found. A session already live belongs to an in-flight turn and is used as-is, never stopped here, and overlapping app calls against the same client share one revived session through a refcount, so no call has the connection closed underneath it. The fix is deliberately kept at the dispatch boundary — resolving the live client from the freshly built agent is the deeper fix, but it reaches into how tool providers are held and cached (#994)
+
+## ⚡ Performance
+
+**The artifact library listing now serves from `UserArtifactsIndex`.** 1.19.0 added the index and deliberately left it unread; this release switches the read over. `list_for_user` queries `GSI2PK=USER#{uid}` with `GSI2SK` descending instead of querying the base table.
+
+The base partition holds both HEAD and version rows, so the old Query spanned roughly three times the rows it returned and then date-sorted them in memory on every request. Only HEAD rows carry the GSI2 keys, so the index holds one row per artifact and already in newest-first order — both the amplification and the sort go away, and the ordering comes from the store rather than being recomputed per call.
+
+The endpoint still returns the whole library in one response, paging the index internally. Exposing pagination is a larger change than it looks: search and the type filter live in the SPA today, and a filter that can only see the loaded page is worse than no filter because it looks authoritative — both would have to move server-side in the same change. The index makes that possible whenever it is wanted.
+
+### Two things this turned up
+
+**The library tests were passing against the old code path.** The test fixture declared no `GlobalSecondaryIndexes` at all, so a suite that should have required an index went green without one. The fixture now declares it, which makes moto raise `ResourceNotFoundException` if the query ever stops using the index — the tests exercise the index rather than silently falling back.
+
+**Undated rows would have vanished.** A sparse index omits any HEAD row without `GSI2PK`, permanently and silently. Rows predating `updated_at` cannot carry a real timestamp, and the original backfill reported them rather than stamping them — correct while nothing read the index, and a silent data-loss path the moment something did. They are now stamped with an empty timestamp segment (`ARTIFACT##{aid}`): not a fabricated time, but a key that sorts below every digit and so reads last when the index is read descending — exactly where the old in-memory sort put it. Neither dev nor prod holds such a row today; this is the defensive branch, and it preserves a contract `test_undated_legacy_rows_are_returned_and_sort_last` already asserted.
+
+### Test Coverage
+
+Backend suites for app_api, architecture and the artifact writer pass at 942 tests, with the library fixture now index-backed. The MCP Apps fixes add dispatch tests using the dict result shape the MCP client actually returns and covering session revival, reuse of an already-live session, and refcounted overlap.
+
+## 🚀 Deployment notes
+
+**No CDK deploy is required** — this release changes no infrastructure. `backend.yml` and `frontend-deploy.yml` are sufficient.
+
+**Before deploying, confirm the 1.19.0 index groundwork is complete.** The artifact library now reads `UserArtifactsIndex`, so two things that were optional last release are prerequisites now:
+
+1. The index reports `ACTIVE` — `UPDATE_COMPLETE` on the stack is not the same thing:
+
+   ```bash
+   aws dynamodb describe-table --table-name <prefix>-user-artifacts \
+     --query 'Table.GlobalSecondaryIndexes[].{Name:IndexName,Status:IndexStatus}'
+   ```
+
+2. `backend/scripts/backfill_artifact_user_index_keys.py` has been applied. The index is sparse: an unstamped HEAD row is *absent* from it, not stale, so an artifact written before 2026-09-04 and never backfilled disappears from its owner's library after this deploy. The script is dry-run unless given `--apply`.
+
+**Re-run the backfill if the 1.19.0 version reported any undated rows.** That version counted rows with no `updated_at` and left them unstamped; this version stamps them with an empty timestamp segment so they sort last instead of dropping out. A re-run is idempotent and skips rows already stamped.
+
+---
+
+# Release Notes — v1.19.0
+
+**Release Date:** September 6, 2026
+**Previous Release:** v1.18.0 (September 6, 2026)
+
+---
+
+> 🏗️ **CDK deploy required.** One new GSI — `UserArtifactsIndex` on the **existing** `{prefix}-user-artifacts` table. That is **one** index operation on one existing table, within DynamoDB's one-GSI-per-`UpdateTable` limit, so this release does not need splitting. Confirm the index reports `ACTIVE` before considering the deploy done — CloudFormation reporting `UPDATE_COMPLETE` is not the same thing.
+>
+> ⚙️ **`CDK_ARTIFACT_SHARE_INBOX_ENABLED` changes meaning.** It was opt-in (only `"true"` enabled the inbox); it is now a kill switch (unset or empty means **enabled**, only `"false"` disables). An environment that never set it **gains the "Shared with you" tab on this deploy**. Set it to `"false"` before deploying to keep that surface dark.
+>
+> 🧹 **Two optional one-shot scripts, both dry-run by default.** Neither is required for the deploy to be correct; see Deployment notes.
+
+---
+
+## Highlights
+
+This release makes a conversation stop misreporting its own history. Two unrelated defects were doing it: a response that finished normally could be labelled **"Response interrupted"** with a Continue button that would resume an already-complete answer, and a response that genuinely *was* interrupted could show the model-directed `<interruption_note>` — text written for the model, not the user — inside the user's own chat bubble, permanently. Both are fixed where they originate rather than papered over at the render layer. Alongside them, the artifact **"Shared with you" inbox now ships on by default** with a kill switch, and `UserArtifactsIndex` is added to the artifacts table as groundwork with nothing reading it yet.
+
+## Interrupted turns now tell the truth
+
+Two independent bugs, both surfacing as a conversation describing itself incorrectly after an interruption.
+
+**A completed turn could claim it was interrupted.** The SPA creates one `AbortController` per streaming request and used to release it only when the user clicked Stop — never on normal stream teardown. `streamingSessionIds()` reads exactly that controller to decide which turns a page departure interrupted, so after any turn that finished on its own, the session still looked in-flight for the rest of the tab's life. The next refresh, tab close, or cross-document navigation then attributed a `navigated_away` interruption to a finished answer, and a single departure marked *every* session that tab had ever streamed. On the next load the conversation showed "Response interrupted" and offered Continue, which would spend a turn resuming a response that had already ended.
+
+**An interrupted turn could show the note meant for the model.** When a turn is interrupted, the next turn's prompt carries an `<interruption_note>` telling the model what happened. That note is deliberately part of persisted history — it is an honest record of what the model read — and the UI is supposed to render `displayText`, the clean copy of what the user typed, in its place. `displayText` was written by a single call site at the end of a *successful* turn, so a turn that was stopped, dropped, or errored never wrote one and the augmented prompt became the only text available to render. The failure concentrated where it was most visible: a turn only carries an interruption note because the *previous* turn was interrupted, so notes rode disproportionately on turns likely to be interrupted themselves.
+
+### Backend
+
+- `apis/app_api/sessions/routes.py` — `POST /sessions/{id}/interrupt` now verifies a turn is genuinely in flight against the session's single-flight lease before recording `navigated_away`. `user_stopped` is deliberately ungated: the Stop button only exists while streaming, and the same request arms distributed cancellation, which must still reach a turn whose lease read fails open.
+- `agents/main_agent/session/hooks/display_text.py` — new `DisplayTextHook` writes `displayText` on `MessageAddedEvent`, when the user's message enters history and before the model call, so every later exit path already has it. Not every role-`user` message is the user: tool results carry that role, and Strands prepends a synthetic tool-result message ahead of the prompt when history ends on a dangling `toolUse` — precisely what an interrupted tool turn leaves behind — so content carrying `toolResult`/`toolUse` is skipped.
+- `agents/main_agent/streaming/stream_coordinator.py` — arms the hook at the head of every turn, unconditionally including to `None`, because the agent instance is cached across turns. Its own end-of-turn write remains as a backstop for callers with no hook and for a failed write.
+
+### Frontend
+
+- `session/services/chat/chat-state.service.ts` and `chat-http.service.ts` — a session's controller is released on stream teardown, identity-checked so a superseded stream's late close cannot clear the controller of the stream that replaced it.
+
+### Test Coverage
+
+19 new backend tests across the hook and the coordinator's arming/backstop seam, plus SPA specs covering controller release, the identity guard, and the lease-gated and ungated interrupt paths.
+
+## 🐛 Bug fixes
+
+- **The sidebar said "No Chats Yet" while sessions were still loading**, showing an empty-state message to users who had conversations. The loading test read `value() === undefined`, but the sessions resource short-circuits to `null` on the ordinary cold-start path — `SessionService` is constructed during the `APP_INITIALIZER` pass, before the BFF bootstrap promise resolves — and `reload()` preserves that `null` through the real fetch, so the skeleton never rendered (#985)
+
+## ⚠️ Changed
+
+- **The artifact "Shared with you" inbox defaults on.** `ARTIFACT_SHARE_INBOX_ENABLED` was opt-in when the surface shipped in 1.18.0, because the surface landed before the product decision about it did. That decision has since been made and the inbox went live; leaving the default opt-in would mean every institution forking this repository silently loses a finished feature and has to discover a variable to get it back. `"false"` still turns it off (#986)
+
+## 🏗️ Infrastructure
+
+- **`UserArtifactsIndex`** on the existing `{prefix}-user-artifacts` table — `GSI2PK=USER#{uid}`, `GSI2SK=ARTIFACT#{updated_at}#{aid}`, sparse over HEAD rows. The artifact writer stamps both keys on both of its write paths. **Nothing reads the index in this release**; the library listing still serves from the base table, so the index is groundwork and can be deployed and backfilled without any user-visible change (#982)
+
+## 🚀 Deployment notes
+
+**A CDK deploy is required**, and one existing table gains one index. Verify it before moving on:
+
+```bash
+aws dynamodb describe-table --table-name <prefix>-user-artifacts \
+  --query 'Table.GlobalSecondaryIndexes[].{Name:IndexName,Status:IndexStatus}'
+```
+
+`UPDATE_COMPLETE` on the stack does not mean the index is usable — wait for `ACTIVE`.
+
+**Check `CDK_ARTIFACT_SHARE_INBOX_ENABLED` before deploying.** Its default inverted: an environment that never set it gains the "Shared with you" tab. Set it to `"false"` first to keep that surface dark.
+
+**Two optional one-shot scripts**, both dry-run unless given `--apply`:
+
+- `backend/scripts/backfill_artifact_user_index_keys.py` — stamps `GSI2` keys onto artifact rows written before 2026-09-04. The index is sparse, so unstamped rows are absent from it rather than stale. Nothing reads the index yet, so this can run any time after it reports `ACTIVE` — but it must run before anything does.
+- `backend/scripts/backfill_false_interrupted_markers.py` — clears interrupted-turn markers left by the defect above. It only touches `navigated_away` markers written more than 900s after the session's last message, which no interruption could have produced (the stream times out at 600s). Markers self-clear at the start of that session's next turn, so this only matters for conversations nobody returns to.
+
+---
+
+# Release Notes — v1.18.0
+
+**Release Date:** September 6, 2026
+**Previous Release:** v1.17.0 (September 2, 2026)
+
+---
+
+> 🏗️ **CDK deploy required.** One new DynamoDB table (`{prefix}-announcements`, **no GSIs**), new IAM grants for it, and `bedrock:CallWithBearerToken` on the inference-api role. `infrastructure/gsi-inventory.json` gains one entry with an empty index list — **no index operations on any existing table**, so this release is not subject to the one-GSI-per-`UpdateTable` split.
+>
+> ⚙️ **One new deploy variable: `CDK_ARTIFACT_SHARE_INBOX_ENABLED`.** It gates the artifact library's "Shared with you" tab and nothing else. Default off. Set it to `"true"` on an environment *before* the deploy to have the tab appear there; the pointer rows behind it are written regardless, so flipping it later is complete and instant with no backfill.
+>
+> ⚡ **Two things change on deploy with no flag:** an omitted `supported_param` is now treated as unsupported rather than passed through, and the prompt-cache TTL is derived from the serving model instead of assumed. Both are corrections, but both change behavior on the first turn after the deploy.
+
+---
+
+## Highlights
+
+A release about the things users *keep*, and about telling them what changed.
+
+**Artifacts became a place, not a side effect.** Before this release an artifact existed inside the conversation that made it and nowhere else. Now there is a library at `/artifacts` with live previews, rename and delete; artifacts can be **shared** with named recipients or the whole tenant and revoked at any time; and sharing a conversation shares the artifacts in it — which until now silently showed the recipient nothing where the owner saw cards. Eleven PRs, all verified live on dev, and **zero new tables and zero new indexes**: the `user-artifacts` table was already partitioned by user, and share records ride the same partition under a `SHARE#` prefix.
+
+**The platform can now tell users what shipped.** Feature announcements are admin-authored, role-targeted notices with a real lifecycle (draft → publish → revise → archive), per-user acknowledgements, a What's New panel, a floating banner beside the chat composer, a modal for the high-priority ones, and reach stats on the admin list so an author can see whether anyone actually read it.
+
+**A follow-up typed mid-turn no longer has to interrupt the turn.** Type while the model is working and the text is injected into the *running* turn at the next tool boundary, appended to the same user-role message that carries the tool results — so the agent reads it before choosing its next action, rather than after the turn it should have influenced has already finished. It is append-only against the cached prefix, so it costs nothing in prompt-cache terms.
+
+**The SPA is now rebrandable from one file.** `brand.config.ts` holds app name, page title, greeting text, logo paths and the brand colors; generators derive the entire theme — brand tokens, an OKLCH-banded neutral surface ramp, and favicons — at prestart and prebuild. This matters because this repo is forked: previously a fork had to hunt colors through components.
+
+**Cost correctness took another pass.** The GPT-5.6 family (Sol, Terra, Luna) is curated and every one of its rates is corrected — they had been derived from a 1000x-wrong multi-model blend when the model cards published them all along. Explicit prompt-cache breakpoints for GPT-5.6 were built, measured at **57% more expensive** than the provider's automatic caching, and shipped **off**.
+
+**Every open Dependabot alert (47) and 40 CodeQL findings are closed.**
+
+---
+
+## Artifacts: a library, and sharing
+
+The artifact feature shipped originally as a rendering surface attached to a conversation. This release makes it a user-level asset with an owner, a lifetime independent of the chat that produced it, and an access-control story.
+
+### The library
+
+`GET /artifacts/library` and a page at `/artifacts`, reachable from **Settings → Profile** next to My Files.
+
+**No new index was needed, and that was the finding that shaped the design.** `user-artifacts` is keyed `PK=USER#{uid}` / `SK=ARTIFACT#{aid}#HEAD|#V#{n}`, so a user's entire library is already one partition — ownership rides the partition key. Production was measured before deciding: 1,494 artifacts across 340 users, 4,129 rows, 2.3MB; the heaviest user holds 64 artifacts in ~110KB, about 14 RCU. The content mix (`text/markdown` 2,769 vs `text/html` 1,352) is why the library defaults to **list** while the Agents surface defaults to grid — most artifacts are documents, not visual pages.
+
+`GSI2PK`/`GSI2SK` are stamped on HEAD rows by a writer with **no index consuming them yet** (#940). A sparse GSI only ever contains rows that already carry its key attributes, so rows written before the attributes exist stay invisible to it forever — silently, as a library listing only post-deploy artifacts with no error anywhere. Stamping early shrinks the eventual backfill to the pre-#940 rows, and costs nothing until the index exists.
+
+- **Grid previews** (#967) render the artifact itself — the deployed render path in an iframe at `scale(cardWidth/1024)`, at a fixed 1024px virtual viewport so the miniature is a true reduction rather than a mobile reflow. Not a server-side screenshot, which would mean executing user HTML server-side in our own account. **Cost is the design constraint:** every mounted preview is a mint plus a render-Lambda invocation plus an S3 GetObject on a `CACHING_DISABLED` path, so previews mount lazily on intersection and a mounted one is never unmounted or re-minted. List stays the default deliberately — flipping it would put every user into the expensive view.
+- **Rename and delete** (#952, #957) via `PATCH` / `DELETE /artifacts/{id}` — hard-delete in DynamoDB, tag in S3, no IAM change. Available from the library, the docked panel and the inline message card.
+- **In-app viewer** (#958) — artifacts open in a docked panel rather than depending on a pop-up window. Render tokens are ~120-second bearer credentials, so a grid cannot pre-mint; the previous flow minted per click and any await before `window.open` cost the active gesture and got the pop-up blocked.
+
+### Sharing
+
+`POST /artifacts/{id}/shares` and friends, with two share types: `specific` (an email allowlist) and `public` (any authenticated tenant user). Recipients land on `/shared-artifact/{shareId}` — a minimal-chrome shell with no sidenav, since a recipient has no other business in the app.
+
+**Zero infrastructure.** A share is two rows on the existing artifacts table written in one `TransactWriteItems`: an owner row and a `SHARE#{id}`/`META` lookup row. No GSI, deliberately — the table's index budget stays free for the `UserArtifactsIndex` the writer is already stamping keys for. `TransactWriteItems` needs no IAM action of its own; it authorizes against the underlying Put/Delete.
+
+> ⚠️ **The mint sets the token's `sub` to the *owner's* user id, not the viewer's — and that is correct.** `sub` is the DynamoDB partition key the render Lambda builds (`PK = USER#{sub}`): an *address*, not an identity assertion. Setting it to the viewer points at the viewer's own partition and 404s. Viewer identity travels in the `vwr` claim and the grant in `shr`; the ACL check in app-api is what stands between sharing and reading any artifact by id. This is written down because it looks like a bug and "fixing" it would break the feature.
+
+The render Lambda was deliberately not modified — `_verify_token` has no extras rejection, so `vwr`/`shr` are forward-compatible with what is already deployed. A test imports `_verify_token` directly to keep that a verified fact rather than a reading, and it was confirmed against the live Lambda in dev.
+
+**Session-delete cascade** (#931, #932): deleting a conversation revokes the artifact shares created from it, on both the single and bulk delete routes. The lookup row is deleted **before** the owner row — the lookup row is the capability, so a half-finished cascade leaves an inert orphan rather than a live share the owner can no longer see to revoke. The test asserts the order, because both orders look identical when nothing fails.
+
+### The recipient inbox — the one flagged surface
+
+`GET /shared-artifacts` lists what has been shared *with* you, and the library grows **All / Yours / Shared with you** tabs (#968, #970).
+
+**A GSI cannot index a list attribute.** `allowed_emails` is a list, so no index can turn one share row into N recipient entries; any recipient lookup needs a row per (share, recipient) regardless, and the only real question is which partition it lives in. So: fan-out pointer rows at `PK=SHARED_WITH#{email_lower}` / `SK=SHARE#{createdAt}#{shareId}`, in the recipient's own partition. Still no GSI.
+
+Three properties hold it together. The row is a **pointer** — it carries no title, because copying one per recipient multiplies staleness by allowlist size. The read **never trusts it** — it resolves through the share lookup row and re-runs the access check, so a stranded pointer lists nothing and grants nothing. And fan-out is **discovery, never authorization**, which is what allows it to be written best-effort per item *outside* the two-row transaction — avoiding an allowlist cap of roughly 40 addresses that `TransactWriteItems`' 100-item limit would otherwise invent.
+
+> ⚠️ **`ARTIFACT_SHARE_INBOX_ENABLED` gates the READ only. The fan-out rows are written unconditionally.** That asymmetry is the point: if the writes were gated too, enabling the flag would reveal an inbox missing every share created while it was off — a wrong answer rather than an empty one, and one nobody can see is wrong. Do not "optimise" the write path by wrapping it in the flag.
+
+The SPA needs no flag of its own. It requests the inbox in parallel with the owned list; a 404 means the surface does not exist in this environment and it renders the tab-less library it always did. An inbox that 503s is allowed to fail on its own without blanking the artifacts the user owns.
+
+### Sharing a conversation shares its artifacts
+
+Closing §8 of the spec (#971, #973). A recipient of a shared conversation used to see **nothing** where the owner sees artifact cards, with no error and no explanation.
+
+**The conversation share *is* the grant** — no artifact share records are created. `create_share` pins the session's artifacts at their current versions into the S3 snapshot body, which simultaneously preserves point-in-time semantics and makes the snapshot the allowlist; `resolve_shared_artifact` checks the conversation ACL *and* snapshot membership before minting. Parallel artifact shares were rejected because each would need cascading on update, revoke and delete, and one missed cascade leaves an artifact readable after its conversation was locked down.
+
+The snapshot's `artifacts` key is **optional on read** — conversation sharing is already in production, so pre-existing bodies read as `[]`. No migration.
+
+The recipient UI is its own card and dialog rather than a mode of the owner's: the owner components carry download, share, rename, delete, version picker and code view, all keyed on endpoints a conversation-share recipient has no handle for. The shared layer is `ArtifactViewerComponent`, which absorbed a third mint path with **no change** — the sign the split was drawn in the right place.
+
+### Test coverage
+
+Over 6,700 lines of new tests across the share service, the cascade, the inbox fan-out, the library page and the recipient surfaces — including a test that pins the DynamoDB **API surface** the cascade may use, mutation-checked by reintroducing the bug and confirming it fails.
+
+---
+
+## Feature announcements
+
+Admins can now publish release notices to users, target them by role, and see whether anyone read them.
+
+### Backend
+
+- **`{prefix}-announcements`** — one table, two item shapes: announcement rows under a fixed `ANNOUNCEMENTS` partition and each user's ack rows under `USER#<id>`. No GSIs.
+- `/admin/announcements` — list, get, create, patch, `publish`, `archive`, `revise`, delete, and `{id}/stats` (#966, #972, #978).
+- `GET /announcements` + an acknowledgement endpoint for users (#969).
+- Gated by `ANNOUNCEMENTS_ENABLED`, **default on with a kill switch**. While off the routers are unmounted and the surface 404s; data and code remain intact.
+- **Who may author** is the delegable `admin.announcements` scope. **Who sees** a published announcement is the announcement's own `targetRoles` — a display filter, deliberately *not* an RBAC grant.
+
+### Frontend
+
+- **What's New panel** with the user's feed and ack state (#969).
+- **Banner** (#976, #979, #981) — floats rather than occupying layout, and sits beside the chat composer on the side the composer leaves free. Chat view only.
+- **Modal** for high-priority announcements, gated by the spec's §D8 rules (#977).
+- **Reach column** on the admin list, driven by ack funnel counters (#978).
+
+> ⚠️ Announcement ack counters are **incremented, never backfilled**. An announcement published before this release has no counters and will read as zero reach rather than as unknown.
+
+---
+
+## Mid-turn steering
+
+Type a follow-up while a turn is still streaming and it now lands *inside* that turn.
+
+The text is injected at the next tool boundary as a `{"text": ...}` block on the same user-role message that carries the tool results, so the agent reads it before choosing its next action. A new `steering_applied` SSE event is emitted after that batch's `tool_result` events, so the thread renders in the order the model will see.
+
+**The transport is the session's existing single-flight lease row** — `steerQueue` + `steerFor`, owner-scoped exactly like `cancelRequestedFor`, armed by `POST /sessions/{id}/steer` and deleted with the lease at turn end. No new table, no new stream.
+
+Consumption is **commit-on-append**: the hook peeks at `AfterToolsEvent` and clears the inbox entry only on the `MessageAddedEvent` for that same message. `AfterToolsEvent` fires from a `finally`, so it also fires on the interrupt path where the mutated message is discarded — a hook that consumed on read would destroy the user's words whenever a steer landed on the same tool batch as an OAuth consent.
+
+**Absence of the event is a fallback, not an error.** A turn that calls no tools has no boundary to inject at, and a steer can lose the race with the turn's end; in both cases the entry stays queued and is sent as a normal turn.
+
+It is **append-only against the cached prefix** — the injection lands inside the segment the message-level cachePoint covers — so it never rewrites the prefix and costs nothing in cache terms. A test locks that placement.
+
+Gated by `MID_TURN_STEERING_ENABLED`, default on with a kill switch; while off the steer endpoint 404s and the hook returns immediately. Spec: `docs/specs/mid-turn-steering.md`.
+
+Four defects were found by validating this on dev and fixed in the same release: a steer rendered once per sync tick instead of once (#930), a follow-up typed while a turn was *paused* was dropped rather than queued (#934), the steer bubble used a non-standard color (#935), and a user bubble's overflow was measured once and latched (#937).
+
+---
+
+## Single-file rebranding
+
+This repo is forked by institutions that are not Boise State, and until now rebranding meant hunting colors through components.
+
+`frontend/ai.client/src/branding/brand.config.ts` is now the only file to edit for every non-logo brand value: app name, page title, greeting templates and fallbacks, logo paths, brand colors, and surface anchors. Consumers never import it directly — they read through `BrandingService`, which normalizes and defends against missing or invalid values.
+
+- **Surface colors are validated, not merely accepted.** Each surface anchor must fall inside a per-role OKLCH band (`light` L≥0.90 / C≤0.04, `raised` L≥0.95 and above `light` / C≤0.03, `dark` L≤0.32 / C≤0.05) or it is rejected and reset to the default neutral for that role. The bands keep page and card backgrounds legible while still allowing a brand tint.
+- **Four generators** run at `prestart` and `prebuild`: brand theme, surface theme, surface colors, and favicons (`sharp` + `tsx` are new dev dependencies for this).
+- **Golden-file and parity specs** pin the generated output, including a spec that fails if the rebranding guide goes missing — documentation kept honest by test.
+- New token layers: `styles/tokens/identity.css` and `styles/tokens/state.css`, plus generated `brand-theme.css`, `surface-theme.css` and `surface-colors.ts`.
+
+---
+
+## Models and cost correctness
+
+### GPT-5.6 Sol, Terra and Luna
+
+Curated in the model catalog on the `bedrock-runtime` OpenAI-compatible endpoint (`us.openai.gpt-5.6-*`), with a new `provider="bedrock-responses"` transport (#949) and the IAM grant it turned out to need (#959).
+
+> ⚠️ **The OpenAI-compatible endpoint on `bedrock-runtime` authenticates under the `bedrock` service namespace, not `bedrock-mantle`.** Granting only `bedrock-mantle:CallWithBearerToken` returns `401 ... is not authorized to perform: bedrock:CallWithBearerToken`.
+
+**Every published GPT-5.6 rate in the catalog is corrected** (#980). They had been *derived* — from a blend across models that came out 1000x wrong — when AWS had published them in the model cards the whole time. The rates now come from the model cards; the derivation, where still used, reads a single-model day rather than a blend.
+
+### Explicit prompt-cache breakpoints: built, measured, shipped off
+
+GPT-5.6 supports explicit cache breakpoints. They were implemented (#954), measured, and came out **57% more expensive** than the provider's automatic caching, so the default is off (#956). The code stays for the next model family that prices it differently.
+
+Verified separately: GPT-5.6 caching **works** on the automatic path, at 10.6x on warm turns (#962).
+
+### Other cost fixes
+
+- **Prompt-cache TTL is derived from the serving model** rather than assumed, so `cacheStatus` stops misreading a hit as expired on models with a different TTL (#951).
+- **`supportsCaching` is forced on where the provider caches unconditionally** (#960), and **Mantle models expose the caching controls** they were previously denied (#963).
+- **OpenAI-family usage normalizes to disjoint buckets** (#945) — cached tokens were being counted inside the input total.
+- **The cache-write premium and the Global/Regional rate tier were both wrong** in cost derivation (#914).
+- **An omitted `supported_param` is now unsupported, not pass-through** (#915) — an empty `supportedParams` previously bypassed the guard entirely.
+
+---
+
+## Multi-modal fine-tuning
+
+The fine-tuning surface assumed text. A **task-type registry** replaces that assumption, adding image and image+text tasks through the API and the SPA, with a **dollar-denominated quota** rather than a job count (#944). Generative VLMs are excluded from the dual-encoder task, instance types are validated, and the dataset tests are no longer optional. `pandas==2.3.3` is pinned in the backend to exercise the dataset contract — 2.x is what the py3.10 SageMaker text DLC resolves to and the only line compatible with the existing numpy pin.
+
+---
+
+## 🐛 Bug fixes
+
+- **Artifact share links stayed live after their conversation was deleted.** The cascade used `table.batch_writer()`, and the app-api task role has no `dynamodb:BatchWriteItem` — it has the individual item actions, which is why the rest of the feature needed no IAM change (`TransactWriteItems` authorizes against those; `BatchWriteItem` does not). It failed closed in dev with an `AccessDeniedException` that reached no client, because the cascade runs in a never-raising background task after the 204. Fixed with per-row `DeleteItem`, which also isolates failures and keeps the zero-IAM-change property (#932).
+  > **The generalizable rule: moto proves *shape*, never *permission*.** All 14 cascade tests passed against a call the deployed role cannot make.
+- **An empty "Shared with you" tab claimed "No artifacts match your search"** — with an empty search box. The filtered-empty state gated on the *library* total, so any non-empty library made an empty *tab* look like a failed search. Now three ordered states: nothing anywhere > nothing in this tab > nothing matching the filter. The specs missed it because every empty-state test asserted which rows rendered, never which sentence appeared when none did (#975).
+- **"Pop-up blocked" was reported on every artifact open**, successful ones included (#953).
+- **A duplicate error toast** fired alongside the shared-artifact page's own inline 404 — share calls now set `SUPPRESS_ERROR_TOAST`. `listShares` deliberately keeps its toast, because it degrades silently and the toast is its only signal (#927).
+- **Artifact card actions overlapped the title** when the panel was docked and the chat column halved. Fixed with a **container query** — the card is sized by the chat column, not the viewport, so a media query is the wrong instrument — dropping labels to icons below 26rem with the labels visually hidden rather than removed (#927).
+- The library view toggle stretched on narrow screens, and the grid card footer overflowed its card (#955).
+- The new-announcement form's submit button could never enable (#974).
+- Knowledge-base retrievability is now confirmed with a filtered query, and `TEXT_INDEXED` is classified correctly (#908).
+
+---
+
+## 🔒 Security
+
+- **The custom HuggingFace model id reached a URL unvalidated.** The fine-tuning call site's comment has claimed to validate the id format since before this release; the code only checked non-empty and length. That was latent on `main` — the multi-modal work made it reachable by interpolating the value into a Hub request path, which CodeQL flags as a critical `py/partial-ssrf`. The host was always hard-coded, so this was never an arbitrary-host SSRF; what it allowed was a value carrying URL structure changing the meaning of two sinks — the pre-flight path, and `model_name_or_path` as forwarded to the training container. Now validated against an anchored repo-id pattern at **both** sinks, rather than one relying on the other's branch having run.
+  > The pattern uses `\Z`, not `$` — `$` also matches immediately before a trailing newline, so an otherwise-anchored pattern accepts `org/model\n`. A test pins that.
+- **All 47 open Dependabot alerts cleared** (#924), across the backend, the SPA, infrastructure, the docs site, and the backup/restore scripts. Notable: `cryptography` 48.0.1 → 50.0.1, `dompurify` ≥3.4.13, `undici` ≥7.29.0, `hono` ≥4.12.34, `brace-expansion` ≥5.0.9, `postcss` 8.5.12 → 8.5.28.
+- **CodeQL: 11 high, 20 medium and 9 note findings remediated** (#925) — principally log injection, across 18 backend modules and one SPA page. The nightly workflow is extended in the same pass.
+
+---
+
+## 🏗️ Infrastructure
+
+- **`{prefix}-announcements`** DynamoDB table, **no GSIs**, name published to SSM at `/{prefix}/admin/announcements-table-name`. App-api gains `AnnouncementsTableAccess` (`GetItem`/`PutItem`/`UpdateItem`/`DeleteItem`/`Query`/`Scan`).
+- **`bedrock:CallWithBearerToken`** on the inference-api role, for the `bedrock-runtime` OpenAI-compatible endpoint.
+- **`CDK_ARTIFACT_SHARE_INBOX_ENABLED`** deploy variable → `ARTIFACT_SHARE_INBOX_ENABLED` on the app-api container. Default off.
+- `infrastructure/gsi-inventory.json` gains `"announcements": []`. **No GSI operations on any existing table** — this release is not subject to the one-index-per-`UpdateTable` split.
+
+---
+
+## 📦 Dependencies
+
+| Component | Package | From | To |
+|---|---|---|---|
+| Backend | `cryptography` | 48.0.1 | 50.0.1 |
+| Backend | `aiohttp` | 3.14.1 | 3.14.3 |
+| Backend | `pandas` | — | 2.3.3 (added) |
+| Frontend | `@angular/*` | 21.2.17 | 21.2.19 |
+| Frontend | `mermaid` | 11.15.0 | 11.16.1 |
+| Frontend | `postcss` | 8.5.12 | 8.5.28 |
+| Frontend | `sharp` | — | 0.33.0 (added) |
+| Frontend | `tsx` | — | 4.23.12 (added) |
+| Frontend | `dompurify` | ≥3.4.0 | ≥3.4.13 |
+| Frontend | `undici` | ≥7.28.0 | ≥7.29.0 |
+| Frontend | `hono` | ≥4.12.25 | ≥4.12.34 |
+| Infrastructure | `aws-cdk-lib` | 2.262.0 | 2.265.0 |
+| Infrastructure | `brace-expansion` | — | ≥5.0.9 |
+
+---
+
+## 🚀 Deployment notes
+
+1. **Deploy order is `platform.yml` → `backend.yml` → `frontend-deploy.yml`.** This release changes `infrastructure/lib/constructs/**` and `config.ts`, so the push to `main` triggers `platform.yml` automatically. That order is **not enforced by the workflows** — they share a concurrency group and queue, but nothing guarantees CDK wins the slot. If `backend.yml` runs first, the announcements routes will 500 on a missing table until the CDK deploy lands. Watch both runs.
+
+2. **Decide `CDK_ARTIFACT_SHARE_INBOX_ENABLED` before the deploy, not after.** It reaches the running service only through a `platform.yml` deploy (CDK writes it into the ECS task definition), and `platform.yml` is path-filtered to infra changes — so a later backend- or frontend-only merge will *not* pick up a variable change. Set it now and it rides this release's CDK deploy; set it afterwards and you must dispatch `platform.yml` manually.
+   - Off (default): owner-side sharing, the library, previews, rename/delete and shared-conversation artifacts all ship. Only the "Shared with you" tab is absent, and its absence is silent by design.
+   - On: the tab appears, already populated — the pointer rows have been accumulating since a share was first created.
+
+3. **No data migration.** The conversation-share snapshot's `artifacts` key is optional on read, so pre-existing shares read as `[]`. `GSI2PK`/`GSI2SK` stamping is inert until an index consumes it — DynamoDB charges no index write when no index exists.
+
+4. **Two unflagged behavior changes.** An omitted `supported_param` is now treated as unsupported rather than passed through, and the prompt-cache TTL is derived from the serving model rather than assumed. Both are corrections; both take effect on the first turn after the deploy.
+
+5. **Announcement reach counters are not backfilled.** Anything published before this release reads as zero reach.
+
+6. **Post-deploy verification.** Open `/artifacts` and confirm the library lists and previews. Create a share, open it from a second account, then revoke it and confirm the link dies. Publish a test announcement and confirm the banner appears on the chat view. If the inbox flag is on, confirm the third tab appears and — with nothing shared — says "nothing in this tab" rather than "no artifacts match your search".
+
+---
+
+# Release Notes — v1.17.0
+
+**Release Date:** September 2, 2026
+**Previous Release:** v1.16.0 (August 28, 2026)
+
+---
+
+> 🏗️ **CDK deploy required, plus one manual step it cannot do for you.** After `platform.yml` runs, **subscribe your team to the new `{prefix}-alarms` SNS topic** — see [step-05-verify §6](.github/docs/deploy/step-05-verify.md#6-subscribe-to-platform-alarms-required--not-automated). Subscriptions are deliberately not infrastructure-as-code, so nothing else will do this.
+>
+> `infrastructure/gsi-inventory.json` is **unchanged** — no DynamoDB index operations in this release.
+>
+> **Several changes take effect on the next deploy with no flag to gate them:** log retention moves from 7 days to 30, X-Ray sampling drops from 100% to 1%, Bedrock's transient faults start being retried, skill-resource uploads reject scriptable file types, and a turn posted to a session owned by another user is refused. Read the Deployment notes before shipping.
+
+---
+
+## Highlights
+
+A release about knowing when things break, and behaving well when they do.
+
+**Every alarm in the stack now notifies somebody.** The stack had 13 CloudWatch alarms and not one of them was routed anywhere — three constructs carried a comment saying so. Two were worse than silent: they watched metric names that exist in no CloudWatch namespace, so they had sat in `INSUFFICIENT_DATA` since the day they were created, which an operator reads as healthy. There are now 77 alarms, zero unrouted, all publishing to one SNS topic, with a `{prefix}-platform-health` dashboard ordered by triage rather than service inventory.
+
+**A production outage drove four chat-path changes.** On 2026-08-31 a `ConverseStream` carrying two PDFs failed with `ServiceUnavailableException` after 95.6 seconds, was never retried, billed 56,440 uncached input tokens, and returned nothing — twice, because the attachments died with the first request and the re-upload failed the same way. Bedrock's transient faults are now retried; a retry and a long silence are both visible to the user instead of reading as a hang; and attachments a failed turn never delivered are re-sent on the next one.
+
+**Four security findings are closed**, two of them escalation chains. A High-severity OIDC login CSRF in the BFF auth flow could silently hand a victim's browser a live session for the attacker's account. A stored XSS in skill resources let a zero-privilege user run JavaScript on the SPA's own origin inside a `system_admin`'s session — closed at three independent layers, none load-bearing on its own.
+
+**The Managed Knowledge Base migration met real data.** Still off by default, but its first genuine runs in dev produced eleven defects, most of them one root cause wearing different costumes: **the two engines were never made exclusive.** Documents were indexed twice, a `status` field had two writers racing to decide "ready", and deletions never reached the managed engine at all.
+
+---
+
+## Production observability baseline
+
+The stack's alarms were mostly decorative. This makes them load-bearing, and makes it structurally hard to add an unrouted one.
+
+### Infrastructure
+
+- **`{prefix}-alarms` SNS topic**, encrypted with a customer-managed KMS key. The CMK is a requirement, not a preference: CloudWatch cannot publish to a topic encrypted with the AWS-managed `alias/aws/sns` key, and the failure is silent — the alarm fires, the console shows it, the notification is dropped. ARN published to SSM at `/{prefix}/observability/alarm-topic-arn` and as a CfnOutput.
+- **`AlarmFactory`** (`lib/constructs/observability/alarm-factory.ts`) attaches `AlarmActions` *and* `OKActions` as a consequence of being used at all, so an unrouted alarm now requires deliberately bypassing it. A source-level test fails the build if any file under `lib/` calls `new cloudwatch.Alarm()` directly. The previous gap was not carelessness — the broken form was the shorter one.
+- **77 alarms**: ALB (6), ECS service (3), DynamoDB (27), Lambda (21), AI path (9), AgentCore Runtime (4), plus the pre-existing prompt-cache alarms, all routed.
+- **`{prefix}-platform-health` dashboard** — traffic and errors, then saturation, then every alarm's current state. It *links* to the two existing dashboards rather than restating them, which keeps the stack at exactly 3 — CloudWatch's free ceiling.
+- **`LogRetentionAspect`** rewrites every log group in the tree, including the ones CDK creates for its own machinery and declares nowhere in this repo, which default to 731 days. That gap was found by diffing a real `cdk synth`; unit tests missed it because a bare `cdk.App` lacks the feature flags that materialise those groups.
+- The AgentCore Runtime's log group is created by the service rather than CloudFormation, so an `AwsCustomResource` calls `logs:PutRetentionPolicy` on it — idempotent, and it creates the group if the runtime has not yet been invoked.
+
+### What measurement changed
+
+Every threshold was set against the live account rather than documentation, and four of them came back wrong:
+
+- The AgentCore alarms used namespace `bedrock-agentcore` with `InvocationCount` / `InvocationErrors` / `InvocationLatency`. That namespace is real, but it holds only the OpenTelemetry/Strands *application* metrics — those three names exist nowhere. Corrected to `AWS/Bedrock-AgentCore`, with `SystemErrors` (AWS's fault) split from `UserErrors` (ours).
+- The 30-second latency threshold sat **below** the observed maximum. Over 14 days turns average 3.0–4.5s with daily peaks to 24.4s, because the chat path is SSE and the runtime does not finish a request until the stream closes. Floors default to 120s. AgentCore `Latency` is milliseconds where ALB `TargetResponseTime` is seconds — a 1000× trap in either direction, confirmed with `get-metric-statistics` in both.
+- DynamoDB has never throttled: `ReadThrottleEvents`, `WriteThrottleEvents` and `SystemErrors` have zero metric streams, since every table is on-demand. Account-level `UserErrors` had live data with nothing watching it. That traded 78 alarms on signals that have never fired for 27 including one firing today.
+- No Cognito or Browser alarms were added, and tests assert their absence: `AWS/Cognito` on the ESSENTIALS feature plan publishes only success metrics, and Browser has zero streams. Alarming on either would recreate the permanently-green alarm this work exists to remove.
+
+### Configuration
+
+18 single scalars under an `observability` config section with `CDK_OBSERVABILITY_*` overrides, validated against the retention values CloudWatch actually accepts and against sampling rates given as percentages. There is deliberately **no `config.production` branching**: this repo is forked by many institutions, and a fork with one environment should not have to reason about a `production` boolean while a fork with three should not be limited to two. Enforced by test.
+
+The clearest case for that is X-Ray sampling, which was `fixedRate: 1.0` for any fork that never set `production` — a recorded trace for every agent invocation, at $5 per million. It is now 1% by default.
+
+### Cost and capacity
+
+Log retention becomes one value across all 15 groups (default 30 days), replacing 14 hardcoded literals — 13 `ONE_WEEK` plus one `ONE_MONTH` that differed silently rather than deliberately. Stack resources rise to **382 of CloudFormation's 500 limit**, up from 308; this is a deliberate single-stack architecture with nowhere to spill, so the DynamoDB alarm allocation was decided by measurement rather than by covering every documented metric, and a guard test fails above 460.
+
+---
+
+## Transient failures, made visible and recoverable
+
+Three changes and one post-mortem. Prod session `5f34d2b0` lost a CIO's conversation twice in a row, and each of the three gaps below is one reason why.
+
+### The fault was never retried
+
+Strands' stock `ModelRetryStrategy` retries `ModelThrottledException` and nothing else, and `BedrockModel` maps exactly one error code to it. Every other Bedrock fault re-raised as a raw botocore `ClientError`, so the configured four-attempt backoff never ran for any of them. Meanwhile `ThrottlingException` — the one error that *was* covered — has not occurred once in prod in the last eight days.
+
+`BedrockTransientRetryStrategy` (`agents/main_agent/core/retry_strategy.py`) subclasses the SDK strategy and widens only `is_retryable`, so backoff policy and attempt budget are inherited unchanged; it never narrows stock behavior. Mid-stream failures are deliberately excluded — `EventStreamError` is raised while iterating the response, after chunks may already have reached the client, and restarting there would replay visible output. A plain `ClientError` from the `converse_stream` call itself means the request was rejected before the stream opened, so a retry is invisible. `RETRY_TRANSIENT_SERVICE_ERRORS=false` restores stock behavior without a deploy.
+
+### The retry, and the silence, looked like a hang
+
+Strands emits `EventLoopThrottleEvent` on every retried model call and nothing consumed it, so a retry was silence — and widening the retryable set makes that silence longer. The stream processor now emits a **`model_retry` SSE event** and the SPA swaps the loading indicator's cycling phrases for a fixed amber notice.
+
+That event covers the pauses *between* attempts. It cannot cover the failing call itself — 95 seconds in the incident, and indistinguishable from a slow healthy one — so the parser also stamps the arrival time of every event, and the indicator says **"Still working…"** after 30s of silence and **"Still working — this is taking longer than usual."** after 90s. Thresholds sit past a normal first token (~5–7s) and past most tool calls. A known retry outranks the stall notice: one is a fact, the other an inference from elapsed time.
+
+The liveness stamp is deliberately client-side. A server-sent heartbeat would have to race the agent stream against a timer, which means either running `__anext__` from a fresh task per element — breaking the anyio cancel scopes inside the MCP clients — or pumping the stream through a queue in a side task, a new task boundary through the cancellation path that owns lease release and interrupted-turn persistence, which three prior fixes have each already had to repair.
+
+### The attachments were gone
+
+Inline document bytes are one-shot: `_strip_document_bytes` removes them from restored history because Bedrock rejects two document blocks sharing a sanitized name. Correct when a turn succeeds; when a turn dies before the model reads them, they are gone with no way back — which is why the assistant asked the CIO to upload the PDFs again, and why the re-upload turn failed identically.
+
+A **write-ahead marker** on the session row records the turn's upload IDs before the model call. `StreamCoordinator` clears it the moment the turn produces assistant content, and the next turn pops it and re-sends. Written ahead rather than from an error handler so it survives every way a turn can die, including a dropped stream no error arm ever sees. Bounded: the pop clears as it reads, so recovery can only influence the single turn after a failure; a marker older than an hour is discarded; and the user's own attachments always win, since the resolver caps a turn at five files and merging could push out a file they just attached. A recovery note rides the existing `original_message` `displayText` split, so the model knows the files were re-sent and the user never sees it.
+
+### And the error copy was wrong
+
+Two classifiers both keyed on `"throttl"` and neither recognized service-unavailable, so a Bedrock outage read as "I ran into a problem with the AI model". A shared `is_service_unavailable_error` predicate — shared precisely because the two classifiers had disagreed by omission — now says the fault is on the provider's side and that we already retried. Kept narrow: matching `"unavailable"` alone would swallow unrelated copy like "the model or feature you're trying to use isn't available".
+
+---
+
+## Managed Knowledge Base migration hardening
+
+The feature shipped inert in 1.16.0 behind nine `CDK_MANAGED_KB_*` flags. It stays inert. What changed is that it was driven end-to-end against real documents in dev for the first time, and eleven defects came out of it.
+
+**One root cause dominates: the two engines were never made exclusive.** The managed ingestion consumer stood down for a legacy document; nothing made the legacy pipeline stand down for a managed one, and nothing propagated a deletion to the managed engine at all.
+
+- **Double indexing, and a `status` field with two owners.** The legacy pipeline had no engine gate while its `s3:ObjectCreated` notification stayed live alongside the consumer's EventBridge rule, so every document added to a promoted knowledge base was handled twice — and "ready" was decided by whichever writer finished last. Both outcomes were observed within an hour: a PDF marked `complete` 65 seconds before the managed KB could answer for it, and an image-only flowchart that Docling failed outright (`do_ocr=False`) marked `failed` while Bedrock's image extraction had indexed and was serving it. `handler.py` now resolves the engine before writing any status and returns early for `managed` — keyed on the **engine**, not on the presence of a KB record, because during `shadow` and `verify` the legacy path is still authoritative.
+- **Deletions never reached the managed engine.** `cleanup_service` removed the legacy copy and the `DOC#` row and left the managed copy indexed forever: paid for at $5.00/GB-month against ~$0.15, silently consuming `top_k` slots that the status filter then dropped, with that filter's single fail-open branch left load-bearing in a way it was never designed for. The new engine-gated third phase is conjoined into `all_succeeded`, and its fail-direction is **deliberately opposite** to the ingestion gate's: on ingest an unreadable record resolves to legacy (a duplicate index, and the consumer still finishes the document), but on delete it must fail, because reporting success would remove the `DOC#` row *and* leave the content — the one combination that turns a storage leak into a disclosure.
+- **Provisioning could strand a knowledge base unrecoverably.** `CreateKnowledgeBase` returns while still `CREATING` (measured 47–124s to `ACTIVE`) and `CreateDataSource` was called immediately; `awsKbId` was only written after both creates succeeded, so a failure between them left a record with no identifier while the unique name stayed taken — refusing every subsequent attempt, permanently. Now there is an explicit bounded `ACTIVE` wait, `awsKbId` is persisted the instant the create returns (guarded on `attribute_not_exists`), and a name-collision `ConflictException` is recovered by adopting the existing knowledge base — skipping terminal statuses, so adoption cannot take one that is mid-delete.
+- **Ingestion gave up before indexing finished, and restarted it.** The consumer polled a *retrieval* for 30 seconds, smaller than the documented lower bound for PDF ingestion, and because `IngestKnowledgeBaseDocuments` is fire-and-forget every EventBridge redelivery re-submitted the document. A 1.5MB PDF sat at `uploading` indefinitely with a fully retrievable copy in the knowledge base. `handle_object` now probes `GetKnowledgeBaseDocuments` first and branches on the real `DocumentStatus` enum, with a 600-second budget; a cross-language test parses the Lambda timeout out of the CDK construct and asserts the budget fits inside it, since the two live in different languages with no compiler between them.
+- **`indexedAt` was fabricated** — the local clock at ingest-call return, presented as when indexing finished, minutes apart for a large document. Now Bedrock's own `updatedAt`.
+- **The embedding pin and managed reranking are mutually exclusive.** AWS rejects `embeddingModelType: CUSTOM` with `rerankingModelType: MANAGED`, and measuring all four combinations settled which one to drop: the pin scored 1.00/0.982/0.952 — flat, and unusable when only ~2,000 characters reach the model — against managed reranking's 0.413/0.199. On managed retrieval Bedrock embeds both sides, so query/index consistency is its invariant, not ours.
+
+Three of these were IAM. `bedrock:StartIngestionJob` is the third grant on this feature to name exactly the API the code calls, review as complete, deploy clean, and fail on first real use — AWS authorizes `IngestKnowledgeBaseDocuments` under that adjacent action name. It also stayed invisible because every migration so far was driven by a local script under an SSO identity broader than any Lambda role, which is recorded in HANDOFF.md as a structural limit of that tool rather than an oversight.
+
+### Test coverage
+
+~1,150 lines across `test_kb_ingestion_consumer.py`, `test_managed_kb_backend.py`, the new `test_ingestion_engine_gate.py` and `test_managed_delete_propagation.py`, plus CDK grant-shape assertions on the **real** roles in `kb-sync.test.ts` and `platform-stack.test.ts` — the latter specifically because a grant proven on a fake role says nothing about the identity that runs the code, which is how two earlier defects on this feature shipped.
+
+Several of these bugs had passing tests over them. `FakeBedrockAgent.create_knowledge_base` returned `status: "ACTIVE"`, which the real API never does; it modelled `clientToken` dedup as permanent and did not model name uniqueness at all; `_FakeBackend` reported instant ingestion success, which is what let a 30-second window look adequate for work that takes minutes. Each fake was corrected alongside its fix, and each fix was mutation-verified.
+
+---
+
+## 🐛 Bug fixes
+
+- **A completed answer could tell the model it was cut short.** The client's Stop writes `lastTurnInterrupted` immediately, but the server only observes the armed cancel on a lease heartbeat that sleeps 10 seconds *before* its first check — so a turn finishing inside that window completed normally and left the marker behind. The next turn then prepended a note saying the user deliberately stopped the previous response and not to resume it. Every clause was false, and it demonstrably steered the following answer; a reload also showed the "response interrupted" affordance against a complete message. Verified in dev: Stop at 2.6s on a 10.4s turn, full answer persisted, follow-up turn logged the cleared marker. A turn that reaches the end of the success path now clears it, whatever the client signalled — genuine interruption arms sit in `except` blocks and re-set it after persisting their partial. Deliberately *not* fixed by retuning the heartbeat: a turn shorter than one tick is unstoppable however the ticks are spaced (#909)
+- **A session id could be forked across two users.** `_get_session_by_gsi` returned `None` both for "no such session" and "exists, but owned by someone else", so `ensure_session_metadata_exists` read the second as the first and created a second metadata row on the same session id under the requester — the `attribute_not_exists(PK)` guard cannot catch it, since the new row has a different PK. Session ids travel in shareable `/s/{sessionId}` URLs; opening someone else's 404s on the metadata read, but the SPA then treated the session as new and let the user send. Not a confidentiality bug — conversation content lives in AgentCore Memory keyed by actor id, so the second user only ever saw an empty thread — but it duplicated the row, mis-attached the spend, and left the original owner's session resolving non-deterministically, since both rows share `GSI_PK`/`GSI_SK`. The turn is now rejected with 404 (not 403, which would confirm the session exists), and both GSI lookups scan for the caller's own row rather than reading `items[0]`, because forked rows already exist in prod (#906)
+- **Admin "Discover from server" returned 403 for every IAM-authenticated MCP server**, in every environment, so admins had to type each tool name by hand. `POST /admin/tools/discover` signs with the app-api task role — not the gateway role the form's credential picker names, since the gateway only signs at runtime after the target is registered — and that role held `AddPermission`, `RemovePermission` and `GetFunctionUrlConfig` but never `lambda:InvokeFunctionUrl`. Separately, the runtime role's `ExternalMCPLambdaAccess` was scoped to `<prefix>-mcp-*` only, which never matches an MCP server deployed from its own repo as `mcp-<server>-<env>` — harmless while such a server is a Gateway target, a 403 the moment one is configured as a direct external MCP tool (#911)
+
+---
+
+## 🔒 Security
+
+Four findings, two of them chains that ended in cross-principal execution.
+
+**OIDC login CSRF / session fixation in the BFF auth flow — High (f-8c4f312a).** `GET /auth/login` minted a `state`, stored it server-side, and redirected to the Cognito Hosted UI issuing **no browser-side material at all** — no state cookie, no PKCE, no nonce. But `state` is a public value: it travels in a 302 `Location` and anyone can mint one anonymously. `GET /auth/callback` nonetheless treated "this state exists in the store" as proof the request continued a login *this* browser started, and so accepted any `(code, state)` pair from any browser. The exploit is three steps — mint a state anonymously, authenticate at the IdP yourself to get a real authorization code, then lure a victim to `/auth/callback?code=<theirs>&state=<captured>` — and the victim's browser is silently issued a live session for the attacker's account, reported against a `system_admin` identity. Everything the victim then does (conversations, uploads, memory entries, third-party connector consent) lands inside an account the attacker still holds credentials to.
+
+The fix is browser binding: login mints a 32-byte secret, returns it in a `__Host-bff_oauth_state` cookie (HttpOnly, Secure, Path=/, no Domain, SameSite=lax) and commits only its SHA-256 digest to the state row; callback recomputes the digest and refuses the exchange unless it matches under `secrets.compare_digest`. Three deliberate choices: the cookie is checked **before** the state-store lookup, so a probe from a crafted link cannot burn a user's in-flight state; `SameSite=lax` is required rather than a compromise, because the IdP returns the user via a top-level cross-site GET that `strict` would withhold; and a state row carrying no digest **fails closed**, because such rows exist only mid-deploy and honouring them would hold the hole open for exactly the rollout window an attacker with a pre-minted state would strike in. PKCE (S256) and OIDC nonce verification are added end-to-end as defense in depth — PKCE alone would *not* have closed this finding, since the attacker drives the BFF-minted authorize URL and the stored verifier matches their own code. No `Origin` / `Sec-Fetch-Site` check was added despite the report suggesting one: a legitimate arrival at the callback *is* a cross-site top-level GET with no `Origin`, so rejecting on those headers would break every login and stop nothing. A test pins that.
+
+**Privilege-escalating stored XSS in skill resources (f-317ac252).** An authenticated, zero-privilege user could plant JavaScript that later executed on the SPA's own origin inside a `system_admin`'s authenticated browser session. Two control failures chained: the upload routes persisted the client-supplied multipart Content-Type verbatim with no allowlist and permitted an `.html` filename, and the read routes reflected that stored type with `Content-Disposition: inline` while the CloudFront `/api/*` behavior carried no response-headers policy — so responses shipped with no `nosniff` and no CSP, where `GET /` had both. Because app-api is served from the same origin as the SPA, the file parsed as a top-level HTML document and its inline `<script>` ran with the viewer's session, reading the non-httpOnly CSRF cookie and driving arbitrary state-changing admin calls.
+
+Closed at three independent layers so none is load-bearing: an extension-derived upload allowlist (`apis/shared/skills/resource_types.py`) whose every value is inert and which ignores the client-supplied Content-Type entirely, matching the posture the agent-icon route already took; serve-time re-derivation of the media type from the filename plus `attachment` + `X-Content-Type-Options: nosniff` + `default-src 'none'; frame-ancestors 'none'; sandbox`, which is what neutralizes rows written before the allowlist existed and removes any need for a data migration; and a new `ResponseHeadersPolicy` on the CloudFront `/api/*` behavior so a future route cannot regress the whole origin. `sandbox` is deliberately omitted at the edge — `default-src 'none'` already blocks all script in a document, and an opaque-origin directive across every API response would risk breaking attachment downloads and OAuth navigations for no added protection. The allowlist is mirrored client-side for UX only; the server is the control.
+
+**Cross-owner write on the admin per-object skill routes.** `GET /admin/skills/` narrows to `owner_id == "system"`, but every per-object route read the row by id with no predicate — so an actor holding only `admin.skills` could read and rewrite a private, user-owned skill's instructions, which is instruction-trusted content that steers its owner's agent, while the owner was 403 on the same route. `SkillCatalogService` now exposes `get_catalog_skill()` / `require_catalog_skill()`, applied in the service for update, delete, resource listing and role grants, and at the route layer for GET and the reference-file routes. Non-catalog rows return 404 with the same message template as a nonexistent id, so the surface no longer confirms that another user's private skill exists — the old "is user-authored" role-grant error was itself an existence oracle.
+
+**AST allowlist bypass in the code-execution sandbox.** `visit_Attribute` checked only for dunders, so an allowlisted module that itself imports a host module re-exported it: `pd.io.common.os.popen(...)` reached the full `os` module with no import statement anywhere in the submitted source. Attribute nodes are now checked against the same denylist as bare names, `ImportFrom` members are checked too (`from pandas.io.common import os as o` bound the real module under an innocuous name), ten missing host modules are covered, and the adjacent deserialization sinks are closed — a pickle payload can arrive as a bytes literal through `io.BytesIO`, so `read_pickle`/`to_pickle`/`read_hdf`/`to_hdf`/`load` are refused, with process-spawn entry points as a second net. The disclosed payload was run through both policy versions: pre-fix **accepted**, post-fix **rejected**. Documented consequence: a DataFrame column colliding with a denied name must use `df['open']`, and a lazily-loaded submodule must be imported directly (`from scipy.signal import butter`) — both already true for the bare-name form. Not addressed here, and stated plainly: the policy remains a denylist over a large library surface, and capability reduction inside the execution environment is the durable control.
+
+Together with the first two, these chained — the cross-owner skill write plus the AST bypass ended in attacker-authored OS command execution inside another principal's chat session.
+
+---
+
+## 🏗️ Infrastructure
+
+- New `grantManagedKbDocumentDeletion` for the app-api task role and the kb-sync worker, deliberately **not** `grantDirectIngestion`: these callers only ever remove documents, so a bug in the delete path cannot add content and a bug in the ingest path cannot remove it
+- `bedrock:StartIngestionJob` added to the managed-KB worker and ingestion-consumer roles. It looks like a mistake — Requirement 9.2 forbids *calling* `StartIngestionJob` (0.1 RPS account-wide) and nothing does — so a docblock and a separately-named test carry the reason that holding it is authorization, not invocation, and the obvious cleanup fails a test that explains itself
+- `lambda:InvokeFunctionUrl` added to the app-api task role; both it and the runtime role's `ExternalMCPLambdaAccess` now cover the `mcp-<server>-<env>` convention alongside `<prefix>-mcp-*`
+- `apis/shared/kb_backend/` added to `Dockerfile.rag-ingestion` and `Dockerfile.kb-sync`, and to `build-one.sh`'s `SOURCE_DIRS` for both, so the content hash moves with the engine gate. Cheap: the package's module-level imports are stdlib only, enforced by `test_kb_backend_boundary.py`
+- CloudFront `/api/*` gains its own `ResponseHeadersPolicy` (nosniff, `default-src 'none'; frame-ancestors 'none'`, `X-Frame-Options: DENY`, HSTS, no-referrer)
+- Stack resource count: **382 of 500**, up from 308. Guard test fails above 460
+- Alarm-topic subscriptions are deliberately not IaC — several teams need to hear about failures and their membership changes far more often than the infrastructure does, and requiring a PR and a deploy to add one address is how a notification list goes stale and stops being trusted. A test asserts zero subscription resources exist, so the decision cannot be quietly reversed
+
+---
+
+## 🧪 Test coverage
+
+~5,900 lines of new tests:
+
+| Area | Lines | Scope |
+|---|---|---|
+| Observability | ~1,470 | Alarm routing (zero unrouted), topic + CMK policy, per-service alarm shapes, log retention across all groups, dashboard composition, the three source-level guards |
+| Security | ~1,590 | The reported CSRF chain replayed against the real `/auth/login` with no hand-seeded state, PKCE/nonce enforcement, 36 MIME/upload tests using the report's verbatim payload, AST policy bypasses, CloudFront header policy |
+| Managed KB | ~1,145 | Provisioning waits and adoption, ingestion status branching, both engine gates, delete propagation, real-role grant wiring |
+| Chat reliability | ~900 | Retry-strategy classification, `model_retry` + service-unavailable copy, client liveness thresholds, attachment write-ahead/pop, cross-user fork, completed-turn reconciliation |
+
+Each fix in the managed-KB and security groups was mutation-verified: the change was neutered and the named tests confirmed to fail. Three observability guards were proven non-vacuous by planting a file violating all three.
+
+---
+
+## 🚀 Deployment notes
+
+**Order:** `platform.yml` → `backend.yml` → `frontend-deploy.yml`. All three are required.
+
+1. **`platform.yml` (CDK) — required.** Adds the SNS topic and KMS CMK, 77 alarms, the platform-health dashboard, the log-retention aspect and custom resource, the CloudFront `/api/*` response-headers policy, and the IAM grants above.
+2. **Subscribe to the alarm topic — required, manual, not automated.** See [step-05-verify §6](.github/docs/deploy/step-05-verify.md#6-subscribe-to-platform-alarms-required--not-automated). Until you do, the alarms are still unrouted.
+3. **`backend.yml` — required.** `rag-ingestion` and `kb-sync` images both change (they now carry `apis/shared/kb_backend/`), alongside app-api and inference-api.
+4. **`frontend-deploy.yml` — required.** Loading-indicator states, the skill-form file filters.
+5. **No DynamoDB index operations.** `gsi-inventory.json` is unchanged, so the one-GSI-per-`UpdateTable` limit is not in play for this release.
+
+**Takes effect with no flag:**
+
+- **Log retention moves 7 days → 30** across all 15 log groups (`CDK_OBSERVABILITY_LOG_RETENTION_DAYS` to change it). This raises CloudWatch storage cost; the X-Ray change below more than offsets it in any environment that never set `production`.
+- **X-Ray sampling drops 100% → 1%** with a 1/sec reservoir (`CDK_OBSERVABILITY_XRAY_SAMPLING_RATE`).
+- **Bedrock's transient service faults are now retried.** Set `RETRY_TRANSIENT_SERVICE_ERRORS=false` for stock throttling-only behavior; no deploy needed.
+- **Skill-resource uploads reject `.html`, `.htm`, `.xhtml`, `.xml` and `.svg`**, and source-code extensions collapse to `text/plain`. Existing rows are unaffected on disk but are re-derived at serve time, so no migration is needed — and both read routes now respond `attachment` rather than `inline`. Both SPA callers fetch these over XHR, so nothing user-facing changes; a direct link to a resource URL will now download rather than render.
+- **Logins in flight across the deploy fail closed once.** A state row minted by the old `/auth/login` carries no binding digest and will be refused; the cost is a single retry.
+- **A turn posted to a session owned by another user is refused with 404.** Previously it created a duplicate metadata row. Rows forked before this deploy are read deterministically but are not cleaned up automatically.
+
+**Unchanged:** every `CDK_MANAGED_KB_*` flag still defaults OFF, and the managed-KB fixes in this release are inert in any environment that has not armed them. `CDK_OBSERVABILITY_*` overrides are all optional — the defaults are cost-conscious and intended to be deployed as-is.
+
+---
+
+# Release Notes — v1.16.0
+
+**Release Date:** August 28, 2026
+**Previous Release:** v1.15.0 (August 17, 2026)
+
+---
+
+> 🏗️ **CDK deploy required, and this one has prerequisites.** Set `CDK_TAG_ENVIRONMENT` (`dev` / `prod`) as a GitHub Environment variable **before** running `platform.yml`, then `backend.yml` — which now carries two new kb-migration jobs that must run before the managed-KB Lambdas are anything but no-ops — then `frontend-deploy.yml`.
+>
+> `infrastructure/gsi-inventory.json` adds **one** index, `KbWorkIndex`, to the existing rag-assistants table. One GSI operation per `UpdateTable` is the hard DynamoDB limit, so nothing else may add an index to that table in this release.
+>
+> **Two changes take effect on the next deploy whether or not you set any flag:** fine-tuning becomes reachable in every environment, and RAG retrieval's document-status filter now fails closed. Read the Deployment notes before shipping.
+
+---
+
+## Highlights
+
+A minor release about knowledge bases, marketplace governance, and a feature that turned out never to have been switched on.
+
+**The Bedrock Managed Knowledge Base migration lands inert.** ~29,000 lines — a Bedrock service role, four Lambdas, a migration saga, a reconciler, an owner-facing upgrade card — all of it behind nine `CDK_MANAGED_KB_*` flags that default OFF. That inversion of the repo's usual default-ON idiom is deliberate: managed storage bills at $5.00/GB-month against roughly $0.15 for the S3 Vectors path, so an unset Actions variable must never be able to arm it. What *is* live from day one is the reconciler, in report-only mode, so you can read what it would have deleted before you let it delete anything.
+
+**Marketplace admins can finally review a submission.** Approving an agent — publishing someone's instructions, tools and model to everyone — previously showed a name, an author and a category. Reviewers can now read the frozen submitted snapshot, test-drive it in a live chat panel, and decline it with a reason.
+
+**Fine-tuning was unreachable in every deployed environment.** `FINE_TUNING_ENABLED` was never set on the app-api container, so `/api/fine-tuning/access` had been returning 404 everywhere since the single-stack migration. The wiring lands here, which means the feature **turns on with this deploy** unless you set `CDK_FINE_TUNING_ENABLED=false`. Three bugs behind that 404 are fixed alongside it: JSONL datasets died five billed GPU-minutes into training, the admin cost dashboard read $0.00 while jobs were billing, and an unpriced instance type ran real GPUs and recorded nothing.
+
+**Two live RAG behaviours change with no flag to gate them.** Queries clamp at 10,000 characters on both backends, and the document-status filter fails closed — an environment missing `DYNAMODB_ASSISTANTS_TABLE_NAME` on a retrieval-serving service will now return zero chunks rather than unfiltered ones.
+
+---
+
+## Managed Knowledge Base migration
+
+Assistant knowledge bases can move from the S3 Vectors pipeline onto Bedrock Managed Knowledge Bases. Everything needed to do that ships in this release and none of it runs yet.
+
+The shipped state is dormant on purpose. Managed storage is $5.00/GB-month; the existing path is about $0.15. A flag that defaults ON with a kill switch — the repo's normal idiom — would mean a forgotten variable costs money, so the three behavioural flags use `parseBooleanEnv`, which maps unset *and* empty string to `undefined`. An Actions variable that exists but is blank cannot arm the feature.
+
+### The flags
+
+| GitHub variable | Default | Effect |
+|---|---|---|
+| `CDK_MANAGED_KB_NEW_DEFAULT` | off | New knowledge bases provision managed instead of legacy |
+| `CDK_MANAGED_KB_MIGRATION_ENABLED` | off | Creates the dispatcher rule enabled *and* un-no-ops the handler; also gates the owner-facing upgrade card |
+| `CDK_MANAGED_KB_RECONCILER_ARMED` | off | Reconciler **deletes** orphans instead of reporting them |
+| `CDK_MANAGED_KB_PER_OWNER_BYTES` | 100 MB | Per-owner storage allowance |
+| `CDK_MANAGED_KB_PER_OWNER_ELEVATED_BYTES` | 1 GB | Elevated per-owner allowance |
+| `CDK_MANAGED_KB_PER_KB_CEILING_BYTES` | 500 MB | Per-knowledge-base ceiling |
+| `CDK_MANAGED_KB_RETENTION_WINDOW_DAYS` | 30 | Post-promotion retention; must stay ≥ 30 |
+| `CDK_MANAGED_KB_STORAGE_ALARM_GB` | 500 | Total-storage alarm threshold |
+| `CDK_MANAGED_KB_DAILY_COST_ALARM_USD` | 100 | Daily-cost alarm threshold |
+
+`scripts/common/load-env.sh` forwards each only when non-empty, and validates the three booleans at deploy time — a typo fails the deploy naming the variable rather than silently reading as false.
+
+### Backend
+
+- `apis/app_api/kb_upgrade/` — its own package, deliberately outside `kb_migration/` for image size. Router mounted at `/assistants/{assistant_id}/knowledge-base/upgrade`: `GET ""` (status, readable by any resolved permission, reports `canUpgrade: false` to viewers), `POST ""` (enroll), `POST "/retry"`, `POST "/notice"`. Clients see the derived phases `none|available|in_progress|succeeded|failed` and never learn about shadow/verify/promote
+- Enrolment is **two conditional writes**, not one. `KbRecord.to_item` does not write the GSI7 work keys, so a single put would produce a record that reports an upgrade in progress and is invisible to the dispatcher forever
+- `kb_backend/records.py` is the sole writer of the sparse `GSI7_*` keys; `GSI7_*` joins the generic assistant-update immutable-field guard
+- `rag_service.py` becomes a facade over a `KnowledgeBaseBackend` protocol. Score direction is normalized to `relevance` (higher-is-better) by exact negation inside the S3 Vectors adapter, with the `distance` key still emitted for the existing HTTP consumer. Public signature and both call sites unchanged
+- Four Lambda handlers plus `kb_backend`, shipped on one image (`backend/Dockerfile.kb-migration`)
+
+### Frontend
+
+- `knowledge-base/kb-upgrade.service.ts` and the upgrade card in `knowledge-base-section.component.*`. The card also surfaces stranded documents — distinguishing an unsupported format from a processing failure, and showing `deleting` documents the ordinary list hides
+- `app-api-environment.ts` now passes `MANAGED_KB_MIGRATION_ENABLED`, the byte caps and `MANAGED_KB_METRIC_NAMESPACE` to the app-api task. They were absent, so the card would have rendered nothing anywhere regardless of the flag
+
+### Infrastructure
+
+- **`ManagedKbRoleConstruct`** — one Bedrock KB service role for all managed KBs, with `aws:SourceAccount` + `ArnLike AWS:SourceArn` confused-deputy conditions, S3 read conditioned on `aws:ResourceAccount`, `bedrock:InvokeModel` pinned to `amazon.titan-embed-text-v2:0`, caller grants split by SID (provisioning CRUD / direct ingestion / inference Retrieve), and `iam:PassRole` scoped and conditioned on `iam:PassedToService`
+- **`KbMigrationConstruct`** — worker (15 min / 1024 MB), dispatcher (2 min / 512 MB), reconciler (15 min / 512 MB), ingestion consumer (15 min / 1024 MB with a DLQ), all on one image; four log groups; SSM parameters publishing the four function names
+- **EventBridge rules** — dispatcher `rate(15 minutes)`, created disabled unless `migrationEnabled`; reconciler `rate(1 day)`, **enabled unconditionally**, because report-only is the point; documents rule enabled when either `newDefault` or `migrationEnabled` is set
+- **Four alarms** in namespace `${projectPrefix}/ManagedKb` — total storage, KB count at 80% of the 10,000 account quota, daily cost, orphan count. All NOT_BREACHING on missing data
+- **`KbWorkIndex`** (`GSI7_PK`/`GSI7_SK`, projection ALL) on the rag-assistants table, sparse — keys exist only while a KB is eligible for work
+- `documentsBucket.enableEventBridgeNotification()` — additive. S3 rejects two overlapping-prefix notification configurations, so the ingestion consumer is EventBridge-triggered and the existing rag-ingestion notification is left alone
+- `infrastructure/lib/config.ts` gains `ManagedKbConfig`, four named default constants, and a resolution chain of `CDK_*` env var → flat dotted context → nested object → literal default
+
+### Teardown
+
+Managed knowledge bases are created at **runtime** by the provisioning saga, so they are not CloudFormation children: `delete-stack` leaves them billing at $5.00/GB-month and invisible in the CFN console. `scripts/teardown/managed-kb.sh` scopes **by tag**, never by name pattern, because two environments can share an account. It polls to 480s to match `tombstones.KB_DELETE_POLL_TIMEOUT_SECONDS`, clamps its tunables (an interval of 0 once spun for sixteen hours), and exits non-zero if any matched KB is not confirmed absent.
+
+`destroy.sh` runs it as **Phase 0**, before any stack, and aborts the whole teardown on failure — the Bedrock service role lives in PlatformStack, and deleting it first is a plausible route into the terminal `DELETE_UNSUCCESSFUL` state.
+
+### Two operator traps found while shipping this
+
+Both were caught on a running stack rather than in review, and both are worth knowing about because the failure mode was silence, not an error.
+
+**The dev environment tagged its knowledge bases `prod`.** `config.production` is `true` in every environment and `config.tags` carried no `Environment` key, so the tag-scoped teardown script would have matched nothing, exited 0, and left billed KBs alive. Fixed by a new `CDK_TAG_ENVIRONMENT` variable forwarded as a flat-dotted `--context tags.Environment=` — `config.production` deliberately untouched.
+
+**The dispatcher and the construct disagreed about two variable names.** Every tick raised `KB_MIGRATION_WORKER_FUNCTION_NAME is not set` because the construct published `MANAGED_KB_WORKER_FUNCTION_NAME`, so no knowledge base could have migrated. The same sweep found a second mismatch that would have been quieter and worse: the construct published `MANAGED_KB_RETENTION_WINDOW_DAYS` while `worker._retain_days()` reads `KB_MIGRATION_RETAIN_DAYS`, so an operator's configured retention window would have been silently replaced by the 30-day code floor. `backend/tests/supply_chain/test_kb_migration_env_contract.py` now parses every `os.environ` read in the handlers and `kb_backend` and asserts the construct sets each one — and publishes nothing that is never read.
+
+A third was an IAM gap: AWS authorizes `bedrock:TagResource` separately from `CreateKnowledgeBase`, so the first real migration failed outright. `bedrock:ListTagsForResource` went in with it, and matters more quietly — `tombstones.iter_project_knowledge_bases` reads tags to decide ownership and fails closed, so without it the daily orphan sweep would have reported a clean account forever.
+
+---
+
+## Marketplace submission review
+
+Approving a marketplace submission publishes another person's instructions, bound tools and model choice to every user. Until now the reviewer saw a name, an author and a category. This release gives them the three things the decision actually needs.
+
+**Read it.** `GET /admin/agents/{agent_id}/submission` returns instructions, bound capabilities by name, model, conversation starters, publisher and reachability. It always serves the frozen `submittedVersion` snapshot, never the live draft — the author cannot change what is under review while it is under review. New SPA route `/admin/marketplace/review/:agentId` (`submission-review.page.ts`).
+
+**Test-drive it.** A `review_preview` flag on the inference invocation payload resolves the reviewed snapshot and bypasses the PRIVATE visibility check — after re-resolving `admin.marketplace` against the caller's own roles through a new `has_admin_scope` predicate in `shared/auth/rbac.py`. The preview runs on a `preview-` session and skips bookkeeping writes, so a review leaves no trace in the author's or the reviewer's history. The shared rule lives in `version_resolution.resolve_review_agent`.
+
+**Decline it.** New terminal listing state `rejected`, admin-only from `in_review`, requiring a reason and allowing revise-and-resubmit. `rejected → private` exists so the author can still delete the agent. There is deliberately no edge from `rejected` to `published`.
+
+### Submitting now discloses what it does
+
+`submit-listing-dialog.component.ts` drops the mandatory "Make this agent public" checkbox in favour of an amber disclosure — *submitting makes this agent public* — and always sets `makePublic` on the request. The relaxation is UI-only: the backend `_visibility_block` is unchanged, so a direct API caller that omits the field is still refused.
+
+### Three follow-ups from using it
+
+The test-drive panel was sized by its grid cell, which on a short submission left about 120px of usable chat. It is now viewport-sized and sticky while the reviewer scrolls the instructions, with an expand control that spans both columns **by a class change only** — no DOM remount, so the reviewer's conversation survives the toggle.
+
+A refused Approve reported itself twice, inline and as a global toast. `SUPPRESS_ERROR_TOAST` now rides exactly four calls that render inline — submission read, diff, review decision, withdrawal decision — and deliberately not the whole service: takedown on the Listings page has no inline region, so its toast is kept and a test pins that.
+
+Then the surviving inline message turned out to render 565px above the sticky decision bar, i.e. off-screen at the moment of the click. Load failures stay at the top; a new `decisionError()` renders inside the sticky bar, directly above Approve / Request changes / Decline.
+
+### One thing to tell your reviewers
+
+A RAG-backed agent test-drives with an **empty knowledge base**. Retrieval now runs under an explicit `kb_access.granted(...)` grant threaded from the call sites, and on the `review_preview` path `assistant_permission` is deliberately `None` — fail-closed by design, and called out in-code as an open policy decision. A reviewer who does not know this will read a degraded answer as a broken agent.
+
+---
+
+## Fine-tuning becomes reachable — and correct
+
+`/api/fine-tuning/access` returned 404 in every deployed environment. `FINE_TUNING_ENABLED` mounts both `/fine-tuning` and `/admin/fine-tuning` and defaults to `"false"` in Python, and nothing ever set it on the app-api container — the existing `CDK_FINE_TUNING_ENABLED` repo variable had had no reader since the single-stack migration in #396.
+
+Three links close the gap: `config.ts` resolves `fineTuning.enabled` and `defaultQuotaHours`, `app-api-service-construct.ts` sets them on the container, and `platform.yml` forwards `CDK_FINE_TUNING_ENABLED`, `CDK_FINE_TUNING_DEFAULT_QUOTA_HOURS` and `CDK_FINE_TUNING_CORS_ORIGINS` — the last also never forwarded before. This one follows the repo's normal idiom: **default ON, with only the literal `"false"` disabling it.**
+
+Three bugs the 404 had been hiding go with it.
+
+**A JSONL dataset died five billed GPU-minutes into training.** JSONL is the first format the upload page names. It uploaded fine, dispatched fine, and then `train.py` failed with `No CSV file found`. `sagemaker_scripts/train.py` now reads JSONL and JSON alongside CSV through a dispatch table and validates that the promised `text`/`label` columns exist. Unreadable formats are rejected at `/presign` and again at `POST /jobs` — the second gate is the last point before SageMaker provisions a GPU. `.txt` is dropped from the training upload copy, since it cannot express a label; it remains valid for inference input.
+
+**The admin cost dashboard read $0.00 and 0 jobs for every period** while jobs were billing. Three faults stacked: the `StatusIndex` GSI partition key was queried with SageMaker's `"Completed"`/`"Stopped"` casing while records store `"COMPLETED"`/`"STOPPED"`; `FAILED` was excluded although AWS bills partial runs, which the user-facing quota counter was already charging for; and training and inference share the table and index, so fixing the casing alone would have 500'd on a `model_id` KeyError. Training is now filtered on the `JOB#` sort-key prefix.
+
+**An unpriced instance type ran real GPUs and recorded $0.00.** `instance_type` arrived unvalidated off the request body on both the training and inference create paths, and `calculate_cost` falls back to `0.0` for anything outside its 11-entry `INSTANCE_COST_PER_HOUR` map. The quota meters GPU-hours rather than dollars, so a 10-hour allowance buys roughly $14 on `ml.g5.xlarge` — or several hundred on a larger unlisted type. Both paths now validate the **resolved** type, covering a bad value reaching inference from a stored job record, and 400 with the supported list. Not reachable from the SPA, where instance type is read-only; this was an API-level hole.
+
+---
+
+## Chat and access-control fixes
+
+**Arrow keys can walk the `@`-mention menu.** `keyup` on the textarea re-ran `syncMentionToken`, which reset `mentionActiveIndex` to 0, so every ArrowDown snapped the highlight back to row one and the menu was unusable by keyboard. The highlight now resets only when the token itself — query or start — actually changed, and `agent-mention-menu.component.ts` scrolls the active row into view, which matters because the list scrolls at eight rows. Adds the composer's first spec.
+
+**`@`-mentions read as an address in your own message.** `@Brand Deck Builder` renders `font-semibold text-white` against the bubble's `text-white/90`. The new `mention-text.component.ts` matches against the known agent-name list from `AgentMentionService` — the same session-cached list the composer's `@` menu warms — rather than `@\w+`: agent names contain spaces, and a word pattern would also bold `@here`, npm scopes and email addresses. Stored message text is unchanged.
+
+**JWT role mappings accept IdP group names with spaces.** A mapping like `PSEmeriti Entra Sync` 400'd the whole `PATCH /api/admin/roles/{role}` payload, blocking even untouched entries. `_JWT_MAPPING_PATTERN` now allows single internal spaces (commas, edge whitespace, tab/NBSP/ZWSP still rejected), and the 400 body and log name the offending entry with invisible characters escaped as `<U+XXXX>` — the failure that motivated this was invisible on screen. `_FORBIDDEN_PROTECTED_MAPPINGS` now compares case-folded with space, hyphen and underscore treated as one separator, so `All Users` and `Authenticated Users` stay blocked now that they are typeable at all.
+
+**Image attachments stop showing the broken-image glyph.** Presigned S3 GET URLs are minted once with a 10-minute lifetime, and `loading="lazy"` tiles in a long turn frequently fetch after expiry. All three render sites now handle `(error)` with a one-shot re-mint: `image-attachment-group.component.ts` restores the retry budget on `(load)` and pre-refreshes when the lightbox opens within 30s of expiry, `image-lightbox.component.ts` gains an `imageError` output and a guard against `<img src="">`, and PDF page-1 thumbnails in `file-attachment-badge.component.ts` fall back to the skeleton.
+
+---
+
+## ⚠️ Changed — live RAG behaviour, ungated
+
+Both of these apply to the existing S3 Vectors path on the next backend deploy. Neither is behind a managed-KB flag.
+
+**The document-status filter fails closed.** Both table-level fallbacks in `_filter_vectors_by_document_status` — an unset `DYNAMODB_ASSISTANTS_TABLE_NAME`, and the outer `except` — now drop *every* chunk rather than returning them unfiltered. Each logs at ERROR and emits `KbStatusFilterFailClosed`. This supersedes reliable-document-deletion Req 3.4; the per-document handler is unchanged. Verify the variable is set on every service that serves retrieval, and watch the metric after deploy.
+
+**Queries clamp at 10,000 characters.** Applied in the facade before dispatch, so it also clamps the legacy path, which was previously unclamped up to Titan's roughly 32,000. It emits `KbQueryClamped` and never raises.
+
+---
+
+## 🧪 Test coverage
+
+Roughly 2,600 lines of new infrastructure tests alone — `kb-migration.test.ts` (1,032), `managed-kb.test.ts` (596), `config.test.ts` (367), `fine-tuning-runtime-flags.test.ts` (100) — plus the backend env-contract test that parses every `os.environ` read in the kb-migration handlers and asserts the construct sets each one, three tests guarding the `boto3==1.43.68` pin, a test pinning takedown's toast against the four suppressed calls, and the chat composer's first spec.
+
+---
+
+## 🚀 Deployment notes
+
+Order: **`CDK_TAG_ENVIRONMENT` first**, then `platform.yml`, then `backend.yml`, then `frontend-deploy.yml`.
+
+1. **Set `CDK_TAG_ENVIRONMENT` before deploying** — `dev` for the development environment, `prod` for production, as a GitHub Environment variable. Without it, managed knowledge bases are tagged `prod` even in dev, and the tag-scoped teardown script matches nothing while reporting success.
+2. **One GSI, deliberately.** `KbWorkIndex` on the existing rag-assistants table is this release's single index operation. `UpdateTable` permits exactly one GSI create or delete per call and CloudFormation issues one per changed table, so any other change adding an index to that table must ship in a separate release — the 1.12.0 outage shape.
+3. **Run the new `backend.yml` jobs.** `build-kb-migration` → `deploy-kb-migration-code` must run at least once, or the four Lambdas stay bootstrap no-ops. Do not relax the `boto3==1.43.68` pin in `Dockerfile.kb-migration`: the base image's 1.40.4 cannot express `managedKnowledgeBaseConfiguration` and every `CreateKnowledgeBase` fails at runtime.
+4. **Fine-tuning becomes reachable with this deploy.** `CDK_FINE_TUNING_ENABLED` is already `true` at repo level and the flag is default-ON regardless, so the routes mount; set it to `false` explicitly to keep the feature dark. Access stays gated: `CDK_FINE_TUNING_DEFAULT_QUOTA_HOURS` is `0`, which is **whitelist-only** — a user with no explicit grant in the `fine-tuning-access` table gets a 403, and no grant is auto-provisioned. Any value above 0 flips it to open access and auto-grants that many monthly GPU-hours to every authenticated user on first use, so confirm the value before raising it. Disabling leaves storage intact, so no dataset or trained model is orphaned.
+5. **The document-status filter now fails closed.** Confirm `DYNAMODB_ASSISTANTS_TABLE_NAME` is set on every retrieval-serving service before deploying, and watch `KbStatusFilterFailClosed`. A service missing it will return zero chunks where it previously returned unfiltered ones.
+6. **Retrieval queries clamp at 10,000 characters** on both backends. Watch `KbQueryClamped`.
+7. **The reconciler runs daily from day one, with every flag off.** Its rule is enabled in report-only mode, and four alarms are created in namespace `${projectPrefix}/ManagedKb`. Expect Lambda invocations, log volume and alarm state. Read its "would have deleted" logs before setting `CDK_MANAGED_KB_RECONCILER_ARMED`.
+8. **Teardown order changed.** `destroy.sh` runs `managed-kb.sh` as Phase 0 and exits 1 before deleting any stack if it cannot confirm every matched knowledge base is gone. Scripted teardowns should expect that new failure mode.
+9. **New listing state `rejected`.** Any external consumer enumerating marketplace listing statuses needs updating. There is no edge from `rejected` to `published`.
+10. **Tell marketplace reviewers that a RAG-backed test drive has an empty knowledge base** — fail-closed by design, easily misread as a broken agent.
+11. **The nine `CDK_MANAGED_KB_*` variables are all safe to leave unset.** Unset is the shipped dormant state, and an empty value cannot arm the three behavioural flags.
+
+---
+
+# Release Notes — v1.15.0
+
+**Release Date:** August 17, 2026
+**Previous Release:** v1.14.1 (August 13, 2026)
+
+---
+
+> 🏗️ **CDK deploy required.** Run `platform.yml` first, then `backend.yml`, then `frontend-deploy.yml`. `infrastructure/lib/` changed in four places this release (one new S3 bucket, two IAM grants, one env var). `infrastructure/gsi-inventory.json` is byte-identical to `main` — **no data migration, no GSI changes**.
+
+---
+
+## Highlights
+
+A minor release about attachments and external tools.
+
+**PowerPoint decks are uploadable.** The backend has accepted `.pptx` since the PowerPoint toolset landed, but the SPA's allowlist never did — so `create_powerpoint_presentation`'s own error text told users to "upload a .pptx template first," advice the UI made impossible. Decks now upload, get a stacked-slides preview card instead of a grey blob, and route to the PowerPoint tools. Fixing the reload path for them fixed it for spreadsheets too: any attachment that skips the inline document set was vanishing from the conversation on refresh.
+
+**OAuth-gated MCP servers stop losing their tools.** A server that requires auth even for `tools/list` — GitHub's does — 401'd the registration pre-flight on every fresh microVM, and the tool was dropped with no explanation and no recovery for the life of the process. That was the single largest source of ERROR lines in the production runtime log. Alongside it, an abandoned consent prompt no longer bricks every later message in the conversation.
+
+**Two IAM grants missing in production are fixed** — both had the capability wired end-to-end except the policy statement, so neither surfaced as a user-visible error while document cleanup silently orphaned vector chunks and every user's saved default model was silently ignored.
+
+---
+
+## PowerPoint decks as attachments
+
+Users can upload a `.pptx` and hand it to the PowerPoint tools — as a template to build from, or a deck to read. It renders as a slide-deck card in the conversation and survives a reload.
+
+The upload could not simply be allowlisted. Bedrock's Converse `DocumentFormat` enum has no `pptx` member (`pdf`, `csv`, `doc`, `docx`, `xls`, `xlsx`, `html`, `txt`, `md`), so a deck sent as an inline document block fails the turn with a `ValidationException` at any size. The release adds a presentation carve-out mirroring the existing tabular one, diverting decks out of the inline set and pointing the model at the tools instead.
+
+### Backend
+
+- `apis/shared/files/models.py` — new `is_presentation_file()` predicate
+- `_partition_attachments()` returns a 4-tuple, diverting decks **before** the size gate (they never go inline, so an "oversized" note would misdescribe why they were skipped)
+- `_build_attachment_guidance()` names the deck and points at `read_powerpoint_presentation`, or names the toggle when the tool is disabled
+- `PromptBuilder.build_prompt()` takes an authoritative `attachment_names` list, defaulting to the names in `files` so existing callers are unchanged. Its `if not files: return message` early path now still emits the marker
+- `chat_agent.stream_async` forwards it; the route derives it via `_attachment_marker_names`, the only place that sees every attachment. Oversized files stay excluded — those were dropped from the turn and the guidance already explains their absence
+- The tools needed no changes: `_find_powerpoint_presentation` already resolves any `READY` `.pptx` in the session
+- Decks get their own **25MB** upload ceiling (`FILE_UPLOAD_MAX_SIZE_BYTES_PRESENTATION`) rather than the general 4MB cap, since that cap exists to bound inline document blocks and a deck never becomes one
+
+### Frontend
+
+- `file-upload.service.ts` — `.pptx` added to the allowlist; new `resolveMimeType()` resolves from the extension. `validateFile` accepted a file by extension when the browser reported no MIME, but `uploadFile` then sent `application/octet-stream`, which the backend allowlist rejects — 400-ing an upload the UI had just accepted. It bit decks twice, since `_find_powerpoint_presentation` matches the stored MIME exactly, so a deck saved as octet-stream would upload and then be invisible to the tool
+- `file-attachment-badge.component.ts` — `FILE_TYPE_STYLES` gains a PPTX entry (presentation icon, orange tint). Presentations render a 16:9 mock front slide with two offset slides stacked behind it, and suppress the folded-corner and bottom-fade details — both are "sheet of paper" cues that fight the stacked-slides metaphor. The mock slide is decorative; a real first-slide thumbnail needs LibreOffice
+
+### Why attachment cards vanished on reload
+
+The card renders from a `fileAttachment` content block the SPA builds client-side at send time and never persists. On reload it rebuilds those blocks by parsing the `[Attached files: …]` marker out of the message text and matching names against the session's file list (`restoreFileAttachments` in `message-map.service.ts`) — so that marker is the only surviving link between a file and the message it was attached to. `PromptBuilder` derived the marker from the files it was turning into content blocks, i.e. the inline set, so any carved-out file never reached it. Spreadsheets had the same gap from the tabular carve-out; csv/xlsx cards now survive reload too.
+
+### Test Coverage
+
+420+ lines across `test_presentation_attachment_carveout.py`, `test_presentation_upload_size_cap.py`, and `test_attachment_marker.py`, plus a frontend spec that pins `FILE_TYPE_STYLES` against the upload allowlist — a type missing from the map degrades silently to a grey blob rather than failing, which is exactly how this shipped, so adding a type to one list now forces the other.
+
+---
+
+## OAuth-gated MCP tools survive a cold token cache
+
+An MCP server that requires auth even for `tools/list` 401s the registration pre-flight whenever the in-process `oauth_token_cache` is cold — which it always is on a fresh microVM. `load_external_tools` caught that, logged a warning, and dropped the tool.
+
+Nothing recovered from there. `OAuthConsentHook` is a `BeforeToolCall` hook, so it only runs for tools that made it into the registry; the dropped tool never reached it, the cache was never warmed, and the drop repeated every turn for the life of the process. A user whose token was sitting in the AgentCore vault the whole time lost the tool permanently and was told nothing — the model simply did not have it. **20 turns hit this in production in 24 hours, the single largest source of ERROR lines in the runtime log.**
+
+### Backend
+
+On pre-flight failure for an OAuth-gated tool with a cold cache, the runtime now asks the vault directly:
+
+- **token** → warm the cache and retry the pre-flight once. This is the consented-user path, and it is also how the tool returns by itself after the user completes consent in the popup
+- **consent URL** → AgentCore is saying the user genuinely has not authorized. Record it so the turn emits `oauth_required` rather than dropping the tool with no explanation
+- **hard error** → stay silent. "Couldn't ask" is not "must consent"; prompting there would nag a connected user whenever the server blips
+
+The vault is only consulted when the pre-flight already failed, so the happy path costs no extra round-trip. Scopes and `customParameters` moved into a shared `oauth/token_resolution.py` helper — AgentCore folds both into the token-vault key, so two callers asking with different values look up different vault entries and would prompt a user who is already connected.
+
+A follow-up narrowed the trigger. Recovery originally ran on *any* pre-flight failure, so an unreachable server looked identical to one refusing an unauthorized caller: the vault correctly answered "this user has no token, here is an authorization URL," and the user got a Connect prompt on every turn that completing consent could never satisfy. Only a 401/403 now counts. The status is not on the exception that surfaces — `MCPClient.load_tools()` raises `ToolProviderException` wrapping `MCPClientInitializationError` wrapping an anyio `ExceptionGroup`, with the real `httpx.HTTPStatusError` three levels down and no status in the outermost message — so `_is_auth_failure` walks `__cause__`/`__context__`/`ExceptionGroup` members, the same shape `mcp_apps._is_transient_connect_error` already had to handle.
+
+### SSE contract
+
+`oauth_required.interruptId` **is now optional.** The pre-flight flavor has no paused turn to resume, and a synthetic id would be worse than none — the resume guard in `inference_api/chat/routes.py` 400s on unknown ids, so the user would hit an error immediately after consenting. Clients must show the Connect affordance and not attempt a resume when the field is absent. Pre-flight events are re-emitted each turn that rebuilds the agent and are deliberately not persisted as `pending_interrupt` breadcrumbs, which are keyed by interrupt id for the resume path.
+
+### Frontend
+
+- `oauth-consent.service.ts` and `stream-parser-core.ts` — handle the id-less flavor, dedupe by `providerId`, and suppress a dismissed pre-flight prompt for the tab session
+
+### Test Coverage
+
+680+ lines across `test_external_mcp_client.py`, `test_oauth_token_resolution.py`, and `test_preflight_consent_events.py`. The tests build the real wrapped exception chain; an existing test that used `RuntimeError("connection refused")` to reach the vault-unreachable branch now uses a 401, since under the new gate it would never have reached the vault and would have passed vacuously.
+
+---
+
+## Attributing interrupted turns
+
+`connection_lost` is a fallback label, not a diagnosis. The container stamps it whenever a stream task is torn down with no client signal, so a refresh, a dead socket, and a platform-side idle timeout were all recorded identically and the resulting population could not be reasoned about. Over 14 days in production: 64 `connection_lost` against 40 `user_stopped`, and of 47 dropped turns sampled in detail only the 11 in the 62–67s band could be attributed to anything at all. The rest were unexplainable in principle, not merely unexplained.
+
+This release closes both ends of that gap — the browser's and the load balancer's.
+
+### Frontend
+
+A page departure is the one interruption cause only the browser witnesses, and the SPA had no `beforeunload`/`pagehide`/`unload` handler anywhere — `cancelChatRequest` was reached solely from the Stop button. A `pagehide` handler now signals `navigated_away` for each session with a stream in flight. `pagehide` rather than `unload` because it still fires for mobile Safari and bfcache navigations; `keepalive: true` on the fetch is what lets the request outlive the page, the same property the Stop path already relies on.
+
+Two things it deliberately does **not** do:
+
+- **It does not abort the stream.** Aborting on page-hide would kill turns for a bfcache navigation the user may return from, and the server turn is meant to keep running so a reload can offer to continue it
+- **It does not arm the distributed turn cancel.** That stays exclusive to a deliberate Stop — cancelling on a departure would make every refresh discard work the reload is about to offer to continue. This endpoint's reason set widened; its side effects did not
+
+### Infrastructure
+
+The ALB access log is the only record of who *ended* a connection. A mid-stream SSE disconnect is indistinguishable from inside the container — client gone, socket dropped, and the ALB's own 60s idle timeout all arrive as the same cancellation — so with logging off, attribution beyond the timing signature was guesswork. `elb_status_code`, the termination-reason field, and `request_processing_time` name the terminator and how long the request had run.
+
+- New access-log bucket is **SSE-S3, not KMS**: the ELB log-delivery service cannot write to an SSE-KMS bucket and fails silently, leaving an empty bucket and no logs. 30-day expiry bounds the cost of a per-request log
+- Synthing the ALB construct now requires a concrete region — CDK resolves the regional ELB log-delivery principal for the bucket policy and refuses on an env-agnostic stack. Every real deploy already passes env via `bin/infrastructure.ts`; one `PlatformStack` test did not, and now does
+
+---
+
+## 🐛 Bug fixes
+
+**An abandoned consent prompt bricked every later message.** If a turn paused on an OAuth-consent or tool-approval interrupt and the user never completed it — just typed a new message instead — Strands rejected the new turn with `TypeError: prompt_type=<class 'str'> | must resume from interrupt with list of interruptResponse's`. `InterruptState.resume` refuses a plain string prompt while `activated` is set, and that flag lives on the agent, which the cache reuses across turns. Nothing cleared it, so every later turn in the session hit the same wall and produced a non-recoverable `stream_error`.
+
+The "a fresh turn supersedes a paused turn" policy already existed in `clear_paused_turn` / `clear_interrupted_turn`, but it only cleared the DynamoDB side — the live object on the cached agent was missed. Deactivating alone is not enough: Strands appends the assistant `toolUse` before running tools and returns on interrupt without the matching `toolResult`, so history ends on an unanswered tool call. `_repair_tool_pairing` cannot fix it, because it deliberately leaves a *trailing* `toolUse` alone for prompt-arrival handling and does not count it as a violation. So the abandoned turn is dropped back to the last completed assistant turn, in place — the message list is aliased across the cached agents serving one session, and rebinding mid-life silently breaks that alias (#874)
+
+**Document cleanup orphaned vector chunks in production.** app-api's `S3VectorsQueryAccess` listed read actions only, so `documents/services/cleanup_service.py` exhausted its three retries on every vector delete and logged "Cleanup incomplete … TTL will auto-expire". Two bulk cleanups failed outright in a single hour (0/18 and 0/1 documents), leaving those chunks searchable in the index until TTL. Note the batch action is `DeleteVectors` (plural); rag-ingestion's `DeleteVector` (singular) is a different action (#870)
+
+**Saved default model was silently ignored.** `inference-agentcore-construct.ts` injects `DYNAMODB_USER_SETTINGS_TABLE_NAME`, so `UserSettingsRepository` reported itself enabled — but the table was absent from the runtime role's grants, and `get_settings` swallowed the `AccessDenied` into `DEFAULT_SETTINGS`, serving the system default instead of the user's `defaultModelId`. Scoped read-only on a bare ARN following the `SystemPromptsTableReadAccess` precedent; the runtime never writes settings and the table has no GSIs (#870)
+
+Both IAM gaps were found by `AccessDeniedException` in the prod-ai CloudWatch logs, and both now carry regression tests alongside the existing `SharedConversationsAccess` guard, which covers the identical failure mode.
+
+---
+
+## 🏗️ Infrastructure
+
+| Change | Detail |
+|---|---|
+| ALB access-log bucket | New S3 bucket, SSE-S3 encryption, 30-day expiry. KMS is not an option — ELB log delivery fails silently against it |
+| `S3VectorsQueryAccess` | Gains `s3vectors:DeleteVectors` on the app-api task role |
+| `UserSettingsTableReadAccess` | New read-only grant on the AgentCore runtime role |
+| `FILE_UPLOAD_MAX_SIZE_BYTES_PRESENTATION` | New app-api env var, 25MB. Must never be smaller than `PPTX_MAX_FILE_SIZE_BYTES` in the SPA's `file-upload.service.ts` |
+| Synth requirement | The ALB construct now needs a concrete region for the regional ELB log-delivery principal |
+
+No GSI changes: `infrastructure/gsi-inventory.json` is byte-identical to `main`, and `scripts/release/check-gsi-update-limit.mjs` passes across all 26 tables. No data migration.
+
+---
+
+## 📚 Documentation
+
+- **G3 document-citations probe** — the premise was wrong. Visual PDF understanding is unconditional, and citations are text-layer-only rather than the gate we assumed. Note the answer text moves inside `citationsContent` (#869)
+- **AgentCore Evaluations spike** and eval-harness scoping (#862)
+- **Bedrock Managed KB evaluation** expanded with recommendations (#867)
+- Weekly kaizen research scan and review prep for 2026-08-14, with nine stale review-queue entries resolved (#871, #875)
+
+---
+
+## 🧪 Test coverage
+
+**2,600+ lines of new tests.** Largest additions: `test_external_mcp_client.py` (399), `test_stale_interrupt_reset.py` (273), `test_presentation_attachment_carveout.py` (194), `test_oauth_token_resolution.py` (165), `test_preflight_consent_events.py` (120), `test_presentation_upload_size_cap.py` (117), `test_attachment_marker.py` (109). Infrastructure adds 90 lines of security-policy assertions covering both new IAM grants and 48 lines for the access-log bucket.
+
+---
+
+## 🚀 Deployment notes
+
+**This release requires a CDK deploy**, unlike 1.14.1.
+
+1. **`platform.yml`** — picks up the ALB access-log bucket, both IAM grants, and the new app-api env var
+2. **`backend.yml`** — app-api, inference-api, rag-ingestion, artifact-render
+3. **`frontend-deploy.yml`** — S3 + CloudFront
+
+No data migration and no GSI changes, so the deploy is not order-sensitive beyond the sequence above. Compute image URIs still come from SSM at CFN deploy time, so the infra deploy will not revert a live service.
+
+**After deploying, verify:**
+
+- The ALB access-log bucket is receiving objects. An empty bucket after real traffic means the log-delivery grant did not take — check the bucket is SSE-S3 and not KMS
+- A document delete no longer logs "Cleanup incomplete … TTL will auto-expire" in the app-api logs
+- A user with a non-default `defaultModelId` gets that model on a fresh session
+
+**For API clients:** `oauth_required.interruptId` is now optional. Any client that resumes a turn from that event must check for the field's presence and fall back to showing a Connect affordance without a resume — posting a missing or synthetic id back will 400.
+
+---
+
+# Release Notes — v1.14.1
+
+**Release Date:** August 13, 2026
+**Previous Release:** v1.14.0 (August 11, 2026)
+
+---
+
+> 🚀 **No CDK deploy.** Run `backend.yml`, then `frontend-deploy.yml`. `infrastructure/lib/` is untouched this release and `infrastructure/gsi-inventory.json` is byte-identical to `main` — **no data migration, no GSI changes**.
+
+---
+
+## Highlights
+
+A patch release about interruptions — what happens when a turn does not finish normally.
+
+The headline is a bug prod users reported and could not work around: a mid-response **"Network error"**, then a fatal **"Chat Request Failed"** when they resent. That was one causal chain, not two bugs. A dropped SSE stream never released its single-flight session lease, so the conversation stayed locked for the lease's full 90-second window and rejected the very next message. Two related fixes ship alongside it: SSE keepalive frames, because CloudFront and the ALB were both cutting quiet connections at 60 seconds with no keepalive anywhere in the chat path, and a status relay so the platform's opaque `424` no longer masks the SPA's existing soft "Already responding" path.
+
+**Stop also works properly now.** Pressed during a slow MCP call it used to appear dead until the call returned on its own; separately, a cancelled turn left its flag set on the cached agent and refused every later message in that session.
+
+---
+
+## 🐛 Bug fixes
+
+**A dropped connection bricked the next message.** The lease release sat behind an `await` in the stream generator's `finally`. Starlette cancels a disconnected `StreamingResponse` with an anyio cancel scope, which is level-triggered — while cancelled, *every* checkpoint inside it raises, cleanup included. So the one case that ran the `finally` was the case that guaranteed it never completed. Over 24 hours in production: 433 lease acquires against 413 releases, and those 20 leaked leases accounted exactly for the 20 rejected resends. Fixed by shielding the release, the same idiom `_persist_interruption` already used. Verified live in dev, where the runtime log now shows `Released session lease` landing 420ms after the interruption marker (#863)
+
+**Quiet turns were being cut at 60 seconds.** CloudFront's `OriginReadTimeout` and the ALB's `idle_timeout` are both 60s, and nothing in the chat path sent a keepalive — so any turn that legitimately went silent longer than that, typically a slow tool or a burst of MCP calls, was killed by the platform rather than by anything wrong with the turn. Of 47 dropped turns measured over five days, 11 died in a 62–67 second band. app-api now emits a `": keepalive\n"` comment frame every 20 seconds at frame boundaries (#863)
+
+**The platform's 424 masked a deliberate 409.** The AgentCore Runtime data plane rewrites *any* non-2xx from the container into `424 Failed Dependency`, so inference-api's deliberate "a response is already streaming for this conversation" arrived as a fatal error and the SPA's existing soft notice never fired. The proxy now relays it as 409 — but only when an unexpired turn lease is actually held, since a container crash produces an identical 424 and a real failure must never be disguised as a conflict (#863)
+
+**Stop did not reach a running MCP call.** Cancellation only flipped `session_manager.cancelled`, which StopHook reads at tool boundaries and the stream coordinator reads between stream events. Neither regains control while an MCP `tools/call` is in flight, so a Stop pressed during a slow call did nothing visible until that call finished on its own (#858)
+
+**A cancelled turn bricked the session it was in.** The `cancelled` flag was never reset on the cached agent, so every subsequent message on that conversation was refused (#858)
+
+**The Agent Designer forgot a saved reasoning effort.** An agent saved with `reasoning_effort: high` reopened showing `Default (medium)`. `select.value` is a one-time DOM property write, and Angular applies it before `@for` mounts the options in the same change-detection tick — the browser finds no matching option and falls back to the first. User-reported on boisestate.ai (#849)
+
+---
+
+## ⚡ Performance
+
+**Session persistence no longer blocks the chat event loop.** `AgentCoreMemoryConfig` was constructed without `batch_size`, which defaults to 1, so every message appended during a turn — the user message, each assistant message, each tool result — fired a synchronous boto3 `create_event` plus a `sync_agent` directly on the asyncio event loop from inside the SSE stream generator. This was the last blocking boto3 caller on the hot path; `stream_coordinator` offloads in four places and the artifact and spreadsheet tools document the same rule on every blocking helper (#859)
+
+---
+
+## 📦 Dependencies
+
+| Package | From | To |
+|---|---|---|
+| `strands-agents` | 1.48.0 | 1.51.0 |
+| `strands-agents-tools` | 0.5.2 | 0.8.6 |
+| `bedrock-agentcore` | 1.9.1 | 1.21.0 |
+| `aws-opentelemetry-distro` | 0.17.0 | 0.19.0 |
+| `boto3` | 1.43.9 | 1.43.68 |
+
+`boto3` was not optional — `bedrock-agentcore==1.21.0` floors at `>=1.43.35`, so the resolve fails until it moves. It is pinned in `backend/pyproject.toml` and in the three Lambda `requirements.txt` files that carried the old version. The upgrade is a prerequisite for both fixes above: #858 needs `strands-agents` 1.51.0 to forward the cancel signal into an in-flight MCP call, and #859 needs `bedrock-agentcore` 1.21.0 (#857)
+
+---
+
+## 📚 Docs
+
+`docs/specs/bedrock-managed-kb-evaluation.md` evaluates Bedrock Managed Knowledge Base as a replacement for the custom S3 Vectors RAG pipeline — evaluation and design only, no code and no infrastructure. Grounded in an AWS Price List API query and a live three-KB probe in dev-ai rather than documentation alone. The finding that drives the design: Managed KB has **no per-KB billing floor**, billing under service code `AmazonBedrockAgentCore` through three consumption SKUs (#856)
+
+---
+
+## 🚀 Deployment notes
+
+Backend and frontend only. Run `backend.yml`, then `frontend-deploy.yml`.
+
+- **No `platform.yml` run required.** `infrastructure/lib/` is untouched, and the GSI update-limit check passes with 26 tables compared and no index operations pending.
+- **No new environment variables, no new kill switches.** Every change in this release is unconditional.
+- The frontend deploy is needed only for the Agent Designer fix (#849); the interrupt-path work is entirely server-side.
+
+---
+
+# Release Notes — v1.14.0
+
+**Release Date:** August 11, 2026
+**Previous Release:** v1.13.0 (August 2, 2026)
+
+---
+
+> 🏗️ **CDK deploy required.** Run `platform.yml` first, then `backend.yml`, then `frontend-deploy.yml`. `infrastructure/lib/` changed in three places this release (runtime log-group wiring, one environment variable removed, new prompt-cache widgets and alarm). **No data migration, no GSI changes** — `infrastructure/gsi-inventory.json` is byte-identical to `main`.
+
+---
+
+## Highlights
+
+The platform gets an interface that isn't a browser. **`agentcore-tui`** is a terminal chat client — streaming, model picker, command palette, keyring-backed auth — shipped as its own `uv` project so it installs with `uvx agentcore-tui` without touching this repo.
+
+The rest of the release is the cost-effectiveness arc turning into shipped code. **Conversations now pin to a microVM**, which roughly halves steady-state turn latency for *every* session: AgentCore routes by runtime session id, nothing was forwarding one, and consecutive turns of a single conversation kept landing on cold containers. **Prompt-cache observability learns to name `partial_miss`** — the classification that had been reporting 90% of a burned monthly quota as a green `hit`. And **quota warnings gain a runway**: earlier rungs, plus a per-conversation cost notice for the case the old ladder structurally could not catch, where one conversation spends most of a user's month.
+
+One correctness fix is worth reading even if you skip the rest. **`isPublic` on a tool granted nothing.** It was read by the admin picker and by nothing that enforces access, so three document-builder tools listed for every user in production and then refused at use — including on public marketplace agents that bind them.
+
+---
+
+## A terminal client
+
+The platform's first non-browser interface. `tui/` is a standalone `uv` project — not part of the backend's dependency graph — built on Textual 8.2.8 and talking to the API-key authenticated `/chat/api-converse` endpoint. It is distributable on its own: `uvx agentcore-tui`.
+
+This is Phase 1. It chats, streams, switches models, and reports usage.
+
+### Client
+- `client/converse.py` / `client/events.py` — streaming SSE with typed events, and typed **actionable** errors mapped from the endpoint's HTTP contract: 401, 403, 429, 400 and 502, plus mid-stream failures that arrive as events rather than status codes
+- `config.py` — resolution across CLI flags, environment, a TOML file and the OS keyring, degrading gracefully on hosts with no keyring backend rather than refusing to start
+- `logging_setup.py` — rotating file logs with prompt content **redacted** unless `AGENTCORE_LOG_CONTENT=1`; the API key is never logged at any level
+
+### Interface
+- `app.py` / `widgets/` — live Markdown rendering with delta coalescing, a collapsible reasoning pane, token and usage status bar, and cancel-in-flight
+- `screens/model_picker.py` — model picker on F2; curated command palette on F1 (new conversation, change model, copy last response or transcript, theme, log path)
+- `cli.py` — `chat`, `login` (getpass + keyring), `logout`, `status` (health probe)
+
+### Local development
+`scripts/local-dev/` runs the client against a live environment: `start-app-api.sh` (loopback-bound, and it refuses a non-loopback bind while the auth bypass is on), `mint-api-key.sh`, `sync-models.sh`, `run-tui.sh`, and a host-side `tui.sh` launcher.
+
+### Version discipline
+`tui/pyproject.toml`, `tui/src/agentcore_tui/__init__.py` and `tui/uv.lock` are wired into `scripts/common/sync-version.sh`, so the new project's manifests cannot drift from `VERSION` — the same gate the other three packages sit behind.
+
+### Test Coverage
+1,400+ lines across 143 tests, none of which need the network: `httpx.MockTransport` for the client and Textual's `run_test` pilot for the interface. Also exercised end to end against a real app-api, over both the Bedrock and Mantle model paths, plus the 401 and connection-failure surfaces.
+
+---
+
+## Conversations stay on one microVM
+
+Turns got about twice as fast, and the reason is embarrassingly simple: nothing was telling AgentCore that two turns belonged to the same conversation.
+
+AgentCore routes an invocation to a microVM by runtime session id. We never forwarded one, so AWS assigned a fresh session per call — and consecutive turns of a single conversation could land on different containers, where inference-api's in-process agent cache is cold by definition.
+
+Measured in dev with a two-arm A/B differing only by this header, at steady state:
+
+| | turn latency |
+|---|---|
+| No pinning, agent-cache miss | ~7.6s |
+| Pinned, agent-cache miss | ~4.8s |
+| Pinned, agent-cache hit | ~3.9s |
+
+Read the split carefully, because an earlier note in this codebase got it wrong and has been corrected: **most of the win is the warm container**, which every session gets. The agent-cache hit adds roughly 19% on top, and only for the subset of sessions that can use it. Both arms produced an identical prompt-cache token split (write:read 0.336) — **this is a latency fix, not a cost one.** An earlier probe suggested a cost win; that was run-order confound, where the second arm inherited the first's Bedrock cache entry because both primed with byte-identical text.
+
+### Backend
+- `apis/shared/harness/runner.py`, `apis/app_api/chat/proxy_routes.py`, `apis/app_api/mcp_apps/routes.py` — forward a runtime session id derived as a sha256 of our session id. The hash is not decoration: the runtime session id has a charset and a 33-character minimum our session ids don't reliably meet, and a hash is always valid, stable per conversation, and keeps our identifiers out of an AWS-side one
+- Kill switch `AGENTCORE_RUNTIME_SESSION_AFFINITY_ENABLED=false` restores per-call runtime sessions exactly
+
+**This was also the missing prerequisite for the agent-cache work below.** That predicate fired correctly but could never hit, because the process was always cold — promoting more tool families was worthless without affinity first.
+
+---
+
+## Artifact turns can use the agent cache
+
+`get_agent` bypassed the agent cache for *any* `extra_tools`, standing in for "this agent captured something the cache key doesn't describe." That was true for two builders and false for everything else, which closes over only session and user — both already key elements. The blanket predicate reached **76% of sessions and 95% of spend**, making every one of those turns pay a full `initialize()` plus an AgentCore Memory restore.
+
+It is now a predicate over what a turn actually captured, starting with `create_artifact` alone — deliberately the single-builder experiment, because artifacts are the clean arm (no `assistant_id`, no memory binding) and the bypass→cache-write correlation is otherwise confounded by workload.
+
+### Backend
+- `apis/shared/tools/injected.py` (new) — the eligibility predicate, with structured `agent_cache` hit/miss logging to instrument the experiment's "initialize() per turn" gate
+- `apis/inference_api/chat/service.py` / `chat/routes.py` — the MCP App dispatch paths call `get_agent` with no injected tools but the *same cache key* as real turns. They couldn't collide while artifact turns never cached; now they share a slot, so an App call arriving first would leave every later real turn hitting an agent with no `create_artifact`. Those two callers now **read** the slot but never seed it
+- Needs no cache-key or `PausedTurnSnapshot` change — artifact closures are already fully described by the key — so the paused-agent orphaning hazard is not in play
+- Kill switch `AGENT_CACHE_INJECTED_TOOLS_ENABLED=false` restores the blanket bypass exactly
+
+**The honest read:** the cost thesis behind this work is disproven. It buys the ~19% marginal latency delta above, not a cache-write reduction. That is recorded in the spec rather than quietly dropped.
+
+---
+
+## Naming the cache miss that reports as a hit
+
+A nonzero `cacheRead` was treated as proof the prefix was cached. So any call that read a leading segment and re-wrote everything behind it classified as `hit` with `wastedUsd = 0`. The 2026-08-05 compaction spiral did exactly that on **56 consecutive calls** — 11k read against 190k written, an 18:1 ratio — and spent 90% of a user's monthly quota invisibly.
+
+`partial_miss` splits "read the prefix, wrote the tail" from "read a sliver, wrote the prefix": write greater than 3× read against a live entry, TTL-gated exactly like `miss_avoidable` so a legitimately cold prefix is not booked as waste. It is priced identically to a full miss, minus the tokens the call actually read.
+
+### Backend
+- `apis/shared/observability/prompt_cache.py` — the classification; `emf.py` — `PartialMiss` and `PartialMissUsd`
+- `apis/shared/sessions/metadata.py` — `partialMissCount` / `partialMissUsd` session rollups, carried into `wastedUsd` on the `C#` row
+- `apis/app_api/admin/costs/` — the cost-anatomy endpoint reports the new status
+
+### Frontend
+- `session-cost-anatomy.page.ts` — partial miss rendered alongside the existing statuses, so the anatomy page stops implying a clean prefix
+
+### Infrastructure
+- `prompt-cache-observability-construct.ts` — a partial-miss widget, and the platform's **first per-session alarm**: $5 of partial-miss waste in 24 hours, off the running rollup total. The fleet sums sitting beside it never saw the incident at all
+
+Rides the existing `PROMPT_CACHE_OBSERVABILITY_ENABLED` kill switch. No new flag, **no change to any request sent to Bedrock**, and no backfill — rows written before this ships still say `hit`.
+
+---
+
+## Quota runway
+
+In the 2026-08-05 incident every quota warning — 80% and 90% — fired on the day the block landed, and nothing ever told the user that **one conversation** had spent $28 of their $30 month. Two signals address that, behind one kill switch (`QUOTA_RUNWAY_ENABLED`, default on).
+
+**Earlier rungs.** 50% and 75% join the tier's soft limit and 90%, tier-configurable via `earlyWarningPercentages` (`[]` opts out). Strictly additive — no tier loses a warning it had.
+
+**A per-conversation notice.** The new `quota_session_notice` SSE event fires when a single conversation reaches the tier's `sessionNoticePercentage` share of the monthly limit (default 25%, 0 disables). It reads the `totalCost` already denormalized on the session row, so there is no new aggregation and no new index.
+
+The acceptance test is a replay, not a claim: `tests/shared/test_quota_runway.py` runs the incident session's own 105 recorded cost rows (a content-free fixture — timestamp and cost only) through the ladder. **The result corrected the spec.** The session notice fires on 2026-08-01 as predicted, but the 50%/75% rungs land on 2026-08-03 UTC — a day later than expected, buying only about 6 hours over today's 80% rung. The runway comes from the per-session signal, because the defect was never that the *user* was overspending.
+
+### Backend
+- `agents/main_agent/quota/thresholds.py` (new) — the ladder; `quota/checker.py` and `quota/event_recorder.py` — a durable `session_notice` quota event on first crossing, for support
+- `apis/app_api/admin/costs/` — `GET /admin/costs/top-sessions`, assembled by fanning out over the period's top-cost users rather than scanning. It reports `usersScanned` and `truncated` so a bounded list never reads as exhaustive
+- `apis/app_api/admin/quota/models.py` — fixes `QuotaTierUpdate` silently dropping `softLimitPercentage` and `actionOnLimit`, which the SPA's edit form has been sending all along
+
+### Frontend
+- `quota-warning-banner.component.ts` / `quota-warning.service.ts` — the notice renders as its own dismissible chip, **scoped to the conversation it names** and never shown above another thread's composer
+- `top-sessions-table.component.ts` — the new admin table; `tier-detail.component` — the two new tier settings
+
+---
+
+## 🐛 Bug fixes
+
+- **A tool marked public was listed for everyone and then refused at use.** `isPublic` was read by exactly one function — `ToolCatalogService._compute_granted_by`, which builds the tool picker — while every enforcement path resolved access from role `grantedTools` alone. A public tool granted by no role therefore appeared in the picker and failed at the gate: agent tool bindings raised a hard `AgentBindingBlockedError` refusing the entire turn ("…isn't available to your account"), schedules and "Run now" dropped it silently, and `ToolAccessService` carried a second, narrower copy of the same rule. Only `"*"` holders were unaffected, which is why it read as a permissions misconfiguration rather than a bug. **In production this stranded `create_word_document`, `create_powerpoint_presentation` and `excalidraw`** — all `isPublic: true`, all granted by zero roles — including on public marketplace agents that bind them. Every gate now routes through one `AppRoleService._tool_grant_set` (role grant ∪ public tools), backed by a `get_public_tool_ids()` TTL snapshot that shares its catalog read with `get_all_tool_ids()`. The public set is unioned **at the predicate**, not merged into `UserEffectivePermissions` — that object is per-user cached and its `tools` list reaches the model's `toolConfig`, where an order flip re-writes the prompt-cache prefix. This is the tools-axis twin of the `_grants_access` consolidation already done for models
+- **One leading space silently downgraded delegated identity to anonymous.** A pasted `token_exchange_audience` reached DynamoDB at 37 characters; the token service compares against its per-client allowlist ordinally and refused every exchange. The tool still *appeared* to work — the endpoint it called allows anonymous access, so the request went unauthenticated and returned plausible results. Eight refusals in the token-service log; nothing wrong in the agent's answer. A before-validator now strips surrounding whitespace and maps blank to `None`; blank → `None` matters as much as the strip, because an empty string reads as "exchange configured" and would send an empty audience. **Note for whoever hits this next:** correcting the stored value alone was not enough in dev — the runtime caches MCP clients keyed on the tool's `updatedAt` and the token-provider closure captures the audience at construction, so a fixed record is ignored until the version changes
+- **Auth-mode validation held on create and not on update.** `update_tool` never considered `token_exchange_audience`, so creating a tool with an audience was checked and editing one to add an audience was not — reachable straight through the admin UI. An edit could leave a tool with an audience plus `forward_auth_token`, or an audience with MCP auth type `aws-iam`. Neither is a credential leak: the exchange branch is evaluated before forward-auth so the raw Cognito token is never sent, and with `aws-iam` the bearer takes precedence so the request reaches an IAM-expecting endpoint unsigned. Both are a broken tool. The bug is the inconsistency — a rule the UI implies was checked and wasn't is worse than no rule
+- **The Runtime construct was one environment variable over a hard limit.** `AWS::BedrockAgentCore::Runtime` accepts at most 50 and the construct sat at exactly 50; the quota runway's kill switch made 51 and broke the dev Platform Stack deploy (`maximum size: [50], found: [51]`). CloudFormation enforces this when it validates the changeset — **not** at `cdk synth` — so tsc, jest and CI were all green on the PR that broke it. The variable is removed and the kill switch is unaffected, since `quota_runway_enabled()` reads `os.environ` and defaults on. Setting it to a non-default value now requires an out-of-band Runtime update until a slot is freed
+- **Three dashboard widgets queried a log group nothing ever wrote to.** The inference construct declared `/aws/bedrock-agentcore/runtimes/<prefix>`; measured in dev, that group holds 0 bytes while the service's own holds 229 MB. Empty results read as "no errors" and "no traffic" rather than as a broken query — so the `cacheStatus` widget has never shown data since it shipped, and the partial-miss widget above copied the pattern before this was caught. AgentCore names the group after the AWS-assigned runtime *id* plus the endpoint qualifier, so it is knowable only from the Runtime resource
+- **Two local-dev scripts tripped the `SKIP_AUTH` CI guard** — six matches, in comments, in error messages, and in the very grep patterns they use to *detect* the bypass in a developer's `.env`. Neither script sets it, so the guard's intent was never violated, but the match is real and CI is right to be blunt. Fixed in the scripts rather than by excluding `scripts/local-dev/` from the scan, which would trade a permanent hole in the guard for a cosmetic problem. Side benefit: the new character-class pattern also matches `SKIP_AUTH = true` with spaces, which the previous literal missed — so `start-app-api.sh` would have allowed a non-loopback bind for a spaced assignment
+
+---
+
+## 🏗️ Infrastructure
+
+- `runtimeLogGroupName` is exposed from the inference construct and threaded to the prompt-cache observability construct, which moves into the compute-wiring phase to receive it. The phantom `LogGroup` and its retention policy — which never applied to anything — are dropped. **Operators:** retention on the real, service-created group is unmanaged. That is a live cost item, noted in the code and tracked as a W5 follow-up
+- New `PartialMiss` / `PartialMissUsd` EMF metrics, a partial-miss dashboard widget, and a per-session partial-miss alarm on the `AgentCoreStack/PromptCache` namespace
+- **No GSI changes.** `infrastructure/gsi-inventory.json` is byte-identical to `main`, so the one-GSI-per-`UpdateTable` limit is not in play for this release
+
+---
+
+## 🔧 CI/CD
+
+- `infrastructure/test/runtime-env-var-limit.test.ts` asserts the Runtime environment-variable count stays at or under 50, and fails with a message naming the ways to free a slot. It logs remaining headroom on every run — **currently 0 free** — and synthesizes the worst case deliberately, with `tokenExchange` enabled because it spreads in three more variables. Without that the test counts 47 while prod and dev deploy 50, and the guard would report headroom no real environment has. Any future conditional block must be enabled there too, or the guard quietly stops guarding
+
+---
+
+## 📚 Docs
+
+This release carries an unusually large specification arc, because the cost work is being designed in the open before it is built:
+
+- `docs/one-pagers/cost-effectiveness-roadmap.md` — the plan of record over the whole arc, with W1–W5 workstreams and G0–G3 gates
+- `docs/specs/compaction-over-threshold-cache-spiral.md`, `docs/specs/agent-cache-extra-tools-bypass.md`, compaction v2's versioned frozen prefix segments, and the document-context-offload spec with its adversarial validation and eval design
+- `docs/one-pagers/fleet-prefix-spend-anatomy.md` and `backend/scripts/scan_fleet_prefix_spend.py` — measuring where model spend actually goes, across all conversations rather than one
+- Two corrections worth flagging, both recorded rather than quietly fixed: the agent-cache bypass's cost thesis is **disproven** by its own gate read, and the 1.13.0 note claiming that reaping a microVM risks context loss was wrong — history restores from AgentCore Memory at agent init, so a reap is a cold start, not a loss
+- `AGENTCORE_GATEWAY_TOKEN_EXCHANGE_PLAN.md` corrected: the Gateway does not perform the exchange
+
+---
+
+## 🚀 Deployment notes
+
+**Deploy order: `platform.yml` → `backend.yml` → `frontend-deploy.yml`.** Unlike 1.13.0, this release **does** change `infrastructure/lib/` and requires a CDK deploy.
+
+- **No data migration and no GSI operations.** The GSI inventory is unchanged from `main`, so nothing in this release is exposed to the one-index-per-`UpdateTable` limit
+- **Everything new is behind a default-on kill switch.** `AGENTCORE_RUNTIME_SESSION_AFFINITY_ENABLED`, `AGENT_CACHE_INJECTED_TOOLS_ENABLED`, `QUOTA_RUNWAY_ENABLED`, and the pre-existing `PROMPT_CACHE_OBSERVABILITY_ENABLED` each disable their feature exactly, with no partial state
+- **`QUOTA_RUNWAY_ENABLED` has no Runtime environment-variable slot.** The Runtime construct is at its 50-variable ceiling with **0 headroom**, so the flag is read from `os.environ` with a default of on. Turning it *off* requires an out-of-band Runtime update until a slot is freed — and any new Runtime variable added from here requires retiring an existing one first, which `runtime-env-var-limit.test.ts` will now tell you in CI rather than at deploy
+- **Expect fewer cold starts and faster turns after the first in each conversation** once session affinity is live. This partially offsets 1.13.0's idle-reaper change, which deliberately shrank the warm-microVM pool: conversations now reuse their own container rather than relying on a large shared pool
+- **Users on tiers with default settings will start seeing quota warnings at 50% and 75%**, and a per-conversation notice at 25% of the monthly limit. Both are tier-configurable — set `earlyWarningPercentages` to `[]` and `sessionNoticePercentage` to `0` to keep the old behaviour for a given tier
+- **Watch the new per-session partial-miss alarm.** It is the first alarm on this platform that fires for a single conversation rather than a fleet aggregate, and it exists because the fleet sums did not see the incident that motivated it
+- **The terminal client deploys nothing.** `tui/` is a standalone `uv` project distributed via `uvx agentcore-tui`; it is not part of any image, and it needs an API key from the existing API-key feature
+
+---
+
+# Release Notes — v1.13.0
+
+**Release Date:** August 2, 2026
+**Previous Release:** v1.12.3 (August 1, 2026)
+
+---
+
+> 🖥️ **Backend + frontend deploy** — run `backend.yml`, then `frontend-deploy.yml`. **No CDK deploy**, no new AWS resources, no configuration change, no data migration. There are zero `infrastructure/lib/` changes in this release, so `platform.yml` has nothing to apply.
+
+---
+
+## Highlights
+
+Two things in this release were quietly costing us, in opposite currencies.
+
+A **published Agent listing was a dead end**. Version snapshots made what users run immutable — which is the point — but they also meant an author's edits landed on a draft that reached nobody, and `published` had no edge back into review. Fixing a typo meant asking for the Agent to be taken off the shelf. This release adds the update path: authors submit an update to a live listing, and the approved version keeps serving every user for the entire review.
+
+Meanwhile the **AgentCore Runtime's idle reaper had been disabled since May** — not by configuration, but by our own `/ping` handler, which refreshed its idle timestamp on every poll and so reported a microVM as busy forever. Every microVM ran its full 8-hour `maxLifetime` no matter how long ago its last turn ended. In July that was 71,954 microVM-hours at 1.23% CPU utilization to serve 9,568 turns — **73% of the platform bill**. The handler now reports the contract AgentCore actually reads.
+
+Alongside those, **three Lambda images that had been failing at import on every single invocation** are fixed — document ingestion and scheduled KB sync both come back — and the DynamoDB GSI limit that took production down on 2026-08-01 gains a pre-merge CI guard so no future release can repeat it.
+
+---
+
+## Shipping an update to a live listing
+
+An author with a published Agent could not get a change to their own users. Their edits went to the draft; the store served the approved snapshot. The only routes were to request withdrawal — taking the Agent off the shelf to fix a typo — or to wait for an admin to send it back with `request_changes`, which is not the author's to start.
+
+The listing state machine now has a `published → in_review` edge.
+
+This is not a second door into the store. `submit_listing` carries `published_version` and its index key through untouched, so the approved snapshot keeps serving for the whole review, and approval remains the only edge that changes what users get. `AUTHOR_TARGET_STATES` deliberately does **not** gain `published` — widening it would let an author walk their own unreviewed first submission onto the shelf.
+
+Cancelling an update is the subtle half. Withdrawal picks its target from `is_on_shelf`, so cancelling a pending update previously read as the author asking to delist — a request they never made, parked in an admin's queue. A submission made over something already on the shelf now records its origin, and cancelling derives the target from that rather than accepting one. Assuming `published` instead would discard an outstanding change request and publish something no admin approved.
+
+### Backend
+- `apis/shared/assistants/listing.py` — `published → in_review` in `ALLOWED_TRANSITIONS`; `AgentListing.submittedFrom` records a submission's origin state
+- `apis/app_api/agent_designer/services/listing_service.py` — cancel derives its target from `submitted_from`, the same mechanism as `withdrawal_from`; an author's silence on `publisherId` now keeps the listing's **current** publisher rather than resolving back to their individual profile, so an update no longer silently undoes a D12 reattribution
+- `apis/shared/assistants/models.py` — `publishedVersion` and `submittedFrom` on the wire
+
+### Frontend
+- `share-agent-dialog.component.ts` / `submit-listing-dialog.component.ts` — "Submit an update" / "Cancel update" wording, driven by whether a listing is already live
+- `listing-status.component.ts` — a line on the status badge stating that the published version stays live during review
+
+### Test Coverage
+226+ lines in `test_agent_listing.py` and 105+ in `test_agent_listing_state_machine.py`, plus SPA specs for both dialogs.
+
+---
+
+## The idle reaper, re-armed
+
+`/ping` returned `time_of_last_update: int(time.time())` on every poll. AgentCore measures idleness as `now - time_of_last_update` and polls roughly every two seconds — so the reported idle time was never more than about 2 seconds, and the 900-second `idleRuntimeSessionTimeout` could never fire. Every microVM instead ran to `maxLifetime`: 8 hours, however long ago its last turn finished.
+
+The cost is measurable and large. Mean microVM life stepped from 21.5–33.6 minutes (May 13–14) to 488–496 minutes from May 28 onward, exactly at the deploy of #338 which introduced the moving timestamp. July: 9,568 turns, 71,954 microVM-hours, 1.23% CPU utilization, 217,806 GB-hours — about $2,058, or 73% of the platform bill. On August 1, 88 of 89 microVMs served exactly one turn and then sat idle for eight hours.
+
+### Backend
+- `apis/inference_api/runtime_health.py` (new) — reports the contract the upstream SDK implements: `HealthyBusy` while a turn is in flight, `Healthy` with a **frozen** timestamp once idle, so idle time actually accrues and the reaper fires on schedule
+- `apis/inference_api/main.py` — registers `InvocationActivityMiddleware`, which is **pure ASGI rather than `BaseHTTPMiddleware`**. The unit of work is the streamed SSE body, not the handler call: `BaseHTTPMiddleware` hands back control the moment the handler returns a `StreamingResponse`, before the agent has produced a token. A pure-ASGI `await self.app(...)` does not return until the body is fully sent, so `try/finally` spans the real turn and cannot leak the counter on client disconnect or handler error
+
+Two deliberate deviations from the upstream SDK, both protecting #338's original fix:
+
+- The timestamp refreshes on every poll **while busy** rather than freezing at turn start, so a turn running past `idleRuntimeSessionTimeout` is never reaped mid-stream even if the platform reads only the timestamp and ignores the status (`bedrock-agentcore-sdk-python#471`)
+- Transitions are stamped by `enter()`/`exit()` rather than sampled when a poll happens to observe them. The SDK infers them inside its ping handler, so a turn shorter than the poll interval is never seen as activity — leaving the idle clock running from process start, which can strand a just-served session one poll away from a reap
+
+### Infrastructure
+None. The runtime uses AWS's default lifecycle values; this was never a configuration problem.
+
+### Test Coverage
+268 lines in `test_runtime_health.py` covering the ping contract, busy/idle transitions, and the middleware's `try/finally` spanning the streamed body.
+
+---
+
+## Three Lambda images were failing at import
+
+`apis/shared/timestamps.py` landed in `8544d87a` and is imported by `documents/ingestion/status.py`, but neither `Dockerfile.rag-ingestion` nor `Dockerfile.kb-sync` copied it. Both images had been raising `ModuleNotFoundError` on **every invocation** ever since — rag-ingestion and both kb-sync Lambdas at a 100% error rate in dev since roughly 2026-07-27, and in prod since the 2026-08-01 18:46 UTC deploy.
+
+Nothing surfaced it. The S3 events fired, the crawler staged its markdown correctly, and the container died at import before any handler code ran. Documents simply sat at `uploading` forever, and scheduled KB sync stopped running.
+
+Two more gaps of the same shape were already present and are closed here:
+
+- **kb-sync** omitted `assistants/` and `dynamo_errors.py`, reached from `document_service.soft_delete_document` through a `try/except ImportError` that logs "boto3 is required" and returns `None` — so the worker's miss-eviction path silently no-opped rather than crashing
+- **scheduled-runs** omitted `errors.py`, `storage/` and `observability/`, reached from `sessions/metadata.py`
+
+### Test Coverage
+216 lines in `test_lambda_image_imports.py`, which walks each image's real import graph from its handler entrypoints and fails on anything not COPYed. It deliberately does **not** distinguish module-level imports from function-local ones — `handler.py` reaches `status.py` via a function-local import, so a module-level-only check would pass the very bug this fixes. It also resolves bare module names against each image's flattened COPY root, without which the walk never enters `status.py` at all.
+
+---
+
+## A CI guard for the GSI limit that took prod down
+
+Release 1.12.0 added two GSIs to the existing `{prefix}-rag-assistants` table in a single CloudFormation update. DynamoDB's `UpdateTable` API permits exactly one GSI creation or deletion per call, so the update failed and CloudFormation rolled back every other resource in the deploy with it — including a brand-new audit-log table. `backend.yml` and `frontend-deploy.yml` succeeded independently, leaving production running new code against old infrastructure with the agent store returning 500. Recovery took two more patch releases.
+
+Dev could not have caught it. The two indexes reached `develop` in separate merges, so dev got a platform deploy for each and never saw them collapse into one update. Only an environment that jumps a whole release at once is exposed — which means no amount of soak time would have surfaced it.
+
+The limit applies to `UpdateTable` only; `CreateTable` accepts any number of indexes, which is why the new audit-log table's two GSIs were never the problem. The right question is therefore *"does any **existing** table gain more than one GSI?"*, not *"are there new indexes?"*.
+
+- `infrastructure/gsi-inventory.json` — a committed, synth-generated inventory of every DynamoDB table and its indexes
+- `infrastructure/test/gsi-update-limit.test.ts` — synthesizes `PlatformStack` and fails if the committed inventory has drifted from the CDK code, so the inventory can never go stale silently. Regenerate with `UPDATE_GSI_INVENTORY=1 npx jest gsi-update-limit`
+- `scripts/release/check-gsi-update-limit.mjs` — dependency-free diff of the inventory between `origin/main` and the PR. Exempts tables present only on the branch (`CreateTable`) and tables dropped entirely (`DeleteTable`); counts creations and deletions together, since the API limit is one GSI *operation* per update, not one addition
+- `.github/workflows/gsi-update-limit.yml` — runs on PRs into `main` only. Diffs two committed JSON files: no `npm install`, no CDK synth, a couple of seconds
+
+Verified by replaying the real incident: the 1.12.0 inventory delta fails the check naming both indexes, the 1.12.1/1.12.2 split passes, and the new audit-log table is correctly exempt.
+
+> **Note for this release only:** the automated check reports **SKIPPED**, because `main` has no `gsi-inventory.json` to diff against until this release lands. The prerequisite was verified by hand instead — there are **zero** `infrastructure/lib/` changes in this release, so no table gains or loses any index. From 1.13.1 onward the check runs for real.
+
+---
+
+## Bug fixes
+
+- **The submit dialog showed authors the wrong category.** The listing's category was preselected into `category()`, but the select rendered `Administration` — the first option — so an author updating a `Student Support` listing saw a shelf they never chose, reading as though submitting had moved it. The cause is `[value]` on the `<select>`: the whole form sits behind `@if (loading())`, so the select and its options render in one pass, and Angular applies an element's own bindings before creating its children. `select.value` was set while the select still had no options, the browser dropped it, and the first option won. Binding `[selected]` on the options cannot lose that race. Display-only — `category()` held the right value throughout, so submissions always sent the correct shelf. The hazard ran the other way: an author who *wanted* `Administration`, saw it already selected, and submitted something else. Pre-existing but only reachable from `changes_requested` and `taken_down` until this release made updating a live listing the common path (#828)
+- **The agent store and admin problem-report queue no longer return 500 when a GSI is absent.** An absent index is a legitimate transient deploy state, not a programming error — CloudFormation reports success while a GSI is still `CREATING`, deploys can roll back, and `platform.yml` and `backend.yml` are separate workflows that can land out of order. All three converged on 2026-08-01, and the agent store returned 500 to every user for the two releases it took to repair the infrastructure — in the release that opened the store's navigation to GA. Both reads now catch the missing-index case specifically, log at WARNING with the index name, and return an empty result with no cursor. The match is narrow on purpose: catching every `ValidationException` would hide malformed key conditions and bad cursors behind a permanently empty surface, and catching every `ClientError` would turn throttling into "there is nothing here". `DueSyncIndex` on the KB-sync dispatcher is deliberately left loud — a background sweep that silently returns nothing means scheduled syncs stop with only a warning. Writes and admin mutations are untouched and still fail loudly (#822)
+- **Deleting a taken-down Agent no longer requires a round trip through the review queue.** `delete_assistant` refuses every listing state but `private` and told the author of a taken-down Agent to "take it back to private first" — advice for a door that did not exist. The only route out was to resubmit for review and withdraw a moment later: a junk entry in the admin queue as the price of a delete. The edge is added rather than the refusal reworded, because the audit-grounds justification never held — `taken_down → in_review → private` was always walkable by the author alone. Safe in the direction that matters: `is_on_shelf` hardcodes `taken_down` to `False`, so this can never route to `withdrawal_requested` or pull something off a shelf it is not on, and approval is still the only door into the store (#824)
+- **`heroBookmark` had nothing to resolve to** on the Pinned page's empty state — `pinned.page.ts` imported `provideIcons` and `heroBookmark` and called neither, and the SPA registers icons per-component with no root-level registration (#815)
+
+---
+
+## The agent launch card, simplified
+
+The card is read at the moment of typing, and two of its blocks were restating things the user had already been told on the way in: the capability chips duplicated the detail page's "what it can access", and "Ready to run for you." was a green line announcing that nothing happened. Both are gone, along with `capabilities` on the view model — the projection was its only writer.
+
+Only the blocked half survives. "You can't run this and here is what's missing" is news a user can act on; "this works" is not. The footer bar now renders only for a blocked verdict or the Agent details link, so a healthy private Agent has no footer at all.
+
+Attribution reads "By &lt;name&gt;" rather than a bare name, which under a description read as a caption instead of an author. The name carries the weight and "By" stays muted, so the eye lands on who made it. A verified publisher keeps its treatment and still outranks `ownerName` outright — on a published departmental Agent the name to trust is the department, not whoever holds the record. The "By" is dropped when there is no name at all, so a category-only Agent never renders a dangling preposition (#825)
+
+---
+
+## 🔒 Security
+
+Ten `py/log-injection` findings CodeQL raised against the 1.12.0 delta are closed, plus three adjacent findings that turned out to be real defects rather than dead code (the missing icon registration and the `_ROLE_GATED_KINDS` drift above).
+
+`scrub_log` (`apis/shared/security/log_sanitize.py`) already existed and was used in six files; the marketplace, audit and role-pin code shipped without adopting it. Path parameters — `agent_id`, `role_id`, `target_id`, `report_id`, `actor_user_id` — and exception text now pass through it before reaching a log message. A percent-encoded `%0A` in a path segment survives URL decoding, and most of these sites sit in `except` blocks where the value was never validated, so a forged log line was reachable.
+
+Scope note: only the message f-strings are scrubbed, not the `extra={...}` structured fields CodeQL also flags. `logging.basicConfig` formats records as `%(asctime)s - %(name)s - %(levelname)s - %(message)s`, so `extra` is never rendered — scrubbing it would corrupt the stored value for any future handler that *does* read it, and buy nothing against injection. `tool_filter.py` had the flagged warning twice in two near-identical methods and CodeQL reported one; both are fixed, since leaving the other would be arbitrary (#815)
+
+---
+
+## 🚀 Deployment notes
+
+1. **`backend.yml`** — required. Ships app-api, inference-api, rag-ingestion, kb-sync (dispatcher + worker) and scheduled-runs. The three Dockerfile closure fixes only take effect once these images are rebuilt and the Lambda code is updated.
+2. **`frontend-deploy.yml`** — required, for the submit/share dialogs, the listing status badge, the launch card and the Pinned page icon.
+3. **`platform.yml`** — **not required.** There are no `infrastructure/lib/` changes in this release.
+
+**What to watch after the deploy:**
+
+- **Document ingestion and KB sync recover on their own.** Documents stuck at `uploading` were never ingested; re-upload or re-trigger a sync for anything staged during the outage window (dev from ~2026-07-27, prod from 2026-08-01 18:46 UTC). No data was lost — the crawler staged its markdown correctly throughout; only the handler never ran.
+- **Expect microVM count and cost to drop sharply, and expect more cold starts.** Sessions idle for 900 seconds are now reaped instead of held for 8 hours, which shrinks the pool of warm microVMs. A user returning after 15 minutes gets a cold start where they previously landed on a warm instance.
+  **Conversation history survives a reap.** It is restored from AgentCore Memory at agent init, on a cold container as readily as a warm one: the SDK takes its RESTORE branch whenever `read_session()` and `read_agent()` both resolve, which they do because `persistence_mode` defaults to `FULL` and `agent_id` is always Strands' default. Those reads are `list_events` calls keyed on memory/actor/session and carry no in-process state, so restore does not depend on the agent cache surviving. The `Restore @init: N message(s)` line in the runtime log group reports what each init actually loaded — a useful one-query check if this is ever in doubt.
+  The real cost of a reap is therefore container init latency plus a fresh Bedrock prompt-cache write, since a cold restore re-serializes history through the sanitizers and pairing repair while the warm path only appends. At a 900-second idle gap the prompt cache has almost certainly expired regardless.
+
+---
+
+# Release Notes — v1.12.3
+
+**Release Date:** August 1, 2026
+**Previous Release:** v1.12.2 (August 1, 2026)
+
+---
+
+> 🖥️ **Frontend only** — run `frontend-deploy.yml`. No CDK deploy, no backend change, no configuration change, no data migration.
+
+---
+
+## Highlights
+
+Removes a spurious error dialog that appeared on **every page load for every user** in any environment where Memory Spaces is turned off — which today means production.
+
+The underlying 404 was correct and intentional. Memory Spaces is deliberately hidden in production, and the way it hides is by returning 404 across its whole API surface, so the feature can be switched off without being torn out. The app already understood that: it read the 404 as "feature unavailable" and quietly dropped the sidebar entry. What it did not do was tell the global error handler to stay quiet, so the feature hid itself and then popped a dialog naming an endpoint nobody was meant to see.
+
+Nothing about the feature's availability changes. Memory Spaces remains off in production.
+
+## Fixed
+
+- **No more `404 /memory/spaces` dialog.** `SUPPRESS_ERROR_TOAST` is now set on every Memory Spaces request. Genuine failures still surface — they always went through `MemorySpaceService`'s own error state, which the Memory Spaces pages render inline and in context; the generic dialog was a duplicate of that even when the feature was on (#819)
+
+## Why it appeared now
+
+The switch that hides Memory Spaces in production is applied at **deploy** time, and 1.12.0's CDK deploy rolled back. The first deploy to actually carry it into production was 1.12.1. So the dialog is not a regression in 1.12.2 — it is the first time the production kill switch has been live, and this is the rough edge it exposed.
+
+## Verification note
+
+This fix is invisible in any environment where Memory Spaces is **enabled**, including dev, because nothing 404s there. It is covered by unit tests that pin the interceptor contract directly rather than by a manual check.
+
+---
+
+# Release Notes — v1.12.2
+
+**Release Date:** August 1, 2026
+**Previous Release:** v1.12.1 (August 1, 2026)
+
+---
+
+> 🏗️ **CDK deploy required** — `platform.yml` only, and **only after 1.12.1's `AgentDirectoryIndex` reports `ACTIVE`**. Deploying before that reproduces the 1.12.0 failure exactly. Backend and frontend are unchanged from 1.12.0.
+
+---
+
+## What this release does
+
+Completes the deploy 1.12.1 split in half. It restores `AgentReportsIndex` — the GSI backing the admin problem-report queue — which 1.12.1 deferred so that release could add a single index and satisfy DynamoDB's one-GSI-per-`UpdateTable` limit.
+
+The index definition is unchanged. This is the byte-for-byte inverse of 1.12.1's removal, so the construct returns to matching `develop` exactly and the two branches stop diverging.
+
+**The admin problem-report queue works again.** It had been returning 500 since 1.12.0, because the code that reads the index shipped while the deploy that would have created it rolled back. Reports users submitted during the gap were written normally and none were lost — only the admin view that reads them was unavailable.
+
+## Before deploying
+
+Confirm 1.12.1's index finished backfilling. CloudFormation reports success while an index is still `CREATING`, and starting this deploy against a `CREATING` index puts two index operations in flight and fails the same way 1.12.0 did:
+
+```bash
+aws dynamodb describe-table \
+  --table-name {prefix}-rag-assistants \
+  --query 'Table.GlobalSecondaryIndexes[].{Name:IndexName,Status:IndexStatus}' \
+  --output table
+```
+
+Five indexes, all `ACTIVE`, `AgentDirectoryIndex` among them. Then run `platform.yml`. Afterwards the table should read six.
+
+Nothing else to run. No data migration.
+
+## Note for operators
+
+The 1.12.0 → 1.12.1 → 1.12.2 sequence exists because **1.12.0 added two GSIs to an existing table in one CloudFormation update**. `UpdateTable` permits exactly one GSI create or delete per call. `CreateTable` has no such limit, which is why a brand-new table with several indexes deploys without trouble.
+
+The trap is that this is invisible in any environment that took the changes incrementally. Both indexes reached `develop` in separate merges and so got a deploy each; only an environment jumping a whole release at once sees them collapse into a single update. When cutting a release, the question to ask is not "are there new indexes?" but **"does any *existing* table gain more than one?"** — and if so, split the deploy before merging rather than after a rollback.
+
+---
+
+# Release Notes — v1.12.1
+
+**Release Date:** August 1, 2026
+**Previous Release:** v1.12.0 (August 1, 2026)
+
+---
+
+> 🏗️ **CDK deploy required** — this release exists to make 1.12.0's CDK deploy land. Deploy `platform.yml` only; the backend and frontend are unchanged from 1.12.0 and already shipped. **A second deploy follows in 1.12.2** — see below.
+
+---
+
+## What happened
+
+1.12.0's `platform.yml` deploy failed and rolled the PlatformStack back. The `backend.yml` and `frontend-deploy.yml` deploys both succeeded, so production spent the gap running 1.12.0 code on 1.11.1 infrastructure — the agent store returning 500 on a `AgentDirectoryIndex` that did not exist yet.
+
+The cause: 1.12.0 adds **two** GSIs to the existing assistants table in a single CloudFormation update — `AgentDirectoryIndex` for the marketplace store and `AgentReportsIndex` for the problem-report queue. DynamoDB's `UpdateTable` permits exactly one GSI create or delete per call, so CloudFormation failed on that resource and rolled back everything else with it, including the new audit-log table.
+
+The 1.12.0 deploy note called for one new GSI. There were two. They arrived on `develop` in separate merges and so got a platform deploy each, which is why no non-production environment ever saw the limit — only an environment jumping the whole release at once does.
+
+The restriction applies to `UpdateTable` alone. `CreateTable` accepts as many indexes as you like, which is why the brand-new audit-log table's two GSIs were never the problem.
+
+## What this release does
+
+Defers `AgentReportsIndex` so the deploy carries a single GSI addition. Nothing else changes — no application code, and the index definition itself is untouched.
+
+This deploy also re-applies everything the rollback reverted: the `audit-log` table and its app-api wiring, the optional token-exchange secret, and the Gateway construct changes. **The agent store recovers here.**
+
+## Deploying
+
+Run `platform.yml`. Then wait for the index to finish backfilling before deploying 1.12.2 — CloudFormation reports success while the index is still `CREATING`:
+
+```bash
+aws dynamodb describe-table \
+  --table-name {prefix}-rag-assistants \
+  --query 'Table.GlobalSecondaryIndexes[].{Name:IndexName,Status:IndexStatus}' \
+  --output table
+```
+
+Every index should read `ACTIVE`, `AgentDirectoryIndex` among them. On a table of a few thousand agents this takes a couple of minutes.
+
+Nothing else to run: `backend.yml` and `frontend-deploy.yml` are unchanged from 1.12.0. No data migration.
+
+## Known issue
+
+The **admin problem-report queue returns 500** until 1.12.2 deploys, since it queries the deferred index. User-submitted reports are still written and are not lost — only the admin queue that reads them is unavailable.
+
+Nothing else regresses. Audit writes fail open by design: `AuditService` checks for the table environment variable and falls back to structured logs, so no administrative mutation fails while the table is absent.
+
+---
+
+# Release Notes — v1.12.0
+
+**Release Date:** August 1, 2026
+**Previous Release:** v1.11.1 (July 24, 2026)
+
+---
+
+> 🏗️ **CDK deploy required this release** — one new DynamoDB table (`{prefix}-audit-log`), one new GSI on the assistants table (`AgentDirectoryIndex`), and an optional Secrets Manager secret. Deploy order is `platform.yml` → `backend.yml` → `frontend-deploy.yml`. **Wait for the new GSI to reach `ACTIVE` before shipping the backend** — CloudFormation reports success while the index is still backfilling, and the marketplace store queries it. No data migration.
+
+---
+
+## Highlights
+
+This release turns Agents from a personal authoring tool into a **governed institutional catalog**.
+
+The **Agent Marketplace** ships GA. An author submits their Agent from the Designer, an admin reviews and approves it, and it appears on a browsable store with categories, a curated front, icons and problem reports. Approval means something durable now: every submission freezes an **immutable version snapshot**, and both the store and the invocation path serve *that* snapshot — so an author editing after approval can no longer silently change what the institution is running. Admins can roll a listing back to any earlier approved version, see a diff of exactly what a submission changed, and read `publishedVersion` to know exactly which snapshot the store is serving.
+
+Governance grew to match. **Delegated admin scopes** let a system admin hand out a single admin area — Cost Analytics, Tools, Marketplace — without handing over the whole console, across 16 scopes with three (`admin.roles`, `admin.auth_providers`, `admin.audit`) permanently non-delegable and no wildcard on the axis. Every role mutation, including denied ones, now lands in a durable **audit trail** with its own admin page.
+
+Two integration paths open up for forks and downstream teams. An AgentCore Gateway can authenticate inbound calls with a **Cognito JWT** instead of SigV4, so Gateway targets can act per-user. And the agent can perform an **RFC 8693 token exchange**, trading the signed-in user's token for one issued by a token service the organization already runs — letting existing internal APIs serve agent traffic as the user with no change on their side.
+
+The Assistant → Agent rename completes: the Assistant editor is retired and `/assistants` becomes an explainer. **Action required:** a CDK deploy, and forks running SigV4 Gateway callers should read the breaking-change note before touching `CDK_GATEWAY_INBOUND_AUTH` — a Gateway's authorizer is immutable after creation.
+
+---
+
+## Agent Marketplace
+
+Agents can now be published to an institution-wide store, reviewed by an admin, and discovered by everyone else. Previously an Agent was reachable only by its author and whoever they shared a link with; there was no catalog, no review, and no way for an admin to know what was in circulation.
+
+### Backend
+
+- `apis/shared/assistants/listing.py`, `listing_repository.py`, `storefront.py`, `categories.py`, `publishers.py`, `reports.py` — the listing lifecycle (draft → submitted → approved → published → withdrawn/taken down), category and publisher records, and the storefront composition.
+- `apis/app_api/agent_designer/services/` — `listing_service.py` (submit + preflight), `store_service.py` (browse), `agent_detail.py`, `icon_service.py`, `pin_service.py`, `role_pin_service.py`, `report_service.py`.
+- `apis/app_api/admin/agents/routes.py` — the admin surface: review queues, listings, categories, publishers, store front, reports, takedown, rollback, withdrawal decisions.
+- **Runnability** is checked before a listing is offered: an Agent whose bound model, tool, skill or memory space is missing is `blocked`, and the reviewer is told when a listed Agent is unopenable rather than discovering it after publication.
+- **Icons** (`apis/shared/assistants/icons.py`) — bytes live in S3 under a content-addressed key `assistants/{agent_id}/icons/{sha256[:16]}.{png|jpg}`; the digest doubles as the ETag and the `?v=` cache version, so icons cache `immutable` and still change on upload. Uploads are format-sniffed (the `Content-Type` header is ignored) and **always re-encoded**, which strips EXIF — an author uploading a phone photo would otherwise publish its GPS coordinates institution-wide.
+- **`@`-mention** (`apis/inference_api/chat/agent_binding_policy.py`) — mentioning an Agent from the composer hands it exactly one turn. Mention turns deliberately skip *both* halves of conversation binding: they neither validate against the session's bound Agent nor persist a new binding, so mentioning inside an existing thread is the normal case and the next unmentioned message is plain chat again. Binding is never authorization — the Agent is still resolved through `get_assistant_with_access_check` on every turn.
+
+### Frontend
+
+- `agents/discover/discover.page.ts` — the storefront-style browse page, with `agent-store-tile`, `agent-spotlight` and category filtering.
+- `agents/detail/agent-detail.page.ts` — the public Agent page, gated on runnability, with the instructions disclosure gate.
+- `agents/pinned/pinned.page.ts` plus `agent-pin.service.ts` — user pins, seeded from role defaults that resolve live rather than being copied.
+- `agents/components/submit-listing-dialog.component.ts` — the author's submit flow, with a preflight that names every blocker (including visibility) before submission and lets the author go public inline.
+- `agents/components/share-agent-dialog.component.ts` — one surface for an Agent's reach: visibility, collaborators and listing state together.
+- `session/components/chat-input/agent-mention-menu.component.ts` — the composer's `@`-mention picker.
+- `admin/marketplace/` — Review queue, Listings, Categories, Default pins, Store front, Publishers and Reports pages, with dialogs for takedown, request-changes, rollback, withdrawal decisions and report resolution.
+
+### Infrastructure
+
+- New sparse `AgentDirectoryIndex` GSI (`GSI5_PK`/`GSI5_SK`, ALL projection) on `{prefix}-rag-assistants` — only listed Agents carry the keys, so unlisted Agents cost nothing.
+- New CDK config `agentMarketplace.enabled` → `AGENT_MARKETPLACE_ENABLED` on **app-api only**; the marketplace adds no inference-api routes, because publication is a catalog concern.
+
+### A note on the GA gate
+
+The store shipped behind an `@if (showAgents() && isAdmin())` nav condition, which turned out to be the *only* closed door: `/agents/discover`, agent detail pages, the composer `@`-mention menu and role-seeded pins were all already reachable by any authenticated user. That interim state was worse than either end state, so the nav gate is now the feature flag alone. There is no RBAC capability on this axis — a capability id cannot be granted from the admin roles UI (the same defect that made the short-lived `skills` and `scheduled-runs` gates inoperable), so shipping one would have meant a gate nobody could open.
+
+---
+
+## Immutable Agent Version Snapshots
+
+Approval now freezes what it approved. Before this, an admin approved an Agent and the author could edit its instructions, swap its model or add tools the next minute — users would silently get the new behavior under the old approval. Now every submission captures an `AgentVersion`, and both the store and the invocation path serve the *approved snapshot*, not the author's working draft.
+
+### Backend
+
+- `apis/shared/assistants/versions.py`, `version_repository.py` — `VERSION#` child rows under the Agent's own partition, capturing instructions, model, tool/skill/memory bindings.
+- `apis/shared/assistants/version_resolution.py` — resolves which version a given caller should run.
+- `apis/shared/assistants/version_diff.py` — computes the delta between the last approved snapshot and the submission under review.
+- Rollback and roll-forward: an admin can point a published listing at any earlier approved version.
+- **Drift detection was removed, not extended.** The post-approval drift marker (#757) hashed `assistant.instructions` and nothing else — it could not see a model swap, a tool change or a retargeted memory space, and its weak `edited` fallback reported an admin's own typo fix as a behavior change. Snapshots made the question moot: a published Agent is an immutable snapshot the author cannot reach, so `listing.publishedVersion` answers "is what I approved still what is live?" as a fact rather than a heuristic. `_instructions_hash` and `_drift` are deleted rather than left dormant.
+  - **Transitional detail:** `AgentListing` is `extra="allow"`, so a listing approved *before* the removal still carries `approvedInstructionsHash` in DynamoDB. Nothing writes it, and it is explicitly stripped from responses for viewers who lack instructions permission — a hash of the instructions would confirm a guessed prompt. Safe to delete from stored rows once none carry it.
+
+### Frontend
+
+- `admin/marketplace/components/review-diff.component.ts` — the reviewer sees exactly what changed, so approval is a decision about a delta rather than a re-read of the whole Agent.
+- `admin/marketplace/components/rollback-dialog.component.ts` and the version picker on the admin Listings page.
+- `agents/components/listing-status.component.ts` — the author's view of listing state and which version is published.
+
+### Withdrawal became a request
+
+An author asks for a listing to be withdrawn rather than unilaterally unpublishing; an admin decides, the withdrawal's origin is recorded, and `delete` respects a pending request instead of racing it.
+
+---
+
+## Delegated Admin Scopes
+
+A system admin can now hand out one admin area at a time. Previously the admin console was all-or-nothing: the only way to let someone manage the tool catalog was to make them a full system admin.
+
+### Backend
+
+- `apis/shared/rbac/admin_scopes.py` — a **closed registry** of 16 scopes (`admin.costs`, `admin.quota`, `admin.fine_tuning`, `admin.models`, `admin.tools`, `admin.skills`, `admin.connectors`, `admin.file_sources`, `admin.export_targets`, `admin.marketplace`, `admin.users`, `admin.system_prompts`, `admin.user_menu_links`, `admin.roles`, `admin.auth_providers`, `admin.audit`), grouped to mirror the admin nav.
+- Scopes are defined in code, never derived from a catalog and never free text — a deliberate response to the `skills`/`scheduled-runs` capability gates, which could not be granted from the roles UI at all and were therefore inoperable.
+- **Three scopes are permanently non-delegable.** `admin.roles` is self-evident: whoever can edit a role can grant themselves anything. `admin.auth_providers` is the non-obvious one — role resolution starts from JWT claims, so whoever controls IdP attribute mapping controls which AppRoles resolve; it is role administration by another route. `admin.audit` records the actions the other two take. Enforced at the service layer by `role_constraints.validate_admin_scopes`, so the rule holds for the REST API, seed scripts and future automation alike.
+- **There is deliberately no wildcard.** `"*"` is the idiom on the tool, model and skill axes; here it would be shorthand for turning a role into a superuser. Full admin is spelled `system_admin`.
+- New `grantedAdminScopes` axis on `AppRole`, enforced on admin routes and exposed over the API.
+
+### Frontend
+
+- `auth/admin-scope.guard.ts` and `admin/admin-scope.model.ts` — the admin console nav and routes gate on resolved scopes.
+- The roles form renders real checkboxes from the served registry, grouped exactly as an admin already navigates the console.
+- The roles list shows which roles carry delegated admin power, so it is visible at a glance rather than buried in a detail page.
+
+---
+
+## Administrative Audit Trail
+
+Role mutations are now durably recorded. An admin can answer "who changed this role, when, and what did they change" — including attempts that were denied.
+
+### Backend
+
+- `apis/shared/audit/` — `models.py` (`AuditAction`, `AuditOutcome`, `AuditRecord`), `repository.py`, `service.py`.
+- Recorded actions: `app_role.created`, `app_role.updated`, `app_role.deleted`, `app_role.synced`, and `app_role.mutation_denied` — denied attempts matter as much as successful ones.
+- `apis/app_api/admin/audit/routes.py` — month-scoped browsing, per-actor lookup, and an action registry.
+
+### Frontend
+
+- `admin/audit/pages/audit-log.page.ts` — the audit page, with month navigation. The empty state is gated on a *successful* read, so a failed load no longer renders "Nothing recorded in <month>" underneath its own error banner and tells an admin a month is empty when nobody knows that.
+
+### Infrastructure
+
+- New `{prefix}-audit-log` DynamoDB table: `PK`/`SK`, `ActorIndex` (`GSI1PK`/`GSI1SK`) and `RecentIndex` (`GSI2PK`/`GSI2SK`) both ALL-projected, PITR enabled, AWS-managed encryption, TTL on `expiresAt`. Name published to `/{prefix}/audit/audit-log-table-name`.
+
+---
+
+## AgentCore Gateway JWT Inbound Auth
+
+A Gateway can now authenticate inbound calls with a Cognito JWT instead of SigV4, so Gateway targets can act as the signed-in user rather than behind a single service identity.
+
+- `config.gateway.inboundAuth` (`'iam' | 'jwt'`, default `iam`) selects the Gateway's single inbound authorizer, driven by `CDK_GATEWAY_INBOUND_AUTH`.
+- The agent forwards the signed-in user's token to a JWT Gateway.
+- Outbound credentials stay per-target, so one Gateway still serves both IAM-invoked Lambda targets and OAuth targets.
+
+### ⚠️ The authorizer is immutable after creation
+
+Changing `inboundAuth` on an **existing** Gateway does not work. The AgentCore control plane rejects it mid-deploy:
+
+```
+Authorizer type cannot be updated for an existing gateway
+(Service: BedrockAgentCoreControl, Status Code: 400)
+```
+
+This is invisible to every pre-deploy check available. The CloudFormation resource reference documents `AuthorizerType` as "Update requires: No interruption", and `cdk diff` — even through a real change set — reports an in-place `[~]` modify. Both describe CloudFormation's plan, not the service's validation. **A change set is not a deploy test.**
+
+The default therefore stays `iam`, matching every Gateway already deployed. Moving an existing deployment to `jwt` requires a *new* Gateway plus target re-registration and a cutover, not a config flip. `load-env.sh` validates the value so a typo fails the deploy rather than silently falling back.
+
+**Forks:** a Gateway accepts exactly one authorizer type — there is no "accept either SigV4 or JWT" mode. If anything other than this stack's agent calls your Gateway with SigV4, migrate those callers before creating a JWT Gateway.
+
+---
+
+## RFC 8693 Token Exchange
+
+The agent can trade the signed-in user's Cognito access token for a token issued by a token service the organization already runs, so **existing internal APIs can serve agent traffic as the user without being modified**.
+
+- `agents/main_agent/integrations/token_exchange.py` — performs the exchange and forwards the result to the MCP server exactly as `forward_auth_token` does with a raw token. Exchanged tokens are cached per `(user, audience)` and reused until shortly before expiry; the cache holds credentials, so entries are never shared across users.
+- **Why not the Gateway:** AgentCore Gateway's outbound OAuth credential provider supports only `CLIENT_CREDENTIALS` and `AUTHORIZATION_CODE` — verified against the `bedrock-agentcore-control` API model, where `OAuthGrantType` has exactly those two values and `TOKEN_EXCHANGE` appears nowhere. A token-exchange grant is not expressible there. Separately, a Gateway with `AWS_IAM` inbound auth never receives the user's token, so it would have nothing to exchange.
+- **Known limitation:** revocation does not propagate. The token service validates the subject token offline (signature, issuer, expiry, `token_use`, `client_id`) and never asks Cognito whether it is still live, so a Cognito token revoked before its expiry remains exchangeable. Exposure is bounded by the token service's own lifetime cap.
+
+### Infrastructure
+
+- New optional `{prefix}-token-exchange-client` Secrets Manager secret holding a `client_id → client_secret` map, **populated out of band** — CDK cannot generate a credential shared with an external system.
+- Entirely additive: leave `CDK_TOKEN_EXCHANGE_URL` unset and no resources, permissions or environment variables are created. A deployment that only ever uses SigV4 for MCP traffic is unaffected.
+
+---
+
+## The Assistant → Agent Rename Completes
+
+One noun in the nav. The Assistant editor is retired and `/assistants` is now an explainer page that tells first-time visitors where their work went, host-gated so a legacy site answers appropriately.
+
+- Assistant **records are untouched** — the Agent Designer reads and writes the same data. What disappeared is the old authoring surface (`assistants/assistant-form/`, `assistant-list`, `assistant-preview`), about 2,200 lines.
+- `agents/migration/agents-migration.page.ts` and `shared/utils/legacy-migration-host.ts` — the explainer and its host gating.
+- **The meaning of the `AGENTS_ENABLED` kill switch changed.** While both nouns shipped, turning it off degraded gracefully: the Agents nav disappeared and the Assistants editor was still there. There is nothing left to fall back to now — off means *no authoring surface at all*. Treat it as an outage switch, not a feature toggle. Records are untouched either way; the routes and pages are what disappear.
+
+---
+
+## 🐛 Bug fixes
+
+- **Chat was completely down on any deploy carrying the `@`-mention cost work.** Every turn returned an AgentCore 424 because the container 500'd before the model was reached: `StreamCoordinator.stream_response()` forwarded `turn_agent_id` from inside its own body but never accepted it as a parameter. `ChatAgent` passes the kwarg on *every* turn, not just mention turns, so this was a total outage rather than a mention-path bug — reproduced on dev with an Agent attached and with no Agent and zero tools alike (#771).
+- **A session's conversation forked when an `@`-mention ran.** The agent cache keys on *configuration*, so a mention builds a second `Agent`, each with its own `TurnBasedSessionManager`; both wrote the same DynamoDB session row and neither knew the other existed. The model answered "not in history" about messages the user could plainly see. Conversation history is now aliased across manager instances (#750).
+- **Compaction state moved backwards for the same structural reason** — `initialize()` never re-runs on an agent-cache hit, so state loaded once went stale. It is now re-read every turn. A clobbered checkpoint is a prompt-cache *cost* bug before it is a correctness one (#761).
+- **Timestamps were emitted as `2026-07-27T05:09:55.853557+00:00Z`** — an offset *and* a `Z`, which is not valid ISO 8601. `datetime.now(timezone.utc).isoformat()` already renders the offset; appending `"Z"` broke it. `new Date()` returns `Invalid Date`, and every SPA formatter fell back silently, so it read as missing data: the agent detail page showed "Last updated —" for an Agent edited minutes earlier, and admin Reports showed "recently" for every report ever filed. New `apis/shared/timestamps.py` plus SPA-side `iso-date.ts` (#772).
+- **Every API-key request was denied every model.** `/chat/api-converse` built its `User` with a hardcoded `roles=["user"]` placeholder; no AppRole maps that JWT role, so permission resolution matched nothing and fell back to `default`, which grants no models in production — 403 "Access denied to model" regardless of the caller's real grants. An API-key record stores only key id, user id and name, so the owner's roles are now read back from the Users table per request, along with email and name — which also stops quota tier and cost attribution being charged against a synthetic `{user_id}@api-key` identity (#796).
+- **~2,500 false "tool not found" warnings per day in production.** `ToolFilter` knew three tool classes (registry, gateway, external MCP) and warned on anything else. Context-bound tools are a fourth — they need request scope baked in at construction, so inference-api builds them per invocation and passes them as `extra_tools`, which `BaseAgent` appends *after* filtering. Every enabled one logged "not found in registry or catalog, skipping" and then worked fine (`create_artifact` 1,744, `analyze_spreadsheet` 1,690, `list_spreadsheets` 1,690 over 48h), drowning the one signal that branch exists to give: a genuinely stale tool id pinned in a saved session (#794).
+- **Cache-TTL classification used the wrong clock.** `classify_cache_status` measured the gap to the immediately-previous call row, which is wrong the moment two prefixes interleave in one session — exactly what an `@`-mention does. The entry a call could have hit belongs to the last call with the *same* prefix. Measured on dev: a plain turn 266s after a mention was booked as `miss_avoidable` waste, but the entry it needed was written 308s earlier, past the 300s TTL — the re-write was unavoidable. Three of six rows in that session were false positives (#754).
+- **The unopenable-Agent warning was unreadable where it mattered most.** It shipped inside the review card's identity column, competing for width with the agent name and the action buttons — measured at ~160px of a 528px card, wrapped across five lines. It now sits on its own full-width row beneath the decision, separated by a hairline rule. Structural only: no wording, logic or gating change, and Approve was never blocked on it. This is the signal standing between "approved" and a store tile that 404s for everyone but its author, so being on screen was not the same as being read (#776).
+- **The agent detail page never loaded its agent** — broken since marketplace phase 3, now covered by a load-path spec (#740, #742, #743).
+- Deleting an Agent left its entire `VERSION#` snapshot history in the table permanently — child rows live under the Agent's partition precisely so they never outlive what they concern (#792).
+- Four version-snapshot gaps found in end-to-end testing, plus the version picker becoming unreachable after a rollback and the reviewer not being told why a diff was missing (#799, #801).
+- The `limits` (degraded) runnability state is removed. It could never occur — it degraded only when a binding declared `config.optional == true`, a key read in exactly one place and written nowhere, with no API accepting it and no Designer control for it. Building toward it would also have contradicted the block-only binding model that `agent_binding_resolver` actually implements (#762).
+- The admin roles list shows which roles carry delegated admin power (#807).
+- A failed category change surfaces an error banner instead of failing silently (#795).
+- Dialogs dismiss on a backdrop click across the SPA, and the agent feedback dialog scrolls instead of clipping (#811).
+
+---
+
+## 🔒 Security
+
+- Backend security pins: `pillow` 12.2.0 → 12.3.0, new pins for `pyasn1` 0.6.4 and `soupsieve` 2.8.4 (#723).
+- Frontend and infrastructure transitive vulnerabilities patched by lockfile regeneration. `aws-cdk-lib` was bumped rather than overridden, because it **bundles its dependencies** — an npm `overrides` entry cannot reach a CVE inside the bundle (#723).
+- Docs site upgraded to Astro 7 to clear transitive advisories (#724).
+- Uploaded Agent icons are always re-encoded, stripping EXIF (including GPS) before an icon is published institution-wide (#735).
+
+---
+
+## ⚠️ Breaking changes
+
+| Change | Who is affected | What to do |
+|---|---|---|
+| Assistant editor retired; `/assistants` is now an explainer | Anyone linking directly to the old editor | Use the Agent Designer. Records are unchanged; `AGENTS_ENABLED=false` no longer falls back to the old editor — treat it as an outage switch |
+| Publishing requires PUBLIC visibility | Authors submitting a private Agent | Go public from the submit dialog (now inline; previously required a detour to settings) |
+| `limits` runnability state removed | API consumers reading `runnability` | Handle `ready` and `blocked` only |
+| Gateway authorizer is immutable | Forks setting `CDK_GATEWAY_INBOUND_AUTH=jwt` on an existing Gateway | Do not. It fails mid-deploy. Create a new Gateway and re-register targets |
+| A Gateway accepts one authorizer type | Forks with non-agent SigV4 Gateway callers | Migrate those callers before creating a JWT Gateway |
+
+---
+
+## 🏗️ Infrastructure
+
+| Resource | Detail |
+|---|---|
+| `{prefix}-audit-log` DynamoDB table | New. `PK`/`SK`; `ActorIndex` + `RecentIndex` GSIs (ALL projection); PITR on; TTL `expiresAt`; AWS-managed encryption. Name at `/{prefix}/audit/audit-log-table-name` |
+| `AgentDirectoryIndex` GSI | New, on `{prefix}-rag-assistants`. `GSI5_PK` = `LISTED#{category}`, `GSI5_SK` = `CREATED#{created_at}` (newest-first), ALL projection, **sparse** — only listed Agents carry the keys |
+| `{prefix}-token-exchange-client` secret | New, **optional**. Created only when `tokenExchange` is configured; populated out of band |
+| `AgentCoreGatewayConstruct` | Gains a `CUSTOM_JWT` inbound-authorizer path driven by `config.gateway.inboundAuth` |
+| CDK config | New `agentMarketplace.enabled`, `gateway.inboundAuth`, optional `tokenExchange.url` / `tokenExchange.clientId` |
+
+---
+
+## 🔧 CI/CD
+
+- `platform.yml` accepts three new repository variables: `CDK_GATEWAY_INBOUND_AUTH`, `CDK_TOKEN_EXCHANGE_URL`, `CDK_TOKEN_EXCHANGE_CLIENT_ID`. All three are safe to leave unset.
+- `load-env.sh` threads them into CDK context and **validates the authorizer value** (`iam` | `jwt`), so a typo fails the deploy instead of silently falling through to the `iam` default.
+- `test_non_admin_roles_get_403` no longer rebuilds the FastAPI admin app inside every Hypothesis example (~50ms × 100 across 130 routes against a 200ms deadline). It passed with no margin and failed as `DeadlineExceeded` under load, which reads as an auth regression rather than the timing artifact it was; adding any admin router made it likelier to trip (#808).
+- SPA test isolation: cross-file state leaks that made `ng test` flaky are fixed in `src/test-setup.ts` (#759).
+
+---
+
+## 📦 Dependencies
+
+| Component | Package | From | To |
+|---|---|---|---|
+| Backend | `pillow` | 12.2.0 | 12.3.0 |
+| Backend | `pyasn1` | — | 0.6.4 (new pin) |
+| Backend | `soupsieve` | — | 2.8.4 (new pin) |
+| Infrastructure | `aws-cdk-lib` | 2.260.0 | 2.262.0 |
+| Docs site | `astro` | 6.4.6 | 7.1.3 |
+| Docs site | `@astrojs/starlight` | 0.39.3 | 0.41.4 |
+| Docs site | `sharp` | 0.34.5 | 0.35.3 |
+
+---
+
+## 🚀 Deployment notes
+
+**A CDK deploy is required.** Order: `platform.yml` → `backend.yml` → `frontend-deploy.yml`.
+
+1. **Deploy `platform.yml` first and wait for the new GSI.** `AgentDirectoryIndex` on the assistants table backfills asynchronously — CloudFormation reports the stack green while the index is still `CREATING`, and the marketplace store queries it. Confirm `IndexStatus: ACTIVE` before shipping the backend:
+   ```bash
+   aws dynamodb describe-table --table-name {prefix}-rag-assistants \
+     --query 'Table.GlobalSecondaryIndexes[?IndexName==`AgentDirectoryIndex`].IndexStatus'
+   ```
+   Note that `platform.yml`, `backend.yml` and `frontend-deploy.yml` share a concurrency group, so a merge cannot be relied on to order them — run and verify platform before the rest.
+2. **Then `backend.yml`, then `frontend-deploy.yml`.**
+3. **No data migration.** Existing Agents keep working; they simply have no listing and no version snapshots until an author submits one.
+4. **Feature flags — all default ON, opt-out only. This is the GA moment.** An environment with no variable set gets the Agent store live for every authenticated user on this deploy, with an empty catalog until the first Agent is approved. If an environment should *not* get the store yet, set the variable **before** deploying — the flags are empty-string-safe, so an unset or blank GitHub Actions variable resolves to *enabled*, never to off.
+   - `AGENT_MARKETPLACE_ENABLED=false` (or `CDK_AGENT_MARKETPLACE_ENABLED=false`) disables the marketplace surface on app-api.
+   - `AGENTS_ENABLED=false` now removes the *only* authoring surface — see the rename section above before using it.
+   - Agent categories **self-seed on first read** (`categories.ensure_seeded`), so there is no per-environment seeding step and nothing to forget.
+5. **Gateway inbound auth — leave `CDK_GATEWAY_INBOUND_AUTH` unset** on every environment whose Gateway already exists. Setting it to `jwt` against a live `AWS_IAM` Gateway fails mid-deploy and cannot be fixed by a config change; it applies only to a newly created Gateway.
+6. **Token exchange is dormant by default.** Leave `CDK_TOKEN_EXCHANGE_URL` and `CDK_TOKEN_EXCHANGE_CLIENT_ID` unset unless the organization runs a token service with a token-exchange endpoint. If enabling: deploy, then populate the `{prefix}-token-exchange-client` secret out of band with the `client_id → client_secret` map.
+7. **Delegated admin scopes require no action.** Existing `system_admin` roles are unaffected; no role gains or loses access on deploy. Delegation is opt-in per role from the roles admin page.
+8. **The audit log starts empty** and fills from the first role mutation after deploy. It is not backfilled — there is no historical source to backfill from.
+
+---
+
 # Release Notes — v1.11.1
 
 **Release Date:** July 24, 2026

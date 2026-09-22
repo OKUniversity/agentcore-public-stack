@@ -1,11 +1,26 @@
 import * as cdk from 'aws-cdk-lib';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as sns from 'aws-cdk-lib/aws-sns';
 import { Construct } from 'constructs';
 
 import { AppConfig, getResourceName } from '../../config';
+import { AlarmFactory } from './alarm-factory';
 
 export interface PromptCacheObservabilityConstructProps {
   config: AppConfig;
+  alarmTopic?: sns.ITopic;
+  /**
+   * The log group the AgentCore Runtime actually writes to, from
+   * `InferenceAgentCoreConstruct.runtimeLogGroupName`.
+   *
+   * Must be passed, not derived: the group is service-created and named
+   * after the runtime *id* (AWS-assigned suffix), which is only knowable
+   * from the runtime resource. This construct previously guessed
+   * `/aws/bedrock-agentcore/runtimes/<prefix>` — a group nothing writes to,
+   * so both Logs Insights widgets below returned empty results and read as
+   * "no traffic" rather than "wrong query".
+   */
+  runtimeLogGroupName: string;
 }
 
 /**
@@ -28,11 +43,8 @@ export interface PromptCacheObservabilityConstructProps {
  * per-session drill-down counterpart is the cost-anatomy admin endpoint
  * (`GET /admin/costs/sessions/{id}/calls`).
  *
- * Alarms are console-only — no SNS topics exist in the stack yet (same
- * posture as kb-sync and scheduled-runs). They use NOT_BREACHING for
- * missing data because the `PROMPT_CACHE_OBSERVABILITY_ENABLED=false`
- * kill switch (or simply zero traffic) makes the metrics absent
- * entirely.
+ * NOT_BREACHING on missing data: the PROMPT_CACHE_OBSERVABILITY_ENABLED=false
+ * kill switch, or simply no traffic, makes the metrics absent entirely.
  */
 export class PromptCacheObservabilityConstruct extends Construct {
   constructor(
@@ -42,7 +54,7 @@ export class PromptCacheObservabilityConstruct extends Construct {
   ) {
     super(scope, id);
 
-    const { config } = props;
+    const { config, runtimeLogGroupName } = props;
 
     // Must match the default of EMF_NAMESPACE in emf.py.
     const namespace = 'AgentCoreStack/PromptCache';
@@ -68,11 +80,41 @@ export class PromptCacheObservabilityConstruct extends Construct {
       period: cdk.Duration.minutes(5),
     });
 
+    // A call that read a leading prefix segment and re-wrote the rest against
+    // a live cache entry. Its own metric rather than a roll-in to
+    // AvoidableMiss so the existing alarm keeps its meaning; its dollars are
+    // inside WastedUsd, with PartialMissUsd naming the subset.
+    const partialMissMetric = new cloudwatch.Metric({
+      namespace,
+      metricName: 'PartialMiss',
+      statistic: 'Sum',
+      period: cdk.Duration.minutes(5),
+    });
+
     const wastedUsdMetric = new cloudwatch.Metric({
       namespace,
       metricName: 'WastedUsd',
       statistic: 'Sum',
       period: cdk.Duration.minutes(5),
+    });
+
+    const partialMissUsdMetric = new cloudwatch.Metric({
+      namespace,
+      metricName: 'PartialMissUsd',
+      statistic: 'Sum',
+      period: cdk.Duration.minutes(5),
+    });
+
+    // One session's *cumulative* partial-miss waste, emitted after each
+    // rollup bump. Maximum (not Sum) over a long period is the point: the
+    // question is "is any single conversation over the line", which a fleet
+    // sum cannot answer — the motivating incident spent $27 over five days
+    // at ~$0.43 a turn without ever stepping a fleet-wide number.
+    const sessionPartialMissUsdMetric = new cloudwatch.Metric({
+      namespace,
+      metricName: 'SessionPartialMissUsd',
+      statistic: 'Maximum',
+      period: cdk.Duration.hours(24),
     });
 
     // Cache efficiency: fraction of cache traffic served from cache.
@@ -124,15 +166,24 @@ export class PromptCacheObservabilityConstruct extends Construct {
 
     dashboard.addWidgets(
       new cloudwatch.GraphWidget({
-        title: 'Avoidable Cache Misses',
-        left: [avoidableMissMetric],
+        title: 'Cache Misses (avoidable vs partial)',
+        left: [avoidableMissMetric, partialMissMetric],
         width: 12,
         height: 6,
       }),
       new cloudwatch.GraphWidget({
-        title: 'Wasted USD (avoidable re-writes)',
-        left: [wastedUsdMetric],
+        title: 'Wasted USD (total, and the partial-miss share)',
+        left: [wastedUsdMetric, partialMissUsdMetric],
         width: 12,
+        height: 6,
+      }),
+    );
+
+    dashboard.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: 'Worst single session — cumulative partial-miss waste (24h)',
+        left: [sessionPartialMissUsdMetric],
+        width: 24,
         height: 6,
       }),
     );
@@ -140,12 +191,11 @@ export class PromptCacheObservabilityConstruct extends Construct {
     dashboard.addWidgets(
       new cloudwatch.LogQueryWidget({
         title: 'Model Calls by cacheStatus (inference-api)',
-        // The runtime log group is defined by the inference-api
-        // construct with this deterministic name; referenced by name
-        // (not typed ref) since a dashboard widget creates no CFN
-        // dependency. app-api's ECS log group is auto-named, so its
-        // (much smaller) share of emissions isn't queried here.
-        logGroupNames: [`/aws/bedrock-agentcore/runtimes/${config.projectPrefix}`],
+        // Referenced by name (not a typed LogGroup ref) since a dashboard
+        // widget creates no CFN dependency. app-api's ECS log group is
+        // auto-named, so its (much smaller) share of emissions isn't
+        // queried here.
+        logGroupNames: [runtimeLogGroupName],
         queryLines: [
           'filter ispresent(cacheStatus)',
           'stats count(*) as calls by cacheStatus',
@@ -156,30 +206,63 @@ export class PromptCacheObservabilityConstruct extends Construct {
       }),
     );
 
+    dashboard.addWidgets(
+      new cloudwatch.LogQueryWidget({
+        title: 'Sessions by partial-miss waste (which session did the alarm mean?)',
+        logGroupNames: [runtimeLogGroupName],
+        // sessionId is a log property, not a metric dimension (unbounded
+        // cardinality), so the alarm says *that* a session crossed the line
+        // and this widget says *which*.
+        queryLines: [
+          'filter ispresent(SessionPartialMissUsd)',
+          'stats max(SessionPartialMissUsd) as wastedUsd, max(sessionPartialMissCount) as partialMisses by sessionId',
+          'sort wastedUsd desc',
+          'limit 20',
+        ],
+        width: 24,
+        height: 6,
+      }),
+    );
+
     // ============================================================
-    // Alarms (console-only; no SNS wiring yet)
+    // Alarms
     // ============================================================
+
+    const alarms = new AlarmFactory(this, config, props.alarmTopic);
 
     // AvoidableMiss is the nominated alarm target (see emf.py): a
     // prefix-stability regression flips a large share of calls to
     // `miss_avoidable`, showing up as a step change in this sum.
-    new cloudwatch.Alarm(this, 'PromptCacheAvoidableMissAlarm', {
-      alarmName: getResourceName(config, 'prompt-cache-avoidable-miss'),
+    alarms.alarm('PromptCacheAvoidableMissAlarm', {
+      name: 'prompt-cache-avoidable-miss',
       alarmDescription:
         'Avoidable prompt-cache misses exceeded threshold — likely a prompt-prefix stability regression',
       metric: avoidableMissMetric,
-      threshold: config.production ? 10 : 50,
+      threshold: config.observability.promptCacheAvoidableMissThreshold,
       evaluationPeriods: 3,
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
 
-    new cloudwatch.Alarm(this, 'PromptCacheWastedUsdAlarm', {
-      alarmName: getResourceName(config, 'prompt-cache-wasted-usd'),
+    // Maximum, not Sum: reads as "a session over the threshold was active in
+    // the last 24h". A fleet sum cannot see one conversation doing this (#833).
+    alarms.alarm('PromptCacheSessionPartialMissAlarm', {
+      name: 'prompt-cache-session-partial-miss',
       alarmDescription:
-        'Dollars wasted on avoidable prompt-cache re-writes exceeded threshold',
+        'A single session accumulated more than the configured partial-miss cache waste — one conversation is re-writing its prefix every turn (see the "Sessions by partial-miss waste" dashboard widget for which)',
+      metric: sessionPartialMissUsdMetric,
+      threshold: config.observability.promptCacheSessionWastedUsdThreshold,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    alarms.alarm('PromptCacheWastedUsdAlarm', {
+      name: 'prompt-cache-wasted-usd',
+      alarmDescription:
+        'Dollars wasted on prompt-cache re-writes of already-cached prefix bytes (avoidable + partial misses) exceeded threshold',
       metric: wastedUsdMetric,
-      threshold: config.production ? 1 : 5,
+      threshold: config.observability.promptCacheWastedUsdThreshold,
       evaluationPeriods: 3,
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,

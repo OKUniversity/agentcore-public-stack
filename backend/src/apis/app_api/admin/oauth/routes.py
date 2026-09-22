@@ -9,7 +9,6 @@ the callback URL that the admin must register with the vendor.
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Optional
 
@@ -18,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from apis.app_api.export_targets.registry import registry as export_target_registry
 from apis.app_api.file_sources.registry import registry
-from apis.shared.auth import User, require_admin
+from apis.shared.auth import User, require_admin_scope
 from apis.shared.oauth.agentcore_registrar import (
     AgentCoreRegistrar,
     CredentialProviderConflictError,
@@ -39,10 +38,16 @@ from apis.shared.oauth.provider_repository import (
     OAuthProviderRepository,
     get_provider_repository,
 )
+from apis.shared.timestamps import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/oauth-providers", tags=["admin-oauth"])
+
+# Every route in this package is guarded by this one scope, so the
+# permission boundary is the package boundary. Enforced by
+# tests/architecture/test_admin_scope_coverage.py.
+require_connectors_admin = require_admin_scope("admin.connectors")
 
 # Rollback backoff schedule. Two retries after the initial attempt, ~2.5s
 # total worst case — short enough to keep the create request responsive,
@@ -139,7 +144,7 @@ def _emit_orphan_metric(provider_id: str) -> None:
 @router.get("/", response_model=OAuthProviderListResponse)
 async def list_providers(
     enabled_only: bool = Query(False, description="Only return enabled providers"),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_connectors_admin),
     provider_repo: OAuthProviderRepository = Depends(get_provider_repository),
 ):
     """List all OAuth providers. Admin only."""
@@ -154,7 +159,7 @@ async def list_providers(
 @router.get("/{provider_id}", response_model=OAuthProviderResponse)
 async def get_provider(
     provider_id: str,
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_connectors_admin),
     provider_repo: OAuthProviderRepository = Depends(get_provider_repository),
 ):
     """Get a provider by ID. Admin only."""
@@ -172,7 +177,7 @@ async def get_provider(
 )
 async def create_provider(
     provider_data: OAuthProviderCreate,
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_connectors_admin),
     provider_repo: OAuthProviderRepository = Depends(get_provider_repository),
     registrar: AgentCoreRegistrar = Depends(get_agentcore_registrar),
 ):
@@ -252,7 +257,7 @@ async def create_provider(
 async def update_provider(
     provider_id: str,
     updates: OAuthProviderUpdate,
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_connectors_admin),
     provider_repo: OAuthProviderRepository = Depends(get_provider_repository),
     registrar: AgentCoreRegistrar = Depends(get_agentcore_registrar),
 ):
@@ -280,13 +285,32 @@ async def update_provider(
     )
 
     rotating_credentials = bool(updates.client_id and updates.client_secret)
+    # Only a *different* value counts as a discovery change. Clients that
+    # round-trip the whole record (the connector edit form does) resend the
+    # unchanged discovery URL on every save; treating any non-None value as
+    # a change would make metadata-only edits — scopes, display name, icon,
+    # enabled — impossible for a discovery-URL provider, because the admin
+    # cannot satisfy the rotation requirement (AgentCore never echoes the
+    # client secret back, so there is nothing to re-enter).
     changing_discovery = (
         updates.oauth_discovery_url is not None
-        or updates.authorization_server_metadata is not None
+        and updates.oauth_discovery_url != existing.oauth_discovery_url
+    ) or (
+        updates.authorization_server_metadata is not None
+        and updates.authorization_server_metadata
+        != existing.authorization_server_metadata
     )
 
     credential_info: CredentialProviderInfo | None = None
     if rotating_credentials or changing_discovery:
+        if not rotating_credentials:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Discovery config can only be updated together with a "
+                    "credential rotation (client_id + client_secret)."
+                ),
+            )
         discovery_url = (
             updates.oauth_discovery_url
             if updates.oauth_discovery_url is not None
@@ -297,14 +321,6 @@ async def update_provider(
             if updates.authorization_server_metadata is not None
             else existing.authorization_server_metadata
         )
-        if not rotating_credentials:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    "Discovery config can only be updated together with a "
-                    "credential rotation (client_id + client_secret)."
-                ),
-            )
         try:
             credential_info = registrar.update_credential_provider(
                 provider_id=provider_id,
@@ -338,7 +354,7 @@ async def update_provider(
     if credential_info is not None:
         provider.credential_provider_arn = credential_info.credential_provider_arn
         provider.callback_url = credential_info.callback_url
-        provider.updated_at = datetime.now(timezone.utc).isoformat() + "Z"
+        provider.updated_at = utc_now_iso()
         await provider_repo.put_provider(provider)
 
     return OAuthProviderResponse.from_provider(provider)
@@ -347,7 +363,7 @@ async def update_provider(
 @router.delete("/{provider_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_provider(
     provider_id: str,
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_connectors_admin),
     provider_repo: OAuthProviderRepository = Depends(get_provider_repository),
     registrar: AgentCoreRegistrar = Depends(get_agentcore_registrar),
 ):
@@ -434,7 +450,7 @@ def _validate_export_target_adapter(
 def _build_provider_from_create(
     data: OAuthProviderCreate, credential_info: CredentialProviderInfo
 ) -> OAuthProvider:
-    now = datetime.now(timezone.utc).isoformat() + "Z"
+    now = utc_now_iso()
     return OAuthProvider(
         provider_id=data.provider_id,
         display_name=data.display_name,

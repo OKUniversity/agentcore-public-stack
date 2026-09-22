@@ -11,6 +11,7 @@ from enum import Enum
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, ConfigDict
+from apis.shared.timestamps import from_iso, to_iso
 
 
 class FileStatus(str, Enum):
@@ -111,6 +112,49 @@ def is_tabular_file(filename: str, mime_type: str) -> bool:
     return False
 
 
+# =============================================================================
+# Presentation File Detection
+# =============================================================================
+
+# PowerPoint files are routed to the PowerPoint presentation tools
+# (list_powerpoint_presentations, read_powerpoint_presentation) instead of
+# being sent inline as Bedrock document content blocks. Unlike the tabular
+# carve-out below, this one is not a size optimization — it is mandatory:
+# Bedrock's Converse `DocumentFormat` enum has no `pptx` member (pdf, csv,
+# doc, docx, xls, xlsx, html, txt, md are the only accepted values), so an
+# inline .pptx fails the whole turn with a ValidationException. The tools are
+# the only path that works.
+#
+# read_powerpoint_presentation extracts slide text, tables and speaker notes
+# with python-pptx inside Code Interpreter, which is also far cheaper in
+# tokens than shipping raw OOXML bytes would be even if Bedrock accepted them.
+#
+# Uploads are gated to keep this reachable: `.pptx` is in ALLOWED_MIME_TYPES
+# above, and the frontend allowlist in `file-upload.service.ts` must stay in
+# sync — drift there is what made .pptx un-uploadable while the create-deck
+# tool's own error text told users to "upload a .pptx template first".
+
+PRESENTATION_MIME_TYPES = frozenset({
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+})
+
+PRESENTATION_EXTENSIONS = frozenset({".pptx"})
+
+
+def is_presentation_file(filename: str, mime_type: str) -> bool:
+    """Return True when the file should be handled by the PowerPoint tools
+    rather than sent inline as a Bedrock document block.
+    """
+    if mime_type and mime_type.lower() in PRESENTATION_MIME_TYPES:
+        return True
+    if filename:
+        lower = filename.lower()
+        for ext in PRESENTATION_EXTENSIONS:
+            if lower.endswith(ext):
+                return True
+    return False
+
+
 # Bedrock's /ConverseStream imposes a 4.5MB hard limit on each document
 # content block's *internal* representation. Non-tabular formats (PDF, docx,
 # txt, md) don't inflate much, but we leave margin for per-request overhead
@@ -119,6 +163,41 @@ def is_tabular_file(filename: str, mime_type: str) -> bool:
 # ValidationException mid-stream.
 INLINE_DOCUMENT_MAX_BYTES = int(
     os.environ.get("INLINE_DOCUMENT_MAX_BYTES", 4 * 1024 * 1024)  # 4MB
+)
+
+# A turn's inline attachments are persisted as ONE message, and the message —
+# not the file — is what AgentCore Memory bounds. Anything over the SDK's
+# ~72 KB conversational limit is written as a base64 ``blob`` payload, so raw
+# attachment bytes inflate by 4/3 on the way in and are then held to the
+# 10 MB event quota. 10 MB × 3/4 = 7.5 MB of raw bytes per turn is the break
+# point. Above it ``create_message`` raises ``SessionException`` — a hole in
+# history — which is strictly worse than the per-file oversized note, so the
+# turn is trimmed to this budget *before* it is built. Prod measurement
+# (docs/specs/document-context-offload-validation.md, Claim 7): ~1.3–1.4% of
+# attachment turns exceed it, several with only 3–4 files, so the per-file
+# cap above and the SPA's 5-file cap do not protect on their own.
+# ``0`` (or any non-positive value) disables the aggregate budget.
+#
+# Why 7.0 MB and not the 7.5 MB the arithmetic above suggests: base64 of N raw
+# bytes is ``4*ceil(N/3)``, so 7,500,000 encodes to **exactly 10,000,000** — the
+# quota itself, with nothing left for the event's JSON envelope (role, content
+# keys, the prompt text block, per-file metadata, the wrapper). A guard whose
+# default sits precisely on the break point it exists to stay under does not
+# prevent the failure it was written for. 7,000,000 encodes to 9,333,336 and
+# leaves ~666 KB of headroom, which comfortably covers the envelope while still
+# admitting every attachment turn measured in prod (p90 cluster 2.58 MB, largest
+# legitimate 29.89 MB — already over either number and correctly trimmed).
+INLINE_ATTACHMENTS_MAX_TOTAL_BYTES = int(
+    os.environ.get("INLINE_ATTACHMENTS_MAX_TOTAL_BYTES", 7_000_000)  # 7.0MB
+)
+
+# Files per message. The SPA enforces the same number client-side
+# (``MAX_FILES_PER_MESSAGE`` in file-upload.service.ts); this is the server
+# side of it, shared by the ``file_upload_ids`` resolver and the direct
+# ``files`` path so a sixth file is reported to the user instead of silently
+# truncated. ``0`` (or any non-positive value) disables the count cap.
+MAX_FILES_PER_MESSAGE = int(
+    os.environ.get("FILE_UPLOAD_MAX_FILES_PER_MESSAGE", 5)
 )
 
 
@@ -160,6 +239,14 @@ class FileMetadata(BaseModel):
     # never part of an access decision.
     source: str = Field(default="upload", description="Origin of the file")
 
+    # DocumentDigest (docs/specs/document-context-offload.md §4A), built once
+    # when a document upload completes and stored as a plain map — see
+    # ``apis.shared.files.document_digest``. ``None`` = never generated (files
+    # uploaded before PR-2, non-documents, or the flag off). Carries model
+    # prose (``abstract``) and heading text (``sections``): content-bearing,
+    # denylisted in the admin projections.
+    digest: Optional[dict] = Field(None, description="DocumentDigest map, when generated")
+
     # Timestamps
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -186,7 +273,7 @@ class FileMetadata(BaseModel):
         if ttl_value is None:
             ttl_value = int(self.created_at.timestamp()) + (365 * 24 * 60 * 60)
 
-        return {
+        item = {
             "PK": f"USER#{self.user_id}",
             "SK": f"FILE#{self.upload_id}",
             "GSI1PK": f"CONV#{self.session_id}",
@@ -202,10 +289,13 @@ class FileMetadata(BaseModel):
             "s3Uri": self.s3_uri,
             "source": self.source,
             "status": self.status if isinstance(self.status, str) else self.status.value,
-            "createdAt": self.created_at.isoformat() + "Z",
-            "updatedAt": self.updated_at.isoformat() + "Z",
+            "createdAt": to_iso(self.created_at),
+            "updatedAt": to_iso(self.updated_at),
             "ttl": ttl_value,
         }
+        if self.digest:
+            item["digest"] = self.digest
+        return item
 
     @classmethod
     def from_dynamo_item(cls, item: dict) -> "FileMetadata":
@@ -224,9 +314,10 @@ class FileMetadata(BaseModel):
             s3_bucket=item.get("s3Bucket", ""),
             status=item.get("status", FileStatus.PENDING),
             source=item.get("source", "upload"),
-            created_at=datetime.fromisoformat(created_at.rstrip("Z")) if created_at else datetime.now(timezone.utc),
-            updated_at=datetime.fromisoformat(updated_at.rstrip("Z")) if updated_at else datetime.now(timezone.utc),
+            created_at=from_iso(created_at) if created_at else datetime.now(timezone.utc),
+            updated_at=from_iso(updated_at) if updated_at else datetime.now(timezone.utc),
             ttl=item.get("ttl"),
+            digest=item.get("digest") if isinstance(item.get("digest"), dict) else None,
         )
 
 
@@ -252,7 +343,7 @@ class UserFileQuota(BaseModel):
             "userId": self.user_id,
             "totalBytes": self.total_bytes,
             "fileCount": self.file_count,
-            "updatedAt": self.updated_at.isoformat() + "Z",
+            "updatedAt": to_iso(self.updated_at),
         }
 
     @classmethod
@@ -263,7 +354,7 @@ class UserFileQuota(BaseModel):
             user_id=item.get("userId", ""),
             total_bytes=int(item.get("totalBytes", 0)),
             file_count=int(item.get("fileCount", 0)),
-            updated_at=datetime.fromisoformat(updated_at.rstrip("Z")) if updated_at else datetime.now(timezone.utc),
+            updated_at=from_iso(updated_at) if updated_at else datetime.now(timezone.utc),
         )
 
 
@@ -333,6 +424,58 @@ class TextSnippetResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class SheetPreview(BaseModel):
+    """One worksheet, read into display-ready strings."""
+
+    name: str = Field(..., description="Worksheet name as it appears on the tab")
+    headers: List[str] = Field(
+        ..., description="First row of the sheet, used as column labels"
+    )
+    rows: List[List[str]] = Field(
+        ..., description="Body rows, each padded to len(headers)"
+    )
+    total_rows: int = Field(
+        ...,
+        alias="totalRows",
+        description="Body rows the sheet claims to have, which may exceed len(rows)",
+    )
+    truncated: bool = Field(
+        ..., description="True when a cap stopped the read short of the sheet's end"
+    )
+    truncated_by: Optional[str] = Field(
+        None,
+        alias="truncatedBy",
+        description="Which cap fired: 'rows' or 'columns'",
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class SheetPreviewResponse(BaseModel):
+    """Response for GET /api/files/{uploadId}/sheet-preview."""
+
+    upload_id: str = Field(..., alias="uploadId")
+    filename: str
+    sheets: List[SheetPreview] = Field(
+        ..., description="Visible worksheets, in workbook order"
+    )
+    truncated: bool = Field(
+        ...,
+        description="True when any sheet was cut short or sheets were dropped",
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# MIME types the spreadsheet reader can turn into a grid. Deliberately
+# only OOXML: the pre-2007 .xls binary format needs a different library
+# (xlrd), and it is not worth one for a format nothing in the product
+# generates.
+SHEET_PREVIEW_MIME_TYPES = frozenset({
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+})
+
+
 # MIME types the thumbnail renderer can currently produce a preview image for.
 # Callers should consult this set before invoking the thumbnail endpoint to
 # avoid hammering the service for unsupported types.
@@ -377,7 +520,7 @@ class FileResponse(BaseModel):
             session_id=meta.session_id,
             s3_uri=meta.s3_uri,
             status=meta.status if isinstance(meta.status, str) else meta.status.value,
-            created_at=meta.created_at.isoformat() + "Z",
+            created_at=to_iso(meta.created_at),
         )
 
 

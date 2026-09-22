@@ -5,6 +5,7 @@ import { NgIcon, provideIcons } from '@ng-icons/core';
 import { heroXMark, heroCircleStack } from '@ng-icons/heroicons/outline';
 import { MemorySpaceSummary, SpaceTemplate } from '../models/memory-space.model';
 import { MemorySpaceService } from '../services/memory-space.service';
+import { DialogDismissDirective } from '../../components/dialog/dialog-dismiss.directive';
 
 export interface CreateSpaceDialogData {
   templates: SpaceTemplate[];
@@ -21,7 +22,7 @@ export type CreateSpaceDialogResult = MemorySpaceSummary | undefined;
 @Component({
   selector: 'app-create-space-dialog',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [FormsModule, NgIcon],
+  imports: [DialogDismissDirective, FormsModule, NgIcon],
   providers: [provideIcons({ heroXMark, heroCircleStack })],
   host: {
     class: 'block',
@@ -31,10 +32,11 @@ export type CreateSpaceDialogResult = MemorySpaceSummary | undefined;
     <div
       class="dialog-backdrop fixed inset-0 bg-gray-500/75 dark:bg-gray-900/80"
       aria-hidden="true"
-      (click)="onCancel()"
     ></div>
 
-    <div class="fixed inset-0 z-10 flex min-h-full items-end justify-center p-4 sm:items-center sm:p-0">
+    <div class="fixed inset-0 z-10 flex min-h-full items-end justify-center p-4 sm:items-center sm:p-0"
+      appDialogDismiss
+      (dismissed)="onCancel()">
       <div
         class="dialog-panel relative transform overflow-hidden rounded-2xl border border-gray-200 bg-white px-4 pt-5 pb-4 text-left shadow-xl sm:my-8 sm:w-full sm:max-w-lg sm:p-6 dark:border-gray-700 dark:bg-gray-800"
         role="dialog"
@@ -46,7 +48,7 @@ export type CreateSpaceDialogResult = MemorySpaceSummary | undefined;
           <button
             type="button"
             (click)="onCancel()"
-            class="flex size-8 items-center justify-center rounded-2xl text-gray-400 hover:bg-gray-100 hover:text-gray-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:hover:bg-gray-700 dark:hover:text-gray-200"
+            class="flex size-8 items-center justify-center rounded-2xl text-gray-400 hover:bg-gray-100 hover:text-gray-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 dark:hover:bg-gray-700 dark:hover:text-gray-200"
             aria-label="Close dialog"
           >
             <ng-icon name="heroXMark" class="size-5" aria-hidden="true" />
@@ -54,8 +56,8 @@ export type CreateSpaceDialogResult = MemorySpaceSummary | undefined;
         </div>
 
         <div class="sm:flex sm:items-start">
-          <div class="mx-auto flex size-12 shrink-0 items-center justify-center rounded-2xl bg-blue-100 sm:mx-0 sm:size-10 dark:bg-blue-500/10">
-            <ng-icon name="heroCircleStack" class="size-6 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+          <div class="mx-auto flex size-12 shrink-0 items-center justify-center rounded-2xl bg-gray-100 sm:mx-0 sm:size-10 dark:bg-gray-700">
+            <ng-icon name="heroCircleStack" class="size-6 text-primary-accessible dark:text-primary-50" aria-hidden="true" />
           </div>
           <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left">
             <h3 id="create-space-title" class="text-base/7 font-semibold text-gray-900 dark:text-white">
@@ -79,7 +81,7 @@ export type CreateSpaceDialogResult = MemorySpaceSummary | undefined;
               (ngModelChange)="name.set($event)"
               placeholder="e.g. Chief of Staff"
               maxlength="200"
-              class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500"
+              class="mt-1 block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 placeholder:text-gray-400 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500"
             />
           </div>
 
@@ -92,11 +94,11 @@ export type CreateSpaceDialogResult = MemorySpaceSummary | undefined;
                   role="radio"
                   [attr.aria-checked]="template() === tmpl.templateId"
                   (click)="template.set(tmpl.templateId)"
-                  class="flex w-full flex-col items-start rounded-2xl border px-4 py-3 text-left transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 aria-checked:border-blue-500 aria-checked:bg-blue-50 dark:aria-checked:border-blue-400 dark:aria-checked:bg-blue-500/10 border-gray-300 hover:bg-gray-50 dark:border-gray-600 dark:hover:bg-gray-700/40"
+                  class="flex w-full flex-col items-start rounded-2xl border px-4 py-3 text-left transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 aria-checked:border-primary-500 aria-checked:bg-gray-100 dark:aria-checked:border-primary-400 dark:aria-checked:bg-gray-700 border-gray-300 hover:bg-gray-50 dark:border-gray-600 dark:hover:bg-gray-700/40"
                 >
                   <span class="text-sm/6 font-medium text-gray-900 dark:text-white">{{ tmpl.name }}</span>
                   @if (tmpl.description) {
-                    <span class="mt-0.5 text-xs/5 text-gray-500 dark:text-gray-400">{{ tmpl.description }}</span>
+                    <span class="mt-0.5 text-xs/5 text-gray-600 dark:text-gray-300">{{ tmpl.description }}</span>
                   }
                 </button>
               }
@@ -104,7 +106,7 @@ export type CreateSpaceDialogResult = MemorySpaceSummary | undefined;
           </fieldset>
 
           @if (error()) {
-            <div class="rounded-2xl bg-red-50 px-3 py-2 text-sm/6 text-red-800 dark:bg-red-900/20 dark:text-red-400" role="alert">
+            <div class="rounded-2xl bg-state-danger-50 px-3 py-2 text-sm/6 text-state-danger-800 dark:bg-state-danger-900/20 dark:text-state-danger-400" role="alert">
               {{ error() }}
             </div>
           }
@@ -122,7 +124,7 @@ export type CreateSpaceDialogResult = MemorySpaceSummary | undefined;
             type="button"
             (click)="onCreate()"
             [disabled]="saving() || !name().trim()"
-            class="rounded-2xl bg-blue-600 px-4 py-2 text-sm/6 font-medium text-white hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-blue-500 dark:hover:bg-blue-600"
+            class="rounded-2xl bg-primary-accessible px-4 py-2 text-sm/6 font-medium text-white hover:brightness-95 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {{ saving() ? 'Creating…' : 'Create space' }}
           </button>
@@ -131,8 +133,7 @@ export type CreateSpaceDialogResult = MemorySpaceSummary | undefined;
     </div>
   `,
   styles: `
-    @import "tailwindcss";
-    @custom-variant dark (&:where(.dark, .dark *));
+    @reference "../../../styles/theme.css";
     .dialog-backdrop { animation: backdrop-fade-in 200ms ease-out; }
     @keyframes backdrop-fade-in { from { opacity: 0; } to { opacity: 1; } }
     .dialog-panel { animation: dialog-fade-in-up 200ms ease-out; }

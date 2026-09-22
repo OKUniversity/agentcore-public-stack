@@ -16,6 +16,8 @@ import {
   heroCheck,
 } from '@ng-icons/heroicons/outline';
 import { ShareService, ShareResponse } from '../../services/share/share.service';
+import { DialogDismissDirective } from '../../../components/dialog/dialog-dismiss.directive';
+import { SpinnerComponent } from '../../../components/spinner/spinner.component';
 
 export interface ShareModalData {
   sessionId: string;
@@ -27,7 +29,7 @@ type AccessLevel = 'public' | 'specific';
 @Component({
   selector: 'app-share-modal',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [FormsModule, NgIcon],
+  imports: [DialogDismissDirective, FormsModule, NgIcon, SpinnerComponent],
   providers: [
     provideIcons({ heroXMark, heroClipboard, heroArrowUpOnSquare, heroCheck }),
   ],
@@ -40,11 +42,12 @@ type AccessLevel = 'public' | 'specific';
     <div
       class="dialog-backdrop fixed inset-0 bg-gray-500/75 dark:bg-gray-900/80"
       aria-hidden="true"
-      (click)="onClose()"
     ></div>
 
     <!-- Dialog Panel -->
-    <div class="fixed inset-0 z-10 flex min-h-full items-end justify-center p-4 sm:items-center sm:p-0">
+    <div class="fixed inset-0 z-10 flex min-h-full items-end justify-center p-4 sm:items-center sm:p-0"
+      appDialogDismiss
+      (dismissed)="onClose()">
       <div
         class="dialog-panel relative w-full transform overflow-hidden rounded-lg bg-white px-4 pt-5 pb-4 text-left shadow-xl sm:my-8 sm:max-w-md sm:p-6 dark:bg-gray-800 dark:outline dark:-outline-offset-1 dark:outline-white/10"
         role="dialog"
@@ -77,7 +80,7 @@ type AccessLevel = 'public' | 'specific';
             <label
               class="flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors"
               [class]="selectedAccess() === option.value
-                ? 'border-primary-500 bg-primary-50 dark:border-primary-400 dark:bg-primary-500/10'
+                ? 'border-primary-500 bg-gray-100 dark:border-primary-400 dark:bg-gray-700'
                 : 'border-gray-200 hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-white/5'"
             >
               <input
@@ -90,7 +93,7 @@ type AccessLevel = 'public' | 'specific';
               />
               <div>
                 <span class="text-sm font-medium text-gray-900 dark:text-white">{{ option.label }}</span>
-                <p class="text-xs text-gray-500 dark:text-gray-400">{{ option.description }}</p>
+                <p class="text-xs text-gray-600 dark:text-gray-300">{{ option.description }}</p>
               </div>
             </label>
           }
@@ -106,7 +109,7 @@ type AccessLevel = 'public' | 'specific';
             <!-- Email chips -->
             <div class="flex flex-wrap gap-1.5 mb-2">
               <!-- Owner chip (non-removable) -->
-              <span class="inline-flex items-center gap-1 rounded-full bg-primary-100 px-2.5 py-0.5 text-xs font-medium text-primary-700 dark:bg-primary-500/20 dark:text-primary-300">
+              <span class="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-primary-accessible dark:bg-gray-700 dark:text-primary-50">
                 {{ data.ownerEmail }} (you)
               </span>
 
@@ -140,7 +143,7 @@ type AccessLevel = 'public' | 'specific';
                 type="button"
                 (click)="addEmail()"
                 [disabled]="!emailInput().trim()"
-                class="rounded-md bg-primary-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-500 disabled:opacity-50 disabled:cursor-not-allowed dark:bg-primary-500 dark:hover:bg-primary-400"
+                class="rounded-2xl bg-primary-accessible px-3 py-1.5 text-sm font-medium text-white hover:brightness-95 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Add
               </button>
@@ -150,8 +153,8 @@ type AccessLevel = 'public' | 'specific';
 
         <!-- Existing shares info -->
         @if (existingShares().length > 0 && !shareResult()) {
-          <div class="mt-4 rounded-md bg-blue-50 p-3 dark:bg-blue-500/10">
-            <p class="text-xs text-blue-700 dark:text-blue-300">
+          <div class="mt-4 rounded-md bg-state-info-50 p-3 dark:bg-state-info-500/10">
+            <p class="text-xs text-state-info-700 dark:text-state-info-300">
               This conversation has {{ existingShares().length }} existing share{{ existingShares().length > 1 ? 's' : '' }}.
               Creating a new share will add another snapshot.
             </p>
@@ -160,21 +163,21 @@ type AccessLevel = 'public' | 'specific';
 
         <!-- Share result -->
         @if (shareResult()) {
-          <div class="mt-4 rounded-md bg-green-50 p-3 dark:bg-green-500/10">
-            <p class="text-sm font-medium text-green-800 dark:text-green-300 mb-2">Chat shared</p>
-            <p class="text-xs text-green-600 dark:text-green-400 mb-2">Future messages aren't included in the share.</p>
+          <div class="mt-4 rounded-md bg-state-success-50 p-3 dark:bg-state-success-500/10">
+            <p class="text-sm font-medium text-state-success-800 dark:text-state-success-300 mb-2">Chat shared</p>
+            <p class="text-xs text-state-success-700 dark:text-state-success-400 mb-2">Future messages aren't included in the share.</p>
             <div class="flex items-center gap-2">
               <input
                 type="text"
                 readonly
                 [value]="shareUrl()"
-                class="flex-1 rounded-md border border-green-200 bg-white px-2.5 py-1.5 text-xs text-gray-700 dark:border-green-700 dark:bg-gray-700 dark:text-gray-300"
+                class="flex-1 rounded-md border border-state-success-200 bg-white px-2.5 py-1.5 text-xs text-gray-700 dark:border-state-success-700 dark:bg-gray-700 dark:text-gray-300"
                 (click)="$event.target"
               />
               <button
                 type="button"
                 (click)="copyLink()"
-                class="inline-flex items-center gap-1 rounded-md bg-white px-2.5 py-1.5 text-xs font-medium text-gray-700 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 dark:bg-gray-700 dark:text-gray-300 dark:ring-gray-600 dark:hover:bg-gray-600"
+                class="inline-flex items-center gap-1 rounded-2xl bg-white px-2.5 py-1.5 text-xs font-medium text-gray-700 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 dark:bg-gray-700 dark:text-gray-300 dark:ring-gray-600 dark:hover:bg-gray-600"
               >
                 <ng-icon [name]="copied() ? 'heroCheck' : 'heroClipboard'" class="size-3.5" aria-hidden="true" />
                 {{ copied() ? 'Copied' : 'Copy link' }}
@@ -185,8 +188,8 @@ type AccessLevel = 'public' | 'specific';
 
         <!-- Error -->
         @if (error()) {
-          <div class="mt-4 rounded-md bg-red-50 p-3 dark:bg-red-500/10">
-            <p class="text-sm text-red-700 dark:text-red-300">{{ error() }}</p>
+          <div class="mt-4 rounded-md bg-state-danger-50 p-3 dark:bg-state-danger-500/10">
+            <p class="text-sm text-state-danger-700 dark:text-state-danger-300">{{ error() }}</p>
           </div>
         }
 
@@ -195,7 +198,7 @@ type AccessLevel = 'public' | 'specific';
           <button
             type="button"
             (click)="onClose()"
-            class="rounded-md bg-white px-3 py-2 text-sm/6 font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 dark:bg-white/10 dark:text-white dark:shadow-none dark:ring-white/5 dark:hover:bg-white/20"
+            class="rounded-2xl bg-white px-3 py-2 text-sm/6 font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 dark:bg-white/10 dark:text-white dark:shadow-none dark:ring-white/5 dark:hover:bg-white/20"
           >
             {{ shareResult() ? 'Done' : 'Cancel' }}
           </button>
@@ -205,10 +208,10 @@ type AccessLevel = 'public' | 'specific';
               type="button"
               (click)="onShare()"
               [disabled]="isSubmitting() || !canSubmit()"
-              class="inline-flex items-center gap-1.5 rounded-md bg-primary-600 px-3 py-2 text-sm/6 font-semibold text-white shadow-xs hover:bg-primary-500 disabled:opacity-50 disabled:cursor-not-allowed dark:bg-primary-500 dark:shadow-none dark:hover:bg-primary-400"
+              class="inline-flex items-center gap-1.5 rounded-2xl bg-primary-accessible px-3 py-2 text-sm/6 font-semibold text-white shadow-xs hover:brightness-95 disabled:opacity-50 disabled:cursor-not-allowed dark:shadow-none"
             >
               @if (isSubmitting()) {
-                <span class="size-4 animate-spin rounded-full border-2 border-white border-t-transparent" aria-hidden="true"></span>
+                <app-spinner size="sm" variant="on-solid" label="Creating share link" />
               }
               Create share link
             </button>
@@ -218,8 +221,7 @@ type AccessLevel = 'public' | 'specific';
     </div>
   `,
   styles: `
-    @import "tailwindcss";
-    @custom-variant dark (&:where(.dark, .dark *));
+    @reference "../../../../styles/theme.css";
 
     .dialog-backdrop {
       animation: backdrop-fade-in 200ms ease-out;

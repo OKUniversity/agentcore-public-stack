@@ -6,10 +6,9 @@ import {
   input,
   output,
   computed,
+  signal,
   viewChild,
 } from '@angular/core';
-import { NgIcon, provideIcons } from '@ng-icons/core';
-import { heroXMark } from '@ng-icons/heroicons/outline';
 import { Message } from '../../services/models/message.model';
 import { MessageListComponent } from '../message-list/message-list.component';
 import { ChatInputComponent } from '../chat-input/chat-input.component';
@@ -17,10 +16,20 @@ import { AnimatedTextComponent } from '../../../components/animated-text';
 import { ParagraphSkeletonComponent } from '../../../components/paragraph-skeleton';
 import { Topnav } from '../../../components/topnav/topnav';
 import { SidenavService } from '../../../services/sidenav/sidenav.service';
-import { ArtifactStateService } from '../../services/artifacts/artifact-state.service';
+import { DockedPaneService } from '../../services/docked-pane/docked-pane.service';
+import { BrandingService } from '../../../../branding/branding.service';
 import { Assistant } from '../../../assistants/models/assistant.model';
-import { AssistantCardComponent } from '../../../assistants/components/assistant-card.component';
-import { AssistantIndicatorComponent } from '../assistant-indicator/assistant-indicator.component';
+import { Agent, AgentRunnability } from '../../../agents/models/agent.model';
+import {
+  AgentLaunchCardComponent,
+  AgentLaunchCardView,
+  agentLaunchCardView,
+} from '../../../agents/components/agent-launch-card.component';
+import {
+  AgentGovernance,
+  AssistantIndicatorComponent,
+} from '../assistant-indicator/assistant-indicator.component';
+import { ModelService } from '../../services/model/model.service';
 import { SessionCostBadgeComponent } from '../session-cost-badge/session-cost-badge.component';
 import { VoiceOverlayComponent } from '../voice-overlay';
 import { VoiceChatService } from '../../services/voice';
@@ -42,7 +51,6 @@ export interface ChatContainerConfig {
   /** Show voice mode toggle in chat input */
   showVoiceControl: boolean;
   /** Show settings/tools button in chat input */
-  showSettingsControl: boolean;
   /** Custom greeting message (overrides default) */
   customGreeting?: string;
   /** Enable embedded mode (flex layout, no fixed positioning) */
@@ -65,13 +73,11 @@ export interface ChatContainerConfig {
     AnimatedTextComponent,
     ParagraphSkeletonComponent,
     Topnav,
-    NgIcon,
-    AssistantCardComponent,
+    AgentLaunchCardComponent,
     AssistantIndicatorComponent,
     SessionCostBadgeComponent,
     VoiceOverlayComponent,
   ],
-  providers: [provideIcons({ heroXMark })],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './chat-container.component.html',
   styleUrl: './chat-container.component.css',
@@ -79,14 +85,52 @@ export interface ChatContainerConfig {
 export class ChatContainerComponent {
   // Inject sidenav service for full-page mode positioning
   protected sidenavService = inject(SidenavService);
-  private artifactState = inject(ArtifactStateService);
+  private dockedPane = inject(DockedPaneService);
   private voiceChatService = inject(VoiceChatService);
   protected readonly isVoiceActive = this.voiceChatService.isVoiceActive;
+  protected branding = inject(BrandingService);
+
+  /** Whether the branding logo image failed to load (Requirement 2.8). */
+  protected logoLoadFailed = signal(false);
 
   // Child component reference for scroll functionality
   private messageListComponent = viewChild(MessageListComponent);
 
   private readonly chatState = inject(ChatStateService);
+  private readonly modelService = inject(ModelService);
+
+  /**
+   * What the bound Agent fixes for this conversation, for the indicator.
+   *
+   * Derived from the Agent record itself rather than from the picker locks,
+   * which live on root singletons and outlive the view that set them. It also
+   * makes the preview surfaces correct for free: the Designer preview and the
+   * marketplace test-drive render this component without passing `[agent]`, so
+   * they get null and the indicator says nothing — which is right, because a
+   * draft being previewed is not a conversation anyone's saved settings apply to.
+   */
+  protected readonly agentGovernance = computed<AgentGovernance | null>(() => {
+    const agent = this.agent();
+    if (!agent) return null;
+
+    const bindings = agent.bindings ?? [];
+    const toolCount = bindings.filter(b => b.kind === 'tool').length;
+    const skillCount = bindings.filter(b => b.kind === 'skill').length;
+
+    const modelId = agent.modelConfig?.modelId ?? null;
+    // Fall back to the raw id: the catalog may not have loaded yet, and naming
+    // the model badly beats dropping the row that says one is pinned at all.
+    const modelName = modelId
+      ? (this.modelService.availableModels().find(m => m.modelId === modelId)?.modelName ?? modelId)
+      : null;
+
+    if (!modelName && toolCount === 0 && skillCount === 0) return null;
+    return {
+      modelName,
+      toolCount: toolCount || null,
+      skillCount: skillCount || null,
+    };
+  });
 
   // Non-composer submit paths (e.g. an MCP App widget's ui/message) bump
   // ChatStateService.scrollToLastUserTick to get the same "scroll the new
@@ -107,6 +151,16 @@ export class ChatContainerComponent {
 
   // Optional inputs
   assistant = input<Assistant | null>(null);
+
+  /**
+   * The governed Agent behind this conversation, when it resolves (`agentId ==
+   * assistantId`). The launch card reads from this rather than `assistant` because
+   * tagline, publisher, category and capabilities exist only on the Agent shape — see
+   * `agentLaunchCardView`.
+   */
+  agent = input<Agent | null>(null);
+  /** D6, fetched best-effort by the session page; the card omits the line without it. */
+  runnability = input<AgentRunnability | null>(null);
   assistantError = input<string | null>(null);
   isLoadingAssistant = input<boolean>(false);
   isChatLoading = input<boolean>(false);
@@ -123,24 +177,69 @@ export class ChatContainerComponent {
     allowCloseAssistant: true,
     showFileControls: true,
     showVoiceControl: true,
-    showSettingsControl: true,
     embeddedMode: false,
     fullPageMode: false,
     ...this.config(),
   }));
 
   // Output events
-  messageSubmitted = output<{ content: string; timestamp: Date; fileUploadIds?: string[] }>();
+  // `mentionAgentId` and `invokedSkillIds` ride through untouched: the container is a
+  // layout shell, and dropping either field here would silently turn every `@`-mention
+  // back into a plain turn, or every `/` skill command into ordinary prose.
+  messageSubmitted = output<{ content: string; timestamp: Date; fileUploadIds?: string[]; mentionAgentId?: string; invokedSkillIds?: string[] }>();
   continueRequested = output<void>();
   messageCancelled = output<void>();
   fileAttached = output<File>();
-  settingsToggled = output<void>();
   assistantClosed = output<void>();
   starterSelected = output<string>();
   assistantNewSession = output<void>();
   assistantEdit = output<void>();
   assistantShare = output<void>();
   voiceClosed = output<void>();
+
+  /**
+   * What the launch card renders.
+   *
+   * Prefers the Agent shape and falls back to the Assistant, because the two loads are
+   * independent: `loadAssistant` resolves first and `loadAgentBindings` follows, and the
+   * Agent call is allowed to fail outright (the `/agents` surface can be off). Without
+   * the fallback the card would flicker in a beat late, or never paint at all in a
+   * flag-off environment — for a record that is the same record either way.
+   *
+   * The fallback is deliberately `listed: false`: an Assistant carries no listing, so
+   * neither store affordance is offered rather than guessed at.
+   */
+  protected readonly launchCardView = computed<AgentLaunchCardView | null>(() => {
+    const agent = this.agent();
+    if (agent) return agentLaunchCardView(agent);
+
+    const assistant = this.assistant();
+    if (!assistant) return null;
+    return {
+      agentId: assistant.assistantId,
+      name: assistant.name,
+      description: assistant.description,
+      ownerName: assistant.ownerName,
+      emoji: assistant.emoji,
+      starters: assistant.starters ?? [],
+      listed: false,
+    };
+  });
+
+  /**
+   * The agent the foot-of-conversation feedback link asks about, or null.
+   *
+   * Read off `agent()` rather than `launchCardView()` even though the card already carries
+   * a `listed` flag: the card falls back to the Assistant shape with `listed: false`, and
+   * an affordance that is silently absent whenever the `/agents` load loses a race would
+   * be a hard thing to notice and a harder one to explain. Here, no Agent means no link,
+   * for the one honest reason — we do not know that this is a store agent.
+   */
+  protected readonly feedbackAgent = computed<{ id: string; name: string } | null>(() => {
+    const agent = this.agent();
+    if (agent?.listing?.state !== 'published') return null;
+    return { id: agent.agentId, name: agent.name };
+  });
 
   // Computed signals
   protected readonly hasMessages = computed(() => this.messages().length > 0);
@@ -160,6 +259,30 @@ export class ChatContainerComponent {
    * remounting — a remount restarts the fixed wrapper's `left` transition,
    * which reads as the whole bar sweeping across the screen.
    */
+  /**
+   * Whether a composer in this container may float an announcement.
+   *
+   * Off in embedded mode: an agent preview or a marketplace test-drive is
+   * exercising one specific agent, and a platform-wide notice inside that
+   * pane reads as a bug. The real chat is the only place it belongs.
+   */
+  protected readonly showAnnouncements = computed(
+    () => !this.resolvedConfig().embeddedMode,
+  );
+
+  /**
+   * Which side of the composer an announcement takes, following the composer.
+   *
+   * The empty state centres the composer with the greeting immediately above
+   * it, so a pill placed above would float over the greeting — visibly so at
+   * narrow widths, where the greeting wraps. A conversation pins the composer
+   * to the bottom, where below would be off the edge. Same `isEmptyState()`
+   * that picks the layout branch picks the side, so the two cannot drift.
+   */
+  protected readonly announcementPlacement = computed<'above' | 'below'>(
+    () => (this.isEmptyState() ? 'below' : 'above'),
+  );
+
   protected readonly showChatTopnav = computed(
     () =>
       this.resolvedConfig().fullPageMode &&
@@ -175,11 +298,10 @@ export class ChatContainerComponent {
   protected readonly isSidenavCollapsed = computed(() =>
     this.sidenavService.isCollapsed()
   );
-  /** True while the docked artifact pane is open — the fixed footer /
-   *  topnav reserve right-side space so the pane doesn't cover them. */
-  protected readonly artifactPanelOpen = computed(
-    () => this.artifactState.openArtifact() !== null
-  );
+  /** True while any pane is docked (artifact or .docx preview) — the
+   *  fixed footer / topnav reserve right-side space so the pane doesn't
+   *  cover them. */
+  protected readonly artifactPanelOpen = this.dockedPane.isOpen;
   protected readonly isAssistantOwner = computed(() => {
     const a = this.assistant();
     if (!a) return false;
@@ -199,7 +321,7 @@ export class ChatContainerComponent {
   }
 
   // Event handlers
-  onMessageSubmitted(event: { content: string; timestamp: Date; fileUploadIds?: string[] }) {
+  onMessageSubmitted(event: { content: string; timestamp: Date; fileUploadIds?: string[]; mentionAgentId?: string; invokedSkillIds?: string[] }) {
     this.messageSubmitted.emit(event);
 
     // Wait for DOM to update (user message to be added) then scroll to it
@@ -214,10 +336,6 @@ export class ChatContainerComponent {
 
   onFileAttached(file: File) {
     this.fileAttached.emit(file);
-  }
-
-  onSettingsToggled() {
-    this.settingsToggled.emit();
   }
 
   onAssistantClosed() {
@@ -244,5 +362,16 @@ export class ChatContainerComponent {
 
   onVoiceClosed() {
     this.voiceClosed.emit();
+  }
+
+  /**
+   * Handles a branding logo `<img>` failing to load (missing/broken asset at
+   * its documented path). Sets `logoLoadFailed`, which the template uses to
+   * hide the broken `<img>` elements and reveal a same-dimension placeholder
+   * with a visible "logo failed to load" indication, without collapsing the
+   * layout (Requirement 2.8).
+   */
+  onLogoError(_event: Event): void {
+    this.logoLoadFailed.set(true);
   }
 }

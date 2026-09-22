@@ -10,16 +10,16 @@ PK becomes ``USER_MENU_LINKS#<org_id>`` without touching the SK shape.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from apis.shared.timestamps import utc_now_iso
 
 LinkKind = Literal["external", "modal"]
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat() + "Z"
+    return utc_now_iso()
 
 
 def _validate_http_url(value: Optional[str]) -> Optional[str]:
@@ -32,6 +32,12 @@ def _validate_http_url(value: Optional[str]) -> Optional[str]:
     if not (lowered.startswith("http://") or lowered.startswith("https://")):
         raise ValueError("url must start with http:// or https://")
     return value
+
+
+# Public handle on the same check. ``announcements`` validates its ``ctaUrl``
+# for exactly this reason, and one implementation is better than two that can
+# drift apart.
+validate_http_url = _validate_http_url
 
 
 @dataclass

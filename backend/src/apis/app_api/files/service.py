@@ -9,13 +9,14 @@ import os
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from apis.shared.security.log_sanitize import scrub_log
+from apis.shared.timestamps import to_iso
 
 from apis.shared.files.models import (
     FileMetadata,
@@ -24,6 +25,8 @@ from apis.shared.files.models import (
     PresignResponse,
     CompleteUploadResponse,
     PreviewUrlResponse,
+    SheetPreviewResponse,
+    SHEET_PREVIEW_MIME_TYPES,
     TextSnippetResponse,
     ThumbnailResponse,
     THUMBNAIL_SUPPORTED_MIME_TYPES,
@@ -31,7 +34,15 @@ from apis.shared.files.models import (
     FileListResponse,
     QuotaResponse,
     is_allowed_mime_type,
+    is_presentation_file,
     ALLOWED_MIME_TYPES,
+    MAX_FILES_PER_MESSAGE,
+)
+from .sheet_preview import (
+    MAX_WORKBOOK_BYTES,
+    WorkbookTooLargeError,
+    WorkbookUnreadableError,
+    read_workbook_preview,
 )
 from .thumbnails import (
     ThumbnailRenderer,
@@ -118,12 +129,18 @@ class FileUploadService:
     # Stored alongside the original so cleanup happens with the file.
     THUMBNAIL_KEY_NAME = "_thumb.png"
 
+    # Strong refs to fire-and-forget digest builds. The event loop only holds
+    # weak references to tasks, so a bare `create_task` can be collected
+    # mid-run (the trap web_sources/deletion_service.py documents).
+    _digest_tasks: Set["asyncio.Task[None]"] = set()
+
     def __init__(
         self,
         repository: Optional[FileUploadRepository] = None,
         s3_client=None,
         bucket_name: Optional[str] = None,
         max_file_size: Optional[int] = None,
+        presentation_max_file_size: Optional[int] = None,
         max_files_per_message: Optional[int] = None,
         user_quota_bytes: Optional[int] = None,
         thumbnail_renderer: Optional[ThumbnailRenderer] = None,
@@ -155,9 +172,26 @@ class FileUploadService:
         self.max_file_size = max_file_size or int(
             os.environ.get("FILE_UPLOAD_MAX_SIZE_BYTES", 4 * 1024 * 1024)  # 4MB
         )
-        self.max_files_per_message = max_files_per_message or int(
-            os.environ.get("FILE_UPLOAD_MAX_FILES_PER_MESSAGE", 5)
+        # Presentations get a larger cap than the general limit. The general
+        # 4MB is sized for what Bedrock will accept as an inline document
+        # block; a .pptx never goes inline (Bedrock has no pptx document
+        # format — see `is_presentation_file`), so that ceiling does not
+        # apply to it. What does apply is the Code Interpreter hop in the
+        # PowerPoint tools: `_ci_write_bytes` base64-encodes the whole deck
+        # into a single writeFiles `text` field, inflating it ~4/3. That
+        # field is a MaxLenString (100MB), so 25MB of deck → ~33MB of base64
+        # stays well inside it. Real-world corporate templates with imagery
+        # routinely exceed 4MB, which is what made the template workflow
+        # unusable at the general cap.
+        self.presentation_max_file_size = presentation_max_file_size or int(
+            os.environ.get(
+                "FILE_UPLOAD_MAX_SIZE_BYTES_PRESENTATION", 25 * 1024 * 1024  # 25MB
+            )
         )
+        # Single source of truth is the shared constant (the inference API
+        # enforces it per message; see ``_apply_message_file_cap``). Kept on
+        # the service so callers can read the effective limit.
+        self.max_files_per_message = max_files_per_message or MAX_FILES_PER_MESSAGE
         self.user_quota_bytes = user_quota_bytes or int(
             os.environ.get("FILE_UPLOAD_USER_QUOTA_BYTES", 1024 * 1024 * 1024)  # 1GB
         )
@@ -165,6 +199,18 @@ class FileUploadService:
         # Pre-signed URL expiration
         self.presign_expiration = 15 * 60  # 15 minutes
         self.preview_url_expiration = 10 * 60  # 10 minutes for GET previews
+
+    def max_size_for(self, filename: str, mime_type: str) -> int:
+        """Return the upload size cap that applies to this file.
+
+        Presentations get their own (larger) cap; everything else gets the
+        general limit. Callers must use this rather than reading
+        `max_file_size` directly, or a .pptx under the presentation cap gets
+        rejected by whichever gate was missed.
+        """
+        if is_presentation_file(filename, mime_type):
+            return self.presentation_max_file_size
+        return self.max_file_size
 
     # =========================================================================
     # Pre-signed URL Flow
@@ -199,9 +245,10 @@ class FileUploadService:
         if not is_allowed_mime_type(request.mime_type):
             raise InvalidFileTypeError(request.mime_type)
 
-        # Validate file size
-        if request.size_bytes > self.max_file_size:
-            raise FileTooLargeError(request.size_bytes, self.max_file_size)
+        # Validate file size against the cap for this file's class
+        size_limit = self.max_size_for(request.filename, request.mime_type)
+        if request.size_bytes > size_limit:
+            raise FileTooLargeError(request.size_bytes, size_limit)
 
         # Check quota
         quota = await self.repository.get_user_quota(user_id)
@@ -255,7 +302,7 @@ class FileUploadService:
             logger.error(f"Failed to generate pre-signed URL: {e}")
             raise
 
-        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=self.presign_expiration)).isoformat() + "Z"
+        expires_at = to_iso(datetime.now(timezone.utc) + timedelta(seconds=self.presign_expiration))
 
         logger.info(f"Generated pre-signed URL for upload {upload_id} by user {user_id}")
 
@@ -323,6 +370,13 @@ class FileUploadService:
         # Increment quota
         await self.repository.increment_quota(user_id, file_meta.size_bytes)
 
+        # DocumentDigest, off the request path (offload spec §4A / PR-2):
+        # documents get an outline + abstract persisted on their row so a
+        # later turn can carry the digest instead of the bytes. Non-documents
+        # (spreadsheets, decks, images) and the kill switch skip it. The
+        # response does not wait for it.
+        self._schedule_digest(file_meta)
+
         logger.info("Completed file upload")
 
         return CompleteUploadResponse(
@@ -381,9 +435,9 @@ class FileUploadService:
             logger.error(f"Failed to generate preview URL: {e}")
             raise
 
-        expires_at = (
+        expires_at = to_iso(
             datetime.now(timezone.utc) + timedelta(seconds=self.preview_url_expiration)
-        ).isoformat() + "Z"
+        )
 
         return PreviewUrlResponse(
             upload_id=upload_id,
@@ -392,6 +446,52 @@ class FileUploadService:
             mime_type=file_meta.mime_type,
             filename=file_meta.filename,
         )
+
+    async def get_download_url(self, user_id: str, upload_id: str) -> str:
+        """Mint a short-lived presigned GET URL that forces a download.
+
+        Same ownership + READY gate as `get_preview_url`, but the response
+        headers carry `Content-Disposition: attachment` so the browser saves
+        the file instead of rendering it. Minted per request and immediately
+        redirected to, so the caller never holds an expiring URL — that is the
+        whole point of the `/files/{id}/download` route: a stable, durable link
+        that can be persisted in a conversation and still work a week later.
+
+        Args:
+            user_id: The owner's user ID
+            upload_id: The upload identifier
+
+        Returns:
+            A presigned S3 GET URL with an attachment disposition.
+
+        Raises:
+            FileNotFoundError: If file not found, not owned by user, or not ready
+        """
+        file_meta = await self.repository.get_file(user_id, upload_id)
+        if not file_meta:
+            raise FileNotFoundError(f"File {upload_id} not found")
+
+        if file_meta.status != FileStatus.READY:
+            raise FileNotFoundError(
+                f"File {upload_id} is not ready (status: {file_meta.status})"
+            )
+
+        try:
+            return self._s3_client.generate_presigned_url(
+                "get_object",
+                Params={
+                    "Bucket": self.bucket_name,
+                    "Key": file_meta.s3_key,
+                    "ResponseContentType": file_meta.mime_type,
+                    "ResponseContentDisposition": (
+                        f'attachment; filename="{file_meta.filename}"'
+                    ),
+                },
+                ExpiresIn=self.preview_url_expiration,
+            )
+        except ClientError as e:
+            logger.error(f"Failed to generate download URL: {e}")
+            raise
 
     async def get_text_snippet(
         self, user_id: str, upload_id: str
@@ -460,6 +560,77 @@ class FileUploadService:
             snippet=text,
             truncated=truncated,
             mime_type=file_meta.mime_type,
+        )
+
+    # =========================================================================
+    # Spreadsheet preview
+    # =========================================================================
+
+    async def get_sheet_preview(
+        self, user_id: str, upload_id: str
+    ) -> SheetPreviewResponse:
+        """Read an .xlsx into rows the UI can draw in its data grid.
+
+        The workbook never reaches the browser. Unlike the `.docx`,
+        `.pptx` and `.csv` previews — which fetch the bytes through a
+        presigned URL and parse them client-side — there is no
+        client-side spreadsheet reader we are willing to ship, so the
+        parse happens here and only values cross the wire.
+
+        Args:
+            user_id: The owner's user ID
+            upload_id: The upload identifier
+
+        Returns:
+            SheetPreviewResponse with one entry per visible worksheet
+
+        Raises:
+            FileNotFoundError: not found, not owned, or not ready
+            ThumbnailUnsupportedError: MIME type is not a readable workbook
+            WorkbookTooLargeError: past the reader's byte cap
+            WorkbookUnreadableError: corrupt, encrypted, or not OOXML
+        """
+        file_meta = await self.repository.get_file(user_id, upload_id)
+        if not file_meta:
+            raise FileNotFoundError(f"File {upload_id} not found")
+
+        if file_meta.status != FileStatus.READY:
+            raise FileNotFoundError(
+                f"File {upload_id} is not ready (status: {file_meta.status})"
+            )
+
+        if file_meta.mime_type not in SHEET_PREVIEW_MIME_TYPES:
+            raise ThumbnailUnsupportedError(
+                f"No spreadsheet reader for {file_meta.mime_type}"
+            )
+
+        # Checked before the download so an oversized workbook costs a
+        # metadata read rather than a transfer into memory.
+        if file_meta.size_bytes > MAX_WORKBOOK_BYTES:
+            raise WorkbookTooLargeError(file_meta.size_bytes)
+
+        try:
+            response = self._s3_client.get_object(
+                Bucket=self.bucket_name,
+                Key=file_meta.s3_key,
+            )
+            data = response["Body"].read()
+        except ClientError as e:
+            logger.warning(
+                f"Failed to read workbook {scrub_log(upload_id)}: {scrub_log(e)}"
+            )
+            raise FileNotFoundError(f"File {upload_id} could not be read")
+
+        # openpyxl is CPU-bound and blocking, so it runs off the event
+        # loop. A 20 MB workbook parses for long enough to stall every
+        # other request on this worker if it does not.
+        sheets = await asyncio.to_thread(read_workbook_preview, data)
+
+        return SheetPreviewResponse(
+            upload_id=upload_id,
+            filename=file_meta.filename,
+            sheets=sheets,
+            truncated=any(sheet.truncated for sheet in sheets),
         )
 
     # =========================================================================
@@ -546,9 +717,9 @@ class FileUploadService:
             logger.error(f"Failed to generate thumbnail presigned URL: {e}")
             raise
 
-        expires_at = (
+        expires_at = to_iso(
             datetime.now(timezone.utc) + timedelta(seconds=self.preview_url_expiration)
-        ).isoformat() + "Z"
+        )
 
         return ThumbnailResponse(
             upload_id=upload_id,
@@ -596,6 +767,56 @@ class FileUploadService:
             f"Rendered thumbnail for upload {file_meta.upload_id} "
             f"({len(png_bytes)} bytes)"
         )
+
+    # =========================================================================
+    # DocumentDigest (docs/specs/document-context-offload.md §4A, PR-2)
+    # =========================================================================
+
+    def _schedule_digest(self, file_meta: FileMetadata) -> Optional["asyncio.Task[None]"]:
+        """Queue a digest build for a document upload; ``None`` when skipped.
+
+        Skipped for non-documents, when ``DOCUMENT_DIGEST_ENABLED=false``, or
+        when no event loop is running (a synchronous caller). Never raises.
+        """
+        try:
+            from apis.shared.files.document_digest import document_digest_enabled
+            from apis.shared.files.document_read import is_document_class
+
+            if not document_digest_enabled():
+                return None
+            if not is_document_class(file_meta.mime_type, file_meta.filename):
+                return None
+            task = asyncio.get_running_loop().create_task(self._generate_and_store_digest(file_meta))
+        except Exception:  # noqa: BLE001 - scheduling must never fail the upload
+            logger.warning("Document digest not scheduled", exc_info=True)
+            return None
+        self._digest_tasks.add(task)
+        task.add_done_callback(self._digest_tasks.discard)
+        return task
+
+    async def _generate_and_store_digest(self, file_meta: FileMetadata) -> None:
+        """Read the original, build the digest, persist it. Never raises."""
+        from apis.shared.files.document_digest import build_digest, record_digest
+
+        try:
+            response = await asyncio.to_thread(
+                self._s3_client.get_object, Bucket=self.bucket_name, Key=file_meta.s3_key
+            )
+            raw = await asyncio.to_thread(response["Body"].read)
+            digest = await build_digest(
+                raw=raw,
+                mime_type=file_meta.mime_type,
+                filename=file_meta.filename,
+                upload_id=file_meta.upload_id,
+            )
+            record_digest(digest)
+            stored = await self.repository.update_file_digest(
+                file_meta.user_id, file_meta.upload_id, digest.to_item()
+            )
+            if stored is None:
+                logger.info("Document digest discarded: file row no longer exists")
+        except Exception:  # noqa: BLE001 - a digest is never worth an error
+            logger.warning("Document digest build failed", exc_info=True)
 
     def _delete_thumbnail_object(self, file_meta: FileMetadata) -> None:
         """

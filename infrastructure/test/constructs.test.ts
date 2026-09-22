@@ -8,6 +8,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import { Template } from 'aws-cdk-lib/assertions';
 import { createMockConfig, MOCK_ACCOUNT, MOCK_REGION } from './helpers/mock-config';
+import { mockCognitoRefs } from './helpers/mock-cognito';
 
 import { NetworkConstruct } from '../lib/constructs/network/network-construct';
 import { AlbConstruct } from '../lib/constructs/network/alb-construct';
@@ -210,11 +211,48 @@ describe('CostTrackingTablesConstruct', () => {
 });
 
 describe('AdminTablesConstruct', () => {
-  it('creates 3 DDB tables', () => {
+  it('creates 5 DDB tables', () => {
     const stack = testStack();
     new AdminTablesConstruct(stack, 'Admin', { config: createMockConfig() });
     const t = Template.fromStack(stack);
-    t.resourceCountIs('AWS::DynamoDB::Table', 3);
+    // user-settings, user-menu-links, announcements, system-prompts,
+    // agent-templates.
+    t.resourceCountIs('AWS::DynamoDB::Table', 5);
+  });
+
+  it('creates the agent-templates table with PK/SK and no GSI', () => {
+    // Mirrors SystemPromptsTable exactly: PK/SK string keys, AWS-managed
+    // encryption, no secondary index (the repository lists via Scan).
+    const stack = testStack();
+    new AdminTablesConstruct(stack, 'Admin', { config: createMockConfig() });
+    const t = Template.fromStack(stack);
+    const agentTemplates = Object.values(t.findResources('AWS::DynamoDB::Table'))
+      .filter((table: any) =>
+        (table.Properties.TableName as string)?.includes('agent-templates'),
+      );
+    expect(agentTemplates).toHaveLength(1);
+    const props = (agentTemplates[0] as any).Properties;
+    expect(props.KeySchema).toEqual([
+      { AttributeName: 'PK', KeyType: 'HASH' },
+      { AttributeName: 'SK', KeyType: 'RANGE' },
+    ]);
+    expect(props.GlobalSecondaryIndexes).toBeUndefined();
+    expect(props.SSESpecification).toEqual({ SSEEnabled: true }); // AWS_MANAGED (aws/dynamodb key)
+  });
+
+  it('gives only the announcements table a TTL attribute', () => {
+    // The ack rows (PK `USER#<id>`) expire; the announcement rows and every
+    // sibling table's rows do not. A TTL that spread to a sibling would
+    // silently delete admin-authored content.
+    const stack = testStack();
+    new AdminTablesConstruct(stack, 'Admin', { config: createMockConfig() });
+    const t = Template.fromStack(stack);
+    const ttlTables = Object.values(t.findResources('AWS::DynamoDB::Table'))
+      .filter((table: any) => table.Properties.TimeToLiveSpecification !== undefined)
+      .map((table: any) => table.Properties.TableName as string);
+
+    expect(ttlTables).toHaveLength(1);
+    expect(ttlTables[0]).toContain('announcements');
   });
 });
 
@@ -306,7 +344,10 @@ describe('SpaBucketConstruct', () => {
 describe('AgentCoreGatewayConstruct', () => {
   it('creates Gateway + IAM role', () => {
     const stack = testStack();
-    new AgentCoreGatewayConstruct(stack, 'GW', { config: createMockConfig() });
+    new AgentCoreGatewayConstruct(stack, 'GW', {
+      config: createMockConfig(),
+      ...mockCognitoRefs(stack),
+    });
     const t = Template.fromStack(stack);
     t.resourceCountIs('AWS::BedrockAgentCore::Gateway', 1);
     t.resourceCountIs('AWS::IAM::Role', 1);
@@ -314,7 +355,10 @@ describe('AgentCoreGatewayConstruct', () => {
 
   it('publishes the gateway id SSM parameter for app-api (issue #419)', () => {
     const stack = testStack();
-    new AgentCoreGatewayConstruct(stack, 'GW', { config: createMockConfig() });
+    new AgentCoreGatewayConstruct(stack, 'GW', {
+      config: createMockConfig(),
+      ...mockCognitoRefs(stack),
+    });
     const t = Template.fromStack(stack);
     t.hasResourceProperties('AWS::SSM::Parameter', {
       Name: '/test-project/gateway/id',

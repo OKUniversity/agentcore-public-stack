@@ -3,13 +3,14 @@
 Provides endpoints for managing session metadata.
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query, Response, BackgroundTasks, status
+from fastapi import APIRouter, HTTPException, Depends, Path, Query, Response, BackgroundTasks, status
 from typing import Optional
 import logging
-from datetime import datetime, timezone
 from apis.shared.sessions.models import (
     UpdateSessionMetadataRequest,
     SessionInterruptRequest,
+    SessionSteerRequest,
+    SessionSteerResponse,
     SessionMetadataResponse,
     SessionMetadata,
     SessionPreferences,
@@ -17,7 +18,17 @@ from apis.shared.sessions.models import (
     BulkDeleteSessionsRequest,
     BulkDeleteSessionsResponse,
     BulkDeleteSessionResult,
-    MessagesListResponse
+    MessagesListResponse,
+    MessageFeedback,
+    MessageFeedbackRequest,
+    ImplicitSignalRequest,
+    BrowserLiveViewResponse,
+)
+from apis.shared.sessions.feedback import (
+    SessionNotOwned,
+    delete_message_feedback,
+    put_message_feedback,
+    record_implicit_signal,
 )
 from apis.shared.sessions.messages import get_messages
 from apis.shared.sessions.metadata import (
@@ -32,11 +43,18 @@ from apis.shared.sessions.metadata import (
 )
 from .services.session_service import SessionService
 from apis.app_api.shares.service import get_share_service
+from apis.app_api.artifacts.service import get_artifact_share_service
 from apis.shared.auth.dependencies import get_current_user_from_session
+from apis.shared.feature_flags import (
+    response_feedback_enabled,
+    mid_turn_steering_enabled,
+    browser_takeover_enabled,
+)
 from apis.shared.auth.models import User
 from apis.shared.system_prompts.service import get_system_prompts_service
 
 from apis.shared.security.log_sanitize import scrub_log
+from apis.shared.timestamps import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -272,7 +290,7 @@ async def update_session_metadata_endpoint(
                 )
 
             # Create new session metadata with defaults
-            now = datetime.now(timezone.utc).isoformat() + "Z"
+            now = utc_now_iso()
 
             # Build preferences if any preference fields are provided
             preferences = None
@@ -453,6 +471,17 @@ async def delete_session_endpoint(
             session_id
         )
 
+        # 4. Revoke artifact shares from this session. Artifacts outlive
+        # the chat that produced them, so without this a deleted
+        # conversation leaves live links to its artifacts. Best-effort
+        # and never-raising, like the conversation cascade above — and a
+        # no-op when artifacts aren't enabled for this environment.
+        background_tasks.add_task(
+            get_artifact_share_service().delete_for_session,
+            session_id,
+            user_id
+        )
+
         logger.info("Successfully deleted session")
 
         return Response(status_code=204)
@@ -513,6 +542,7 @@ async def bulk_delete_sessions_endpoint(
     try:
         service = SessionService()
         share_service = get_share_service()
+        artifact_share_service = get_artifact_share_service()
 
         for session_id in session_ids:
             try:
@@ -535,6 +565,11 @@ async def bulk_delete_sessions_endpoint(
                     background_tasks.add_task(
                         share_service.delete_shares_for_session,
                         session_id
+                    )
+                    background_tasks.add_task(
+                        artifact_share_service.delete_for_session,
+                        session_id,
+                        user_id
                     )
                     results.append(BulkDeleteSessionResult(
                         session_id=session_id,
@@ -641,28 +676,147 @@ async def get_session_messages_endpoint(
         )
 
 
+def _require_message_feedback() -> None:
+    """404 while ``RESPONSE_FEEDBACK_ENABLED=false`` — the surface does not exist."""
+    if not response_feedback_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+@router.put(
+    "/{session_id}/messages/{message_id}/feedback",
+    response_model=MessageFeedback,
+    response_model_by_alias=True,
+    response_model_exclude_none=True,
+)
+async def put_message_feedback_endpoint(
+    session_id: str,
+    message_id: int = Path(..., ge=0, description="0-based message index"),
+    body: MessageFeedbackRequest = ...,
+    current_user: User = Depends(get_current_user_from_session),
+):
+    """Thumb an assistant message up (+1) or down (-1), optionally with a
+    reason code. Idempotent per (user, message): a second click replaces the
+    first. Content-free by construction — the body is a closed enum, so no
+    text can be stored (``apis.shared.sessions.feedback``).
+
+    ``message_id`` is the message's 0-based index in the conversation — the
+    trailing number of the SPA's ``msg-{sessionId}-{index}`` id, and the
+    ``messageId`` the message's cost row carries. ``retryMessageId`` in the
+    body links the user message sent as a retry-with-correction; it is kept
+    across later thumbs on the same message.
+    """
+    _require_message_feedback()
+    try:
+        return await put_message_feedback(
+            session_id=session_id,
+            user_id=current_user.user_id,
+            message_id=message_id,
+            value=body.value,
+            reason=body.reason,
+            retry_message_id=body.retry_message_id,
+        )
+    except SessionNotOwned:
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        # No metadata table configured (local dev without DynamoDB).
+        logger.warning("Message feedback unavailable: %s", scrub_log(str(e)))
+        raise HTTPException(status_code=503, detail="Message feedback is not available")
+    except Exception:
+        logger.error("Error storing message feedback", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to store message feedback")
+
+
+@router.delete("/{session_id}/messages/{message_id}/feedback", status_code=204)
+async def delete_message_feedback_endpoint(
+    session_id: str,
+    message_id: int = Path(..., ge=0, description="0-based message index"),
+    current_user: User = Depends(get_current_user_from_session),
+):
+    """Withdraw this user's thumb on a message. 204 whether or not one existed."""
+    _require_message_feedback()
+    try:
+        await delete_message_feedback(
+            session_id=session_id,
+            user_id=current_user.user_id,
+            message_id=message_id,
+        )
+    except SessionNotOwned:
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+    except RuntimeError as e:
+        logger.warning("Message feedback unavailable: %s", scrub_log(str(e)))
+        raise HTTPException(status_code=503, detail="Message feedback is not available")
+    except Exception:
+        logger.error("Error deleting message feedback", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete message feedback")
+    return Response(status_code=204)
+
+
+@router.post("/{session_id}/messages/{message_id}/signals", status_code=204)
+async def record_implicit_signal_endpoint(
+    session_id: str,
+    message_id: int = Path(..., ge=0, description="0-based message index"),
+    body: ImplicitSignalRequest = ...,
+    current_user: User = Depends(get_current_user_from_session),
+):
+    """Record an implicit signal (``copy`` / ``continue``) on an assistant
+    message — response-feedback spec §10. Fire-and-forget from the SPA:
+    always 204 once accepted, never a reason to show the user anything.
+    Content-free: the body is a closed enum."""
+    _require_message_feedback()
+    try:
+        await record_implicit_signal(
+            session_id=session_id,
+            user_id=current_user.user_id,
+            message_id=message_id,
+            kind=body.kind,
+        )
+    except SessionNotOwned:
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+    except RuntimeError as e:
+        logger.warning("Message feedback unavailable: %s", scrub_log(str(e)))
+        raise HTTPException(status_code=503, detail="Message feedback is not available")
+    except Exception:
+        logger.error("Error recording implicit signal", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to record signal")
+    return Response(status_code=204)
+
+
 @router.post("/{session_id}/interrupt", status_code=204)
 async def signal_turn_interrupted_endpoint(
     session_id: str,
     body: SessionInterruptRequest,
     current_user: User = Depends(get_current_user_from_session),
 ):
-    """Record that the user deliberately stopped the session's in-flight turn.
+    """Record a client-attested reason for the session's turn being interrupted.
 
-    This is the AUTHORITATIVE carrier of stop intent for the interrupted-turn
-    flow: the transport cannot distinguish a Stop click from a dropped socket
-    (both surface as a cancelled stream), so the SPA signals intent here
-    out-of-band when the user clicks Stop — via ``fetch(..., {keepalive:
+    This is the AUTHORITATIVE carrier of client intent for the
+    interrupted-turn flow: the transport cannot distinguish a Stop click from
+    a refresh from a dropped socket (all three surface as a cancelled
+    stream), so the SPA signals out-of-band — via ``fetch(..., {keepalive:
     true})`` with the ``X-CSRF-Token`` header (NOT ``navigator.sendBeacon``,
     which cannot set headers and would be rejected by CSRFMiddleware).
+
+    Two reasons are accepted, and they mean different things:
+
+      * ``user_stopped``   — the Stop button. Deliberate: the user rejected
+        the response in flight, so the turn is cancelled server-side too.
+      * ``navigated_away`` — the page was hidden or unloaded mid-turn. The
+        user left; they did not reject anything. **Recorded only** — the
+        running turn is deliberately left alone, matching today's behaviour
+        where a refresh lets the turn finish server-side and the reload
+        offers to continue it. Recorded only while the session's
+        single-flight lease is held: "mid-turn" is a claim this endpoint
+        verifies rather than takes from the client (see the gate below).
 
     Lives on app-api, not inference-api: the AgentCore Runtime data plane
     only proxies ``/invocations`` + ``/ping``, so a custom inference-api
     route would 404 in cloud.
 
-    ``user_stopped`` takes precedence over the ``connection_lost`` fallback
-    that inference-api's cancellation backstop may race against this write
-    (see ``set_interrupted_turn``). No-op for missing sessions — and the GSI
+    Both take precedence over the ``connection_lost`` fallback that
+    inference-api's cancellation backstop may race against this write (see
+    ``set_interrupted_turn``). No-op for missing sessions — and the GSI
     lookup inside ``set_interrupted_turn`` is user-scoped, so a session
     owned by someone else is also a no-op. Returns 204 either way (the
     user's intent is recorded best-effort; the client never waits on it).
@@ -672,6 +826,29 @@ async def signal_turn_interrupted_endpoint(
     logger.info("POST /sessions/.../interrupt (reason=%s)", body.reason)
 
     try:
+        # A departure can only interrupt a turn that is actually running.
+        # The SPA decides that from its own transport state, which has been
+        # wrong before: a controller left behind after a completed stream
+        # made every finished turn in the tab eligible, so a later refresh
+        # marked complete answers as interrupted (a false "Response
+        # interrupted" chip, and a false interruption note on the session's
+        # next prompt). The single-flight lease is the server's own answer to
+        # "is a turn in flight", so assert it here rather than trusting the
+        # client — old tabs keep running the old SPA long after the fix ships.
+        #
+        # `user_stopped` is deliberately NOT gated: the Stop button only
+        # exists while streaming, and it also arms cancellation below, which
+        # must reach a turn whose lease read fails for any reason.
+        if body.reason == "navigated_away":
+            from apis.shared.sessions.session_lease import is_session_lease_held
+
+            if not await is_session_lease_held(session_id, user_id):
+                logger.info(
+                    "Ignoring navigated_away for session %s — no turn in flight",
+                    scrub_log(session_id),
+                )
+                return Response(status_code=204)
+
         await set_interrupted_turn(
             session_id,
             user_id,
@@ -685,11 +862,19 @@ async def signal_turn_interrupted_endpoint(
         # so the user's resend isn't rejected with 409 and stopping wasted
         # model/tool work. Owner-scoped, so a stale Stop can't kill a later
         # turn. Best-effort: never fail the Stop signal on this.
-        try:
-            from apis.shared.sessions.session_lease import request_session_cancel
-            await request_session_cancel(session_id, user_id)
-        except Exception:
-            logger.warning("Failed to arm session cancel on stop", exc_info=True)
+        #
+        # Deliberate Stop ONLY. `navigated_away` is an attribution signal, not
+        # an instruction: cancelling on it would make every refresh kill the
+        # turn it interrupted, discarding work the reload is about to offer to
+        # continue. Leaving the turn running preserves exactly today's
+        # behaviour for a departure — this endpoint's reason set widened, the
+        # side effects did not.
+        if body.reason == "user_stopped":
+            try:
+                from apis.shared.sessions.session_lease import request_session_cancel
+                await request_session_cancel(session_id, user_id)
+            except Exception:
+                logger.warning("Failed to arm session cancel on stop", exc_info=True)
         return Response(status_code=204)
     except Exception:
         logger.error("Error recording turn interruption", exc_info=True)
@@ -697,6 +882,102 @@ async def signal_turn_interrupted_endpoint(
             status_code=500,
             detail="Failed to record interruption",
         )
+
+
+@router.post("/{session_id}/steer", response_model=SessionSteerResponse, response_model_by_alias=True)
+async def steer_running_turn_endpoint(
+    session_id: str,
+    body: SessionSteerRequest,
+    current_user: User = Depends(get_current_user_from_session),
+):
+    """Queue a follow-up for injection into the turn that is streaming right now.
+
+    Mid-turn steering (docs/specs/mid-turn-steering.md). PR #916 made Enter
+    mean "say this" while a response streams, but the follow-up sat in the
+    composer until the turn ended — so a user who saw the agent open the wrong
+    file could only wait or Stop-and-resend, and the second discards a partial
+    generation and re-establishes the prefix. This endpoint arms the text on
+    the session's single-flight lease row; the container running the turn
+    peeks it at its next tool boundary and appends it to the tool-result
+    message, so the agent reads it before choosing its next action.
+
+    Lives on app-api, not inference-api, for the same reason ``/interrupt``
+    does: the AgentCore Runtime data plane proxies only ``/invocations`` and
+    ``/ping``, so a steer route on inference-api would 404 in cloud. The lease
+    row is the cross-container side channel — exactly the mechanism the Stop
+    path already proves — and it is owner-scoped, so a steer armed against a
+    turn that has since ended is ignored rather than misdelivered to the next
+    one.
+
+    Returns 200 with ``queued=false`` when there is no live turn to steer, or
+    when the turn ended between the user typing and this request landing. That
+    race resolving to "not queued" is the correct outcome, not an error: the
+    SPA leaves the entry in its queue and the existing end-of-turn flush sends
+    it as a normal turn. 429 when the inbox is at its cap (same fallback).
+    """
+    if not mid_turn_steering_enabled():
+        raise HTTPException(status_code=404, detail="Mid-turn steering is not enabled")
+
+    user_id = current_user.user_id
+
+    logger.info("POST /sessions/.../steer")
+
+    from apis.shared.sessions.session_lease import (
+        SteerQueueFullError,
+        request_session_steer,
+    )
+
+    try:
+        queued = await request_session_steer(
+            session_id,
+            user_id,
+            text=body.text,
+            entry_id=body.entry_id,
+        )
+    except SteerQueueFullError:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many follow-ups are already queued for this turn",
+        )
+    except Exception:
+        logger.error("Error queueing a mid-turn steer", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to queue the follow-up")
+
+    return SessionSteerResponse(queued=queued, entry_id=body.entry_id)
+
+
+@router.delete("/{session_id}/steer/{entry_id}", status_code=204)
+async def withdraw_steer_endpoint(
+    session_id: str,
+    entry_id: str,
+    current_user: User = Depends(get_current_user_from_session),
+):
+    """Withdraw a queued follow-up the user removed from the composer.
+
+    Best-effort and idempotent: an unknown id, an already-consumed entry, and
+    a turn that has since ended all answer 204, because the user's intent —
+    "don't send that" — is satisfied in every one of those cases. Only the
+    caller's own session's inbox is reachable, since the lease row is keyed
+    under ``USER#{user_id}``.
+    """
+    if not mid_turn_steering_enabled():
+        raise HTTPException(status_code=404, detail="Mid-turn steering is not enabled")
+
+    user_id = current_user.user_id
+
+    logger.info("DELETE /sessions/.../steer/...")
+
+    try:
+        from apis.shared.sessions.session_lease import remove_steer_entry
+
+        await remove_steer_entry(session_id, user_id, entry_id)
+    except Exception:
+        # The entry is either still queued (and will be injected, which the
+        # SPA can render) or already gone. Neither is worth a 500 on a
+        # withdrawal the user has already seen disappear from their composer.
+        logger.warning("Failed to withdraw a queued steer", exc_info=True)
+
+    return Response(status_code=204)
 
 
 @router.delete("/{session_id}/pending-interrupts/{interrupt_id:path}", status_code=204)
@@ -732,3 +1013,77 @@ async def dismiss_pending_interrupt_endpoint(
             status_code=500,
             detail=f"Failed to dismiss interrupt: {str(e)}",
         )
+
+
+@router.post(
+    "/{session_id}/browser/live-view",
+    response_model=BrowserLiveViewResponse,
+    response_model_by_alias=True,
+)
+async def mint_browser_live_view_endpoint(
+    session_id: str,
+    current_user: User = Depends(get_current_user_from_session),
+):
+    """Mint a short-lived Live View URL for this conversation's browser session.
+
+    The client sends **only** the conversation id. This route looks the browser
+    session up server-side from the metadata row's `browserSession` projection
+    (spec D4) and signs a fresh URL per call, which is what makes a sign-in that
+    takes twenty minutes work against a signature that lives 300 seconds.
+
+    POST rather than GET on purpose: the response carries a live SigV4
+    signature, and a GET invites it into browser history, referrer headers and
+    access logs. Nothing sensitive goes in the path or query either way.
+
+    Ownership is the metadata read itself — `get_session_metadata` is
+    user-scoped through the GSI, so another user's conversation is
+    indistinguishable from a missing one, and both are 404.
+
+    Status codes:
+      * 404 — flag off, no such conversation for this user, or no browser
+        session on it. All three are "this surface does not exist for you".
+      * 409 — the conversation names a browser session the service will no
+        longer stream (ended, timed out, stopped). Distinct from 404 because
+        the SPA should say "the session ended", not "no viewer here".
+
+    Lives on app-api, not inference-api: the Runtime data plane proxies only
+    `/invocations` and `/ping`, so this would 404 in cloud from there.
+    """
+    if not browser_takeover_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    from .services.browser_live_view import (
+        LiveViewUnavailable,
+        mint_live_view,
+        summarize_for_log,
+    )
+
+    user_id = current_user.user_id
+    logger.info("POST /sessions/.../browser/live-view")
+
+    metadata = await get_session_metadata(session_id, user_id)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    ref = metadata.browser_session
+    if not ref:
+        raise HTTPException(
+            status_code=404,
+            detail="This conversation has no browser session to view.",
+        )
+
+    try:
+        minted = await mint_live_view(ref)
+    except LiveViewUnavailable as exc:
+        logger.info(
+            "browser live view unavailable for %s (%s): %s",
+            scrub_log(session_id), summarize_for_log(ref), exc.message,
+        )
+        raise HTTPException(status_code=exc.code, detail=exc.message)
+    except Exception:
+        # Deliberately generic: the exception text from a signing failure can
+        # contain the partially-built URL.
+        logger.error("Error minting browser live view", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to mint live view")
+
+    return BrowserLiveViewResponse.model_validate(minted)

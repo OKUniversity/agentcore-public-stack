@@ -13,18 +13,27 @@ import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
   heroArrowDownTray,
   heroArrowPath,
+  heroBookOpen,
+  heroCheckCircle,
+  heroExclamationTriangle,
   heroGlobeAlt,
   heroLink,
+  heroMagnifyingGlass,
   heroPlus,
+  heroSparkles,
   heroTrash,
+  heroXMark,
 } from '@ng-icons/heroicons/outline';
 import { Dialog } from '@angular/cdk/dialog';
 import { DocumentService, DocumentUploadError } from '../assistants/services/document.service';
 import {
   Document,
+  DocumentStatus,
+  KbUsage,
   PROCESSING_STATUSES,
   STALE_DOCUMENT_THRESHOLD_MS,
 } from '../assistants/models/document.model';
+import { SpinnerComponent } from '../components/spinner/spinner.component';
 import {
   FileSourceBrowserDialogComponent,
   FileSourceBrowserDialogData,
@@ -33,6 +42,10 @@ import {
   WebSourceDialogComponent,
   WebSourceDialogData,
 } from '../assistants/components/web-source-dialog.component';
+import {
+  ExtractedContentDialogComponent,
+  ExtractedContentDialogData,
+} from '../assistants/components/extracted-content-dialog.component';
 import { FileSourceService } from '../assistants/services/file-source.service';
 import { WebSourceService } from '../assistants/services/web-source.service';
 import { SyncPolicyService } from '../assistants/services/sync-policy.service';
@@ -50,6 +63,12 @@ import {
 import { UserConnectorsService } from '../settings/connectors/services/user-connectors.service';
 import { OAuthConsentService } from '../services/oauth-consent/oauth-consent.service';
 import { ToastService } from '../services/toast/toast.service';
+import {
+  DocumentNotCarried,
+  KbUpgradeService,
+  UpgradeStatus,
+} from './kb-upgrade.service';
+import { parseIso } from '../utils/date';
 
 /**
  * The reusable "Knowledge base" authoring section — device upload, web-crawl
@@ -70,15 +89,21 @@ import { ToastService } from '../services/toast/toast.service';
   selector: 'app-knowledge-base-section',
   templateUrl: './knowledge-base-section.component.html',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [NgIcon, SyncPolicyControlComponent],
+  imports: [NgIcon, SyncPolicyControlComponent, SpinnerComponent],
   providers: [
     provideIcons({
       heroArrowDownTray,
       heroArrowPath,
+      heroBookOpen,
+      heroCheckCircle,
+      heroExclamationTriangle,
       heroGlobeAlt,
       heroLink,
+      heroMagnifyingGlass,
       heroPlus,
+      heroSparkles,
       heroTrash,
+      heroXMark,
     }),
   ],
 })
@@ -91,6 +116,7 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
   private readonly consentService = inject(OAuthConsentService);
   private readonly dialog = inject(Dialog);
   private readonly toast = inject(ToastService);
+  private readonly kbUpgrade = inject(KbUpgradeService);
 
   // ── Inputs ────────────────────────────────────────────────────────────
 
@@ -169,6 +195,256 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
   readonly isLoadingCrawls = signal<boolean>(false);
   /** Source refs (document/crawl ids) with a sync mutation in flight. */
   readonly syncBusySourceRefs = signal<Set<string>>(new Set());
+
+  // ── Knowledge base upgrade (managed-kb-migration, Requirements 21 & 23) ──
+  //
+  // The whole surface hangs off one server-derived phase. Nothing here decides
+  // *whether* an upgrade is available — that judgement needs the record's
+  // migration state and a platform flag, neither of which belongs in a
+  // component. The client's job is to render honestly and never nag.
+
+  /** Server-derived upgrade state. `null` until read; renders nothing either way. */
+  readonly upgradeStatus = signal<UpgradeStatus | null>(null);
+  /** True while a start/retry request is in flight. */
+  readonly upgradeBusy = signal<boolean>(false);
+  /** Locally hidden the moment the user dismisses, before the server confirms. */
+  readonly upgradeNoticeHidden = signal<boolean>(false);
+  /** Whether the stranded-document list is expanded. Collapsed by default. */
+  readonly strandedExpanded = signal<boolean>(false);
+  private upgradeHydratedForId: string | null = null;
+  private upgradePollHandle: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * The phase to render, or `'none'` for nothing at all.
+   *
+   * Requirement 23.1: a legacy knowledge base needing no action shows no badge,
+   * no banner and no prompt. That is the default here rather than a special
+   * case — an unread status is indistinguishable from nothing to say.
+   */
+  readonly upgradePhase = computed(() => this.upgradeStatus()?.phase ?? 'none');
+
+  // ── Engine visibility (task 16.4, HANDOFF §6) ───────────────────────────
+  //
+  // Two surfaces, one source: the server-derived engine on the upgrade status.
+  // The badge names the engine, and the per-document status vocabulary follows
+  // it — because a managed knowledge base no longer emits chunking/embedding
+  // (PR #900), so its documents must not be described with legacy words.
+
+  /** The engine serving this knowledge base; `classic` until a status is read. */
+  readonly kbEngine = computed(() => this.upgradeStatus()?.engine ?? 'classic');
+
+  /** True when this knowledge base is served by the managed backend. */
+  readonly isManagedEngine = computed(() => this.kbEngine() === 'managed');
+
+  /** The `Managed`/`Classic` badge label. */
+  readonly engineBadgeLabel = computed(() => (this.isManagedEngine() ? 'Managed' : 'Classic'));
+
+  /**
+   * Whether to show the engine badge at all.
+   *
+   * Only for an existing knowledge base that actually has documents — a badge on
+   * an empty or not-yet-created section would label a store with nothing in it.
+   * Engine is not sensitive, so this is not permission-gated.
+   */
+  readonly showEngineBadge = computed(
+    () => this.mode() === 'edit' && this.uploadedDocuments().length > 0,
+  );
+
+  // ── KB storage usage bar (byte-cap visibility, Requirement 12.11) ────────
+  //
+  // Managed knowledge bases are byte-capped, so the fleet's managed-storage
+  // cost stays bounded — but a cap the user cannot see is a cap they cannot act
+  // on. The usage bar makes their consumption visible against the binding cap
+  // and turns green→yellow→red as it fills. A legacy KB is uncapped: it shows
+  // only what is stored and stays green. Both come back on the documents list
+  // (`kbUsage`), so there is no extra round-trip.
+
+  /** Storage usage for this KB, from the documents-list response. `null` until read. */
+  readonly kbUsage = signal<KbUsage | null>(null);
+
+  /** Committed + in-flight reserved bytes — what the owner is actually consuming. */
+  readonly kbUsedBytes = computed(() => {
+    const usage = this.kbUsage();
+    if (!usage) return 0;
+    return (usage.storedBytes ?? 0) + (usage.reservedBytes ?? 0);
+  });
+
+  /** Managed KBs carry a cap; a legacy KB returns `cap: null` (uncapped). */
+  readonly kbHasCap = computed(() => (this.kbUsage()?.cap ?? null) !== null);
+
+  /** Show the bar only for an existing record whose usage we have resolved. */
+  // The bar visualises stored bytes against a cap — both of which exist only for
+  // a managed KB (byte tracking is scoped to managed by Requirement 12.11). A
+  // legacy/Classic KB is uncapped and reports zeroed counters, so the bar would
+  // read "0 B stored" beside real documents, which reads as a bug to the user.
+  // Show it only for the managed engine; the per-document sizes carry the rest.
+  readonly showUsageBar = computed(
+    () => this.mode() === 'edit' && this.kbUsage()?.engine === 'managed',
+  );
+
+  /** Fraction of the cap used, clamped 0–1. 0 for an uncapped KB (no denominator). */
+  readonly kbUsageFraction = computed(() => {
+    const usage = this.kbUsage();
+    if (!usage || usage.cap == null || usage.cap <= 0) return 0;
+    return Math.min(this.kbUsedBytes() / usage.cap, 1);
+  });
+
+  /** Percent label ("83%"), shown only when there is a cap. */
+  readonly kbUsagePercentLabel = computed(() =>
+    this.kbHasCap() ? `${Math.round(this.kbUsageFraction() * 100)}%` : '',
+  );
+
+  /**
+   * Bar colour: green under 75%, yellow 75–<90%, red at 90%+ of the cap. An
+   * uncapped legacy KB has no meaningful ratio, so it is always green.
+   */
+  readonly kbUsageLevel = computed<'green' | 'yellow' | 'red'>(() => {
+    if (!this.kbHasCap()) return 'green';
+    const fraction = this.kbUsageFraction();
+    if (fraction >= 0.9) return 'red';
+    if (fraction >= 0.75) return 'yellow';
+    return 'green';
+  });
+
+  /**
+   * Bar fill width. Capped KBs fill to the used fraction (with a 2% floor so a
+   * tiny non-zero usage is still visible). An uncapped legacy KB has no
+   * denominator, so it renders a small fixed sliver rather than a misleading
+   * full or empty bar.
+   */
+  readonly kbUsageBarWidth = computed(() => {
+    if (!this.kbHasCap()) return '8%';
+    const used = this.kbUsedBytes();
+    if (used <= 0) return '0%';
+    return `${Math.max(this.kbUsageFraction() * 100, 2)}%`;
+  });
+
+  /** Caption under the bar: "12 MB of 100 MB used", or uncapped "12 MB stored". */
+  readonly kbUsageLabel = computed(() => {
+    const usage = this.kbUsage();
+    if (!usage) return '';
+    const used = this.formatBytes(this.kbUsedBytes());
+    if (usage.cap == null) return `${used} stored`;
+    return `${used} of ${this.formatBytes(usage.cap)} used`;
+  });
+
+  /**
+   * The user-facing label for a document's processing status, in the vocabulary
+   * of the knowledge base's engine (task 16.4, HANDOFF §6).
+   *
+   * Managed knowledge bases no longer emit `chunking`/`embedding` (PR #900): the
+   * managed ingestion consumer writes only `uploading` then `complete`, so the
+   * whole indexing wait showed as the literal word "Uploading". Managed therefore
+   * reads `uploading → processing → ready` (+ `failed`); legacy assistants keep
+   * the finer-grained words they still emit. The word "vector" appears nowhere,
+   * per Requirement 23.6.
+   *
+   * `provisioning` is checked before the engine split and reads the same either
+   * way. A born-managed first upload sets it in the same request that declares the
+   * knowledge base managed, but the engine here comes from the upgrade-status
+   * poll — which may not have caught up yet — so keying this label on the engine
+   * would show a first-time author "Uploading" for the minutes their knowledge
+   * base is being built. The status itself is unambiguous, so it answers alone.
+   */
+  statusLabel(docStatus: DocumentStatus): string {
+    if (docStatus === 'provisioning') {
+      return 'Provisioning knowledge base…';
+    }
+    if (this.isManagedEngine()) {
+      switch (docStatus) {
+        case 'complete':
+          return 'Ready';
+        case 'failed':
+          return 'Failed';
+        default:
+          // `uploading` — and any legacy word a mid-migration record might still
+          // carry — reads as the honest "still working on it" on the managed path.
+          return 'Processing';
+      }
+    }
+    switch (docStatus) {
+      case 'uploading':
+        return 'Uploading';
+      case 'chunking':
+        return 'Chunking';
+      case 'embedding':
+        return 'Embedding';
+      case 'complete':
+        return 'Complete';
+      case 'failed':
+        return 'Failed';
+      default:
+        return docStatus;
+    }
+  }
+
+  /** Requirement 23.2 — the opt-in card. Only ever for owners and editors. */
+  readonly showUpgradeOffer = computed(
+    () => this.upgradePhase() === 'available' && (this.upgradeStatus()?.canUpgrade ?? false),
+  );
+
+  /** Requirement 23.3 — non-blocking progress; the user may navigate away. */
+  readonly showUpgradeProgress = computed(() => this.upgradePhase() === 'in_progress');
+
+  /** Requirement 23.5 — a plain-language failure with a way forward. */
+  readonly showUpgradeFailure = computed(() => this.upgradePhase() === 'failed');
+
+  /**
+   * Requirement 23.4 — a one-time dismissible notice, never a permanent badge.
+   *
+   * Gated on the local hide as well as the server's flag so the notice
+   * disappears on click rather than on the next poll.
+   */
+  readonly showUpgradeNotice = computed(
+    () =>
+      this.upgradePhase() === 'succeeded' &&
+      (this.upgradeStatus()?.noticePending ?? false) &&
+      !this.upgradeNoticeHidden(),
+  );
+
+  /**
+   * Documents the upgrade will not carry across (Requirement 21.1).
+   *
+   * Surfaced alongside the offer — before the user commits — because the
+   * decision to retry or accept the loss is theirs to make with the facts in
+   * hand. 200 of 1,692 production documents are affected, including 95 whose
+   * owners believe the upload worked.
+   */
+  readonly strandedDocuments = computed<DocumentNotCarried[]>(
+    () => this.upgradeStatus()?.documentsNotCarried ?? [],
+  );
+
+  /**
+   * Whether to show the stranded-document warning at all.
+   *
+   * Shown with the offer and with a failure, but not during progress: mid-run is
+   * the one moment the user can do nothing about it, and a warning you cannot
+   * act on is just noise.
+   */
+  readonly showStrandedDocuments = computed(
+    () =>
+      this.strandedDocuments().length > 0 &&
+      (this.showUpgradeOffer() || this.showUpgradeFailure()),
+  );
+
+  /** Human progress text. Falls back to an honest vaguer form when counts are absent. */
+  readonly upgradeProgressLabel = computed(() => {
+    const progress = this.upgradeStatus()?.progress;
+    if (!progress || progress.total <= 0) {
+      return 'Upgrading your knowledge base…';
+    }
+    return `Upgrading — ${progress.completed} of ${progress.total} documents`;
+  });
+
+  /** Percentage for the progress bar, clamped so a bad count cannot overflow it. */
+  readonly upgradeProgressPercent = computed(() => {
+    const progress = this.upgradeStatus()?.progress;
+    if (!progress || progress.total <= 0) {
+      return 0;
+    }
+    return Math.min(100, Math.max(0, Math.round((progress.completed / progress.total) * 100)));
+  });
+
   /** Provider whose consent popup was opened from a "Reconnect" affordance. */
   readonly reconnectingProviderId = signal<string | null>(null);
 
@@ -316,12 +592,156 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
       }
     });
 
+    // Read the upgrade status once the id is known AND the permission is
+    // resolved. Gated on the permission for the same reason the sync surface is:
+    // issuing it with the default 'owner' guess would ask about a control the
+    // user may not have. Failure inside loadUpgradeStatus leaves the phase at
+    // 'none', which renders nothing — the correct outcome for an optional card.
+    effect(() => {
+      const id = this.id();
+      if (!id || !this.permissionResolved() || id === this.upgradeHydratedForId) {
+        return;
+      }
+      this.upgradeHydratedForId = id;
+      void this.loadUpgradeStatus();
+    });
+
     // Load the connectors the user can import documents from (create or edit).
     void this.loadFileSources();
   }
 
   ngOnDestroy(): void {
     this.stopCrawlWatcher();
+    this.stopUpgradePoll();
+  }
+
+  // ── Knowledge base upgrade ──────────────────────────────────────────────
+
+  /**
+   * Read the upgrade status and start or stop polling to match.
+   *
+   * The service resolves rather than rejects on failure, so there is no error
+   * path here: an unreadable status is `phase: 'none'`, which renders nothing.
+   */
+  async loadUpgradeStatus(): Promise<void> {
+    const id = this.id();
+    if (!id) {
+      return;
+    }
+    const status = await this.kbUpgrade.getStatus(id);
+    this.upgradeStatus.set(status);
+    if (status.phase === 'in_progress') {
+      this.startUpgradePoll();
+    } else {
+      this.stopUpgradePoll();
+    }
+  }
+
+  /**
+   * Opt in to the upgrade (Requirement 23.2).
+   *
+   * Optimistically moves to `in_progress` so the card responds immediately, then
+   * reconciles from the server. A refusal restores the real state rather than
+   * leaving a spinner over a knowledge base that never enrolled.
+   */
+  async startUpgrade(): Promise<void> {
+    const id = this.id();
+    if (!id || this.upgradeBusy()) {
+      return;
+    }
+    this.upgradeBusy.set(true);
+    try {
+      const result = await this.kbUpgrade.start(id);
+      this.toast.success(result.message);
+      await this.loadUpgradeStatus();
+    } catch (err: unknown) {
+      this.toast.error(err instanceof Error ? err.message : 'Could not start the upgrade.');
+      // Re-read rather than guess: the refusal may itself have been "already
+      // running", in which case the truthful phase is not the one we started at.
+      await this.loadUpgradeStatus();
+    } finally {
+      this.upgradeBusy.set(false);
+    }
+  }
+
+  /** Restart a failed upgrade (Requirement 23.5). Never a dead end. */
+  async retryUpgrade(): Promise<void> {
+    const id = this.id();
+    if (!id || this.upgradeBusy()) {
+      return;
+    }
+    this.upgradeBusy.set(true);
+    try {
+      const result = await this.kbUpgrade.retry(id);
+      this.toast.success(result.message);
+      await this.loadUpgradeStatus();
+    } catch (err: unknown) {
+      this.toast.error(err instanceof Error ? err.message : 'Could not restart the upgrade.');
+      await this.loadUpgradeStatus();
+    } finally {
+      this.upgradeBusy.set(false);
+    }
+  }
+
+  /**
+   * Dismiss the one-time success notice (Requirement 23.4).
+   *
+   * Hidden locally first so the click feels instant; the server call only stops
+   * it coming back on the next load, and is allowed to fail quietly.
+   */
+  async dismissUpgradeNotice(): Promise<void> {
+    const id = this.id();
+    this.upgradeNoticeHidden.set(true);
+    if (id) {
+      await this.kbUpgrade.dismissNotice(id);
+    }
+  }
+
+  toggleStrandedDocuments(): void {
+    this.strandedExpanded.update((open) => !open);
+  }
+
+  /**
+   * Group heading for a stranded document (Requirement 21.4).
+   *
+   * The two failure kinds get different words because they need different
+   * actions from the user.
+   */
+  strandedHeading(kind: DocumentNotCarried['kind']): string {
+    switch (kind) {
+      case 'unsupported_format':
+        return 'Cannot be read by this platform';
+      case 'processing_failure':
+        return 'Could not be processed';
+      case 'being_removed':
+        return 'Currently being removed';
+      default:
+        return 'Still being processed';
+    }
+  }
+
+  /**
+   * Poll while an upgrade runs.
+   *
+   * Deliberately a plain interval rather than anything cleverer: the upgrade
+   * takes minutes and the page must stay usable throughout, so a slow refresh
+   * of one small payload is the whole requirement. Cleared in ngOnDestroy —
+   * without that, navigating away leaves a timer polling a dead component.
+   */
+  private startUpgradePoll(): void {
+    if (this.upgradePollHandle) {
+      return;
+    }
+    this.upgradePollHandle = setInterval(() => {
+      void this.loadUpgradeStatus();
+    }, 15000);
+  }
+
+  private stopUpgradePoll(): void {
+    if (this.upgradePollHandle) {
+      clearInterval(this.upgradePollHandle);
+      this.upgradePollHandle = null;
+    }
   }
 
   /**
@@ -592,6 +1012,7 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
     }
     try {
       const response = await this.documentService.listDocuments(recordId);
+      this.kbUsage.set(response.kbUsage ?? null);
       const existing = new Set(this.uploadedDocuments().map((doc) => doc.documentId));
       const newDocs = response.documents.filter((doc) => !existing.has(doc.documentId));
       if (newDocs.length === 0) {
@@ -685,7 +1106,7 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
    */
   private isDocumentStale(doc: Document): boolean {
     try {
-      const updatedAt = new Date(doc.updatedAt).getTime();
+      const updatedAt = parseIso(doc.updatedAt).getTime();
       return Date.now() - updatedAt > STALE_DOCUMENT_THRESHOLD_MS;
     } catch {
       return true; // Can't parse timestamp — treat as stale
@@ -703,6 +1124,7 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
     try {
       const response = await this.documentService.listDocuments(recordId);
       this.uploadedDocuments.set(response.documents);
+      this.kbUsage.set(response.kbUsage ?? null);
 
       // Start polling for any documents that are still processing (and not stale)
       for (const doc of response.documents) {
@@ -726,8 +1148,30 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
     }
   }
 
-  async downloadDocument(documentId: string): Promise<void> {
+  /**
+   * Open the extracted-content panel for a document (§5.41, task 16.2).
+   *
+   * The assistant answers from what the knowledge base extracted, not from the file's
+   * original layout, and on the managed engine those can differ badly — a
+   * column-structured flowchart is flattened at ingestion. This is where an owner sees
+   * the difference instead of inferring it from a wrong answer.
+   */
+  async viewExtractedContent(doc: Document): Promise<void> {
     const recordId = this.id();
+    if (!recordId) {
+      return;
+    }
+    this.dialog.open<void, ExtractedContentDialogData>(ExtractedContentDialogComponent, {
+      data: {
+        assistantId: recordId,
+        documentId: doc.documentId,
+        filename: doc.filename,
+      },
+      hasBackdrop: false,
+    });
+  }
+
+  async downloadDocument(documentId: string): Promise<void> {    const recordId = this.id();
     if (!recordId) {
       return;
     }
@@ -1113,20 +1557,36 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
     this.pollingDocuments.update((set) => new Set(set).add(documentId));
 
     try {
-      await this.documentService.pollDocumentStatus(recordId, documentId, (document) => {
-        // Update the document in the list
-        this.uploadedDocuments.update((docs) =>
-          docs.map((doc) => (doc.documentId === documentId ? document : doc)),
-        );
-      });
+      await this.documentService.pollDocumentStatus(
+        recordId,
+        documentId,
+        (document) => {
+          // Update the document in the list
+          this.uploadedDocuments.update((docs) =>
+            docs.map((doc) => (doc.documentId === documentId ? document : doc)),
+          );
+        },
+        undefined,
+        undefined,
+        undefined,
+        // Deleting a row already drops it from this set, so this turns that into
+        // real cancellation instead of a display-only flag. Before it, deleting a
+        // document mid-upload left the loop asking about a row that no longer
+        // existed until its 404 tolerance ran out — five "Not found" dialogs.
+        () => !this.pollingDocuments().has(documentId),
+      );
 
       // Polling completed - reload full list to ensure consistency
       await this.loadDocuments();
     } catch (error) {
       // Handle document/record deletion gracefully
-      if (error instanceof DocumentUploadError && error.code === 'DOCUMENT_NOT_FOUND') {
-        console.warn('Document or record was deleted during polling:', documentId);
-        // Remove the document from the local list immediately
+      if (
+        error instanceof DocumentUploadError &&
+        (error.code === 'DOCUMENT_NOT_FOUND' || error.code === 'POLL_CANCELLED')
+      ) {
+        // Cancelled or gone. Both are ordinary outcomes, not faults: the row has
+        // already been removed from the list by whoever cancelled it, and a reload
+        // here would race the optimistic delete and flash the row back.
         this.uploadedDocuments.update((docs) =>
           docs.filter((doc) => doc.documentId !== documentId),
         );

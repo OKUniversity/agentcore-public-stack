@@ -82,7 +82,47 @@ async def _auto_fail_stale_document(document: Document) -> Document:
         error_message='Processing timed out. The document may need to be re-uploaded.',
         error_details=f'Document was stuck in "{document.status}" state since {document.updated_at}',
     )
+    # A document that timed out in a processing state never reached the ingestion
+    # consumer's terminal reconcile, so its request-time byte reservation (managed
+    # KBs only) would leak. Return it (Requirement 12.6); settle_once keeps this
+    # idempotent against a concurrent client-reported failure on the same document.
+    await release_reservation_if_managed(document)
     return updated if updated else document
+
+
+async def release_reservation_if_managed(document: Document) -> None:
+    """Return a managed-KB byte reservation for a document abandoned before its
+    bytes were settled by the ingestion consumer (Requirement 12.6).
+
+    Exactly-once via ``byte_cap.settle_once``: the request-time reservation is
+    released by whichever terminal path the document reaches first — a
+    client-reported upload failure, this stale sweep, or the ingestion consumer's
+    own failure path — and the guard stops two of them double-crediting the
+    allowance. A no-op for legacy knowledge bases (uncapped) and for zero-size
+    rows (nothing was reserved).
+
+    ``app_kb_id == assistant_id`` this phase. boto3 is called synchronously here,
+    matching the rest of this module.
+    """
+    from apis.shared.kb_backend import byte_cap
+    from apis.shared.kb_backend.records import ENGINE_MANAGED, get_kb_record, resolve_engine
+
+    size_bytes = int(document.size_bytes or 0)
+    if size_bytes <= 0:
+        return
+    assistant_id = document.assistant_id
+    try:
+        record = get_kb_record(assistant_id, assistant_id)
+        if resolve_engine(record) != ENGINE_MANAGED:
+            return
+        if not byte_cap.settle_once(assistant_id, document.document_id):
+            return
+        byte_cap.release(assistant_id, assistant_id, size_bytes)
+    except Exception as e:  # noqa: BLE001 - a bookkeeping failure must not break the status write
+        logger.error(
+            f"Failed to release byte reservation for document {document.document_id}: {e}",
+            exc_info=True,
+        )
 
 
 async def create_document(
@@ -92,7 +132,8 @@ async def create_document(
     size_bytes: int,
     s3_key: str,
     document_id: Optional[str] = None,
-    provenance: Optional[DocumentProvenance] = None
+    provenance: Optional[DocumentProvenance] = None,
+    status: DocumentStatus = 'uploading'
 ) -> Document:
     """
     Create a new document record in DynamoDB
@@ -110,9 +151,16 @@ async def create_document(
         provenance: Optional file-source origin metadata. Set only for
             documents imported from an external connector; None for device
             uploads.
+        status: Initial status. Defaults to 'uploading' — the only caller that
+            overrides it is the born-managed first upload, which uses
+            'provisioning' because the knowledge base its document is bound for
+            is still being created (MANAGED_KB_NEW_DEFAULT). Passing it in rather
+            than patching the row afterwards keeps the document from ever being
+            visible as 'uploading' to a poller, which is what would make the
+            managed ingestion consumer's defer look like a stuck upload.
 
     Returns:
-        Document object with status='uploading'
+        Document object with the requested initial status
     """
     try:
         import boto3
@@ -136,7 +184,7 @@ async def create_document(
         content_type=content_type,
         size_bytes=size_bytes,
         s3_key=s3_key,
-        status='uploading',
+        status=status,
         created_at=now,
         updated_at=now,
         source_connector_id=provenance.source_connector_id if provenance else None,
@@ -468,6 +516,60 @@ async def update_document_import_metadata(
         return None
 
 
+async def assistant_has_documents(assistant_id: str) -> bool:
+    """Whether this assistant already has any ``DOC#`` rows.
+
+    A cheap existence probe — ``Select='COUNT'`` with ``Limit=1`` so DynamoDB
+    stops at the first match and returns no item bodies. Deliberately does NOT run
+    the ownership check ``list_assistant_documents`` does: the only caller
+    (born-managed) has already authorised the upload, and this answers a question
+    about the data, not about access.
+
+    Born-managed uses this to tell a genuinely new agent (no documents → provision
+    a managed knowledge base) apart from an established legacy agent (already has
+    documents on the shared S3-Vectors index → must stay legacy). Legacy knowledge
+    bases are not first-class and carry no ``KB_Record``, so the absence of a
+    record cannot make that distinction on its own.
+
+    Fails toward "has documents" (returns ``True``) on any error or missing table
+    config. That is the safe direction: wrongly provisioning managed on an
+    established legacy agent silently breaks retrieval of its existing corpus,
+    whereas wrongly staying legacy on a new agent is benign (it can still Upgrade).
+    """
+    import asyncio
+
+    table_name = os.environ.get('DYNAMODB_ASSISTANTS_TABLE_NAME')
+    if not table_name:
+        logger.error(
+            "assistant_has_documents: DYNAMODB_ASSISTANTS_TABLE_NAME unset; "
+            "assuming documents exist so born-managed stays on legacy"
+        )
+        return True
+
+    def _count() -> bool:
+        import boto3
+        from boto3.dynamodb.conditions import Key
+
+        table = boto3.resource('dynamodb').Table(table_name)
+        resp = table.query(
+            KeyConditionExpression=Key('PK').eq(f'AST#{assistant_id}')
+            & Key('SK').begins_with('DOC#'),
+            Select='COUNT',
+            Limit=1,
+        )
+        return int(resp.get('Count', 0)) > 0
+
+    try:
+        return await asyncio.to_thread(_count)
+    except Exception as e:  # noqa: BLE001 — fail toward legacy, never fail the upload
+        logger.warning(
+            f"assistant_has_documents: existence probe for {assistant_id} failed "
+            f"({e}); assuming documents exist so born-managed stays on legacy",
+            exc_info=True,
+        )
+        return True
+
+
 async def list_assistant_documents(
     assistant_id: str,
     owner_id: str,
@@ -711,10 +813,26 @@ async def soft_delete_document(
 
         if 'Attributes' in response:
             try:
-                return Document.model_validate(response['Attributes'])
+                document = Document.model_validate(response['Attributes'])
             except Exception as e:
                 logger.warning(f"Failed to parse document from DynamoDB response: {e}")
                 return None
+
+            # Deleting a document that never finished ingesting leaves its
+            # request-time byte reservation stranded. Nothing else settles it: the
+            # release paths are ingestion reaching a terminal state, a
+            # client-reported upload failure, and the stale sweep — and a deleted
+            # document reaches none of them.
+            #
+            # Left unreleased the leak is invisible and cumulative. Every cancelled
+            # upload permanently shaves bytes off that assistant's allowance until
+            # uploads start failing for no reason the owner can see, months after
+            # the deletes that caused it. `settle_once` makes this exactly-once
+            # against the other paths, so releasing here cannot double-credit a
+            # document that some other path also settles.
+            await release_reservation_if_managed(document)
+
+            return document
 
         return None
 

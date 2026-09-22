@@ -113,6 +113,40 @@ export class ChatStateService {
         return this.states().get(sessionId)?.loading() ?? false;
     }
 
+    // ----- Per-session cost / context reads ----------------------------------
+    // The facades above project the VIEWED session, which is right for the main
+    // composer and wrong for anything else on screen at the same time. An
+    // embedded preview (Designer, marketplace test drive) must never call
+    // `setViewedSession` — that would hand the real composer's spinner and cost
+    // badge to a conversation in a side panel — so it reads its own session
+    // through these instead.
+    //
+    // Deliberately read-only: unlike `stateFor` they never create a bucket, so
+    // they are safe to call from inside a `computed`. A session that has not
+    // streamed yet simply reads zero.
+
+    /** A session's running cost total, in dollars. */
+    costDollarsFor(sessionId: string): number {
+        return this.states().get(sessionId)?.costDollars() ?? 0;
+    }
+
+    /** A session's most-recent-turn context tokens. */
+    contextTokensFor(sessionId: string): number {
+        return this.states().get(sessionId)?.contextTokens() ?? 0;
+    }
+
+    /** A session's context window size, or 0 when unknown. */
+    contextWindowFor(sessionId: string): number {
+        return this.states().get(sessionId)?.contextWindow() ?? 0;
+    }
+
+    /** A session's context usage as a percentage of its window. */
+    contextPctFor(sessionId: string): number {
+        const window = this.contextWindowFor(sessionId);
+        if (!window || window <= 0) return 0;
+        return (this.contextTokensFor(sessionId) / window) * 100;
+    }
+
     /**
      * Whether a session has an unread response — one that finished streaming
      * while the user was looking at a different conversation. Cleared when the
@@ -232,6 +266,43 @@ export class ChatStateService {
         const controller = new AbortController();
         state.abortController = controller;
         return controller;
+    }
+
+    /**
+     * Release a session's controller once its stream has finished.
+     *
+     * The counterpart to `createAbortController`, and what makes
+     * `streamingSessionIds()` honest: without it a controller outlives its
+     * stream for the life of the tab, so every completed turn keeps looking
+     * in-flight and the page-hide attribution below marks turns that
+     * finished minutes (or days) earlier as `navigated_away`. That is a
+     * false "Response interrupted" chip on a complete answer, and a false
+     * interruption note prepended to the session's next prompt.
+     *
+     * Identity-checked: a superseded stream's late teardown must not clear
+     * the controller of the stream that replaced it (`createAbortController`
+     * installs the replacement before the old stream's abort unwinds).
+     */
+    releaseAbortController(sessionId: string, controller: AbortController): void {
+        const state = this.states().get(sessionId);
+        if (state && state.abortController === controller) {
+            state.abortController = null;
+        }
+    }
+
+    /**
+     * Session ids with a stream in flight right now.
+     *
+     * Read at page-hide time to attribute a departure to the turns it
+     * actually interrupted. A live controller is the truthful test: it is
+     * created per request and released on abort (`abortRequest`) or on
+     * stream teardown (`releaseAbortController`), so it tracks the transport
+     * rather than the `loading` flag, which other code also drives.
+     */
+    streamingSessionIds(): string[] {
+        return [...this.states().entries()]
+            .filter(([, state]) => state.abortController !== null)
+            .map(([sessionId]) => sessionId);
     }
 
     /** Abort a session's in-flight request (Stop button), if any. */

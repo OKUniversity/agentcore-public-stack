@@ -8,11 +8,18 @@ requires them. The subclass de-prefixes for the count call only.
 from unittest.mock import patch
 
 import pytest
-from strands.models import BedrockModel
+from botocore.exceptions import ClientError
+from strands.models.bedrock import _SKIP_COUNT_TOKENS_MODELS, _clear_skip_count_tokens_cache
+from strands.models.model import Model
 
 from agents.main_agent.core.bedrock_count_tokens import (
+    COUNT_TOKENS_MAX_ATTEMPTS_ENV,
+    COUNT_TOKENS_TIMEOUT_ENV,
     CountTokensBedrockModel,
     base_foundation_model_id,
+    build_count_tokens_client_config,
+    count_tokens_max_attempts,
+    count_tokens_timeout_seconds,
 )
 
 
@@ -59,63 +66,201 @@ def _aws_region(monkeypatch):
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
 
 
-class TestCountTokensModelIdSwap:
-    """count_tokens must count against the base id, then restore the profile id
-    so invocation keeps using the inference profile."""
+PROFILE_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+BASE_ID = "anthropic.claude-haiku-4-5-20251001-v1:0"
+
+
+class FakeCountClient:
+    """Stands in for the dedicated CountTokens boto client."""
+
+    def __init__(self, result=4242, raise_with=None):
+        self.result = result
+        self.raise_with = raise_with
+        self.calls = []
+
+    def count_tokens(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.raise_with is not None:
+            raise self.raise_with
+        return {"inputTokens": self.result}
+
+
+def _client_error(code, message="nope"):
+    return ClientError({"Error": {"Code": code, "Message": message}}, "CountTokens")
+
+
+@pytest.fixture(autouse=True)
+def _clean_skip_cache():
+    _clear_skip_count_tokens_cache()
+    yield
+    _clear_skip_count_tokens_cache()
+
+
+def _model(model_id=PROFILE_ID, native=True, client=None):
+    model = CountTokensBedrockModel(model_id=model_id, use_native_token_count=native)
+    if client is not None:
+        model._count_client = client
+    return model
+
+
+class TestCountTokensModelId:
+    """The count goes to the API with the base id; the profile id in config is
+    never touched, before, during or after."""
 
     @pytest.mark.asyncio
-    async def test_counts_against_base_id_and_restores_profile_id(self, _aws_region):
-        model = CountTokensBedrockModel(
-            model_id="us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            use_native_token_count=True,
-        )
+    async def test_counts_against_base_id_without_mutating_config(self, _aws_region):
+        client = FakeCountClient(result=4242)
+        model = _model(client=client)
 
-        seen = {}
-
-        async def fake_super_count(self, messages, tool_specs=None, system_prompt=None, system_prompt_content=None):
-            seen["model_id_during_count"] = self.config["model_id"]
-            return 4242
-
-        with patch.object(BedrockModel, "count_tokens", fake_super_count):
-            result = await model.count_tokens([], system_prompt="hi")
+        result = await model.count_tokens([], system_prompt="hi")
 
         assert result == 4242
-        # The base id was used for the CountTokens call...
-        assert seen["model_id_during_count"] == "anthropic.claude-haiku-4-5-20251001-v1:0"
-        # ...and the profile id is restored for invocation afterward.
-        assert model.config["model_id"] == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        assert client.calls[0]["modelId"] == BASE_ID
+        assert client.calls[0]["input"]["converse"]["system"] == [{"text": "hi"}]
+        assert model.config["model_id"] == PROFILE_ID
 
     @pytest.mark.asyncio
-    async def test_no_swap_when_already_base_id(self, _aws_region):
-        model = CountTokensBedrockModel(
-            model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
-            use_native_token_count=True,
-        )
-
+    async def test_config_is_not_mutated_even_mid_call(self, _aws_region):
+        """A concurrent stream() must never observe the base id — that was the
+        hazard of the old swap-and-restore approach."""
+        model = _model()
         seen = {}
 
-        async def fake_super_count(self, messages, tool_specs=None, system_prompt=None, system_prompt_content=None):
-            seen["model_id_during_count"] = self.config["model_id"]
-            return 7
+        class SpyClient(FakeCountClient):
+            def count_tokens(self, **kwargs):
+                seen["model_id_during_count"] = model.config["model_id"]
+                return super().count_tokens(**kwargs)
 
-        with patch.object(BedrockModel, "count_tokens", fake_super_count):
-            await model.count_tokens([])
+        model._count_client = SpyClient(result=1)
+        await model.count_tokens([])
 
-        assert seen["model_id_during_count"] == "anthropic.claude-3-5-sonnet-20241022-v2:0"
-        assert model.config["model_id"] == "anthropic.claude-3-5-sonnet-20241022-v2:0"
+        assert seen["model_id_during_count"] == PROFILE_ID
 
     @pytest.mark.asyncio
-    async def test_profile_id_restored_even_when_count_raises(self, _aws_region):
-        model = CountTokensBedrockModel(
-            model_id="us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            use_native_token_count=True,
+    async def test_base_id_passes_through_unchanged(self, _aws_region):
+        client = FakeCountClient(result=7)
+        model = _model(model_id="anthropic.claude-3-5-sonnet-20241022-v2:0", client=client)
+
+        await model.count_tokens([])
+
+        assert client.calls[0]["modelId"] == "anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+    @pytest.mark.asyncio
+    async def test_native_flag_off_never_builds_a_client(self, _aws_region):
+        model = _model(native=False)
+
+        with patch.object(CountTokensBedrockModel, "_get_count_client") as get_client:
+            result = await model.count_tokens([{"role": "user", "content": [{"text": "hello world"}]}])
+
+        get_client.assert_not_called()
+        assert isinstance(result, int) and result > 0
+
+
+class TestCountTokensBounded:
+    """A throttle costs one failed attempt and falls back to the heuristic;
+    it is never retried and never raised into the turn."""
+
+    @pytest.mark.asyncio
+    async def test_throttle_falls_back_to_heuristic_after_one_attempt(self, _aws_region):
+        client = FakeCountClient(raise_with=_client_error("ThrottlingException"))
+        model = _model(client=client)
+        messages = [{"role": "user", "content": [{"text": "x" * 400}]}]
+
+        result = await model.count_tokens(messages)
+
+        assert len(client.calls) == 1
+        # chars/4 heuristic, not the native answer and not an exception.
+        assert result == await Model.count_tokens(model, messages)
+        # A throttle is transient: the model is NOT added to the skip list.
+        assert BASE_ID not in _SKIP_COUNT_TOKENS_MODELS
+
+    @pytest.mark.asyncio
+    async def test_access_denied_is_remembered_and_skips_the_client(self, _aws_region):
+        client = FakeCountClient(raise_with=_client_error("AccessDeniedException"))
+        model = _model(client=client)
+
+        await model.count_tokens([])
+        await model.count_tokens([])
+
+        assert len(client.calls) == 1
+        assert BASE_ID in _SKIP_COUNT_TOKENS_MODELS
+
+    @pytest.mark.asyncio
+    async def test_unsupported_model_is_remembered(self, _aws_region):
+        client = FakeCountClient(
+            raise_with=_client_error("ValidationException", "The provided model doesn't support counting tokens.")
         )
+        model = _model(client=client)
 
-        async def fake_super_count(self, *args, **kwargs):
-            raise RuntimeError("boom")
+        await model.count_tokens([])
 
-        with patch.object(BedrockModel, "count_tokens", fake_super_count):
-            with pytest.raises(RuntimeError, match="boom"):
-                await model.count_tokens([])
+        assert BASE_ID in _SKIP_COUNT_TOKENS_MODELS
 
-        assert model.config["model_id"] == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    @pytest.mark.asyncio
+    async def test_unexpected_error_falls_back_without_raising(self, _aws_region):
+        client = FakeCountClient(raise_with=RuntimeError("boom"))
+        model = _model(client=client)
+
+        result = await model.count_tokens([{"role": "user", "content": [{"text": "hi"}]}])
+
+        assert isinstance(result, int)
+        assert model.config["model_id"] == PROFILE_ID
+
+    @pytest.mark.asyncio
+    async def test_missing_input_tokens_falls_back(self, _aws_region):
+        class NoneClient(FakeCountClient):
+            def count_tokens(self, **kwargs):
+                self.calls.append(kwargs)
+                return {}
+
+        model = _model(client=NoneClient())
+
+        result = await model.count_tokens([{"role": "user", "content": [{"text": "hi"}]}])
+
+        assert isinstance(result, int)
+
+
+class TestCountTokensClientConfig:
+    """The dedicated client is what bounds the cost of a throttle."""
+
+    def test_default_is_one_attempt_and_a_two_second_timeout(self, monkeypatch):
+        monkeypatch.delenv(COUNT_TOKENS_TIMEOUT_ENV, raising=False)
+        monkeypatch.delenv(COUNT_TOKENS_MAX_ATTEMPTS_ENV, raising=False)
+
+        cfg = build_count_tokens_client_config()
+
+        assert cfg.retries == {"total_max_attempts": 1, "mode": "standard"}
+        assert cfg.read_timeout == 2.0
+        assert cfg.connect_timeout == 2.0
+
+    def test_env_overrides_are_honoured(self, monkeypatch):
+        monkeypatch.setenv(COUNT_TOKENS_TIMEOUT_ENV, "0.5")
+        monkeypatch.setenv(COUNT_TOKENS_MAX_ATTEMPTS_ENV, "3")
+
+        cfg = build_count_tokens_client_config()
+
+        assert cfg.retries["total_max_attempts"] == 3
+        assert cfg.read_timeout == 0.5
+
+    def test_garbage_env_falls_back_to_defaults(self, monkeypatch):
+        monkeypatch.setenv(COUNT_TOKENS_TIMEOUT_ENV, "soon")
+        monkeypatch.setenv(COUNT_TOKENS_MAX_ATTEMPTS_ENV, "0")
+
+        assert count_tokens_timeout_seconds() == 2.0
+        assert count_tokens_max_attempts() == 1
+
+    def test_client_is_built_lazily_in_the_invocation_region(self, _aws_region):
+        model = _model()
+        assert model._count_client is None
+
+        with patch("agents.main_agent.core.bedrock_count_tokens.boto3.client") as boto_client:
+            boto_client.return_value = object()
+            first = model._get_count_client()
+            second = model._get_count_client()
+
+        assert first is second
+        boto_client.assert_called_once()
+        kwargs = boto_client.call_args.kwargs
+        assert boto_client.call_args.args == ("bedrock-runtime",)
+        assert kwargs["region_name"] == "us-east-1"
+        assert kwargs["config"].retries["total_max_attempts"] == 1

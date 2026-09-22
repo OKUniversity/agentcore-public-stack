@@ -29,11 +29,82 @@ Friday early morning (~6am MT). `kaizen-review-prep` runs ~2 hours later (~8am M
    - https://aws.amazon.com/blogs/machine-learning/ (filter: bedrock, agentcore)
    - Filter to: Bedrock, AgentCore, Bedrock Agents, Knowledge Bases, Guardrails, model availability/region/quota changes.
 
-2. **Strands Agents SDK**
-   - https://github.com/strands-agents/sdk-python/releases
-   - https://github.com/strands-agents/sdk-python/blob/main/CHANGELOG.md
-   - https://github.com/strands-agents/sdk-python/issues?q=is%3Aissue+sort%3Aupdated-desc
+2. **Strands Agents SDK** — note the repo moved: `strands-agents/sdk-python` now
+   redirects to **`strands-agents/harness-sdk`** (a monorepo; the Python SDK lives
+   under `strands-py/`). Use the new name — `gh` search against the old one errors.
+   - https://github.com/strands-agents/harness-sdk/releases
+   - https://github.com/strands-agents/harness-sdk/blob/main/strands-py/CHANGELOG.md
+   - https://github.com/strands-agents/harness-sdk/issues?q=is%3Aissue+sort%3Aupdated-desc
    - For each new release, identify: breaking changes, new hooks/features, fixes that map to current usage in `backend/src/agents/main_agent/`.
+
+2a. **Prompt caching across providers — standing watch (added 2026-09-05)**
+
+   We carry custom code that exists only because Strands' caching support is
+   Bedrock/Anthropic-shaped. Upstream is converging on a provider-agnostic
+   `CacheConfig`, so this is *mostly* a **subtraction** item: each upstream landing
+   should delete code here, not add it. Check every run, and check it for *all*
+   cacheable families — Anthropic, OpenAI/GPT, and any newly cacheable model — not
+   just the one that prompted this.
+
+   ⚠️ **Amended 2026-09-11: it is not subtraction-only, and the second half is now
+   the more valuable one.** Two kinds of drift matter, and only the first deletes
+   code. **(i) Convergence** — upstream absorbs something we hand-roll; propose the
+   swap. **(ii) Coverage** — a Bedrock family gains prompt caching that *neither*
+   we nor upstream will use, because both gate on the same `_cache_strategy`
+   string test for `"claude"`/`"anthropic"`. Measured that day: **Nova Micro
+   accepts an explicit system cachePoint and honors it** (7,203 input tokens → 2,
+   7,201 cache-written) while `bedrock_cache_points_supported()` refuses it. That
+   is caching left on the floor, it grows every time AWS ships a cacheable model,
+   and no test can catch it — a string predicate keeps answering the same thing
+   while the platform moves underneath it. Coverage findings are **additions**;
+   file them anyway.
+
+   Our carried code, and what would retire it:
+
+   | Ours | Retired by |
+   |---|---|
+   | `usage_normalization.py` — maps `cache_write_tokens`, which Strands drops | [harness-sdk#4193](https://github.com/strands-agents/harness-sdk/pull/4193) (ours) merging + releasing |
+   | `usage_normalization.py` — disjointness shim for OpenAI's inclusive `input_tokens` | [harness-sdk#3546](https://github.com/strands-agents/harness-sdk/issues/3546) landing a `Usage` convention contract |
+   | `build_prompt_cache_key()` in `bedrock_responses.py` | `strands/models/_openai_cache.py::apply_cache_config` — **already on upstream main**, maps `CacheConfig.cache_key` → `prompt_cache_key`. Adopt on the next pin bump. |
+   | `apply_explicit_prompt_cache()` (breakpoints) | No upstream equivalent yet — `apply_cache_config` emits no `prompt_cache_breakpoint`. Ours is OFF by default (measured 57% worse); don't re-enable without re-running the probe. |
+   | `cache_ttl_seconds_for()` in `observability/prompt_cache.py` | A model-derived TTL upstream. Note `apply_cache_config` maps ttl to `prompt_cache_retention` (`in_memory`/`24h`), *not* GPT-5.6's `prompt_cache_options.ttl: "30m"` — so these are not yet the same concept. |
+   | `bedrock_cache_points_supported()` + the hand-placed system cachePoint | **NOTHING upstream can retire this — settled by measurement 2026-09-11, do not re-propose.** `format_request` copies `system_prompt_content` verbatim and `_apply_system_cache_ttl` never removes a point, so the block reaches Bedrock, which answers `AccessDeniedException` on a model that can't cache. The rejection is Bedrock's, not the SDK's. Only its `tools_ttl` half is redundant (upstream applies the same test at `bedrock.py:579`). |
+
+   Each run, answer:
+   - Does the pinned Strands version now ship `_openai_cache.py` / a `CacheConfig`
+     that covers a provider we hand-roll? If so, propose the swap and say which of
+     our modules shrinks.
+   - Did `CacheConfig` gain a field (`cache_key`, `tools_ttl`, `system_prompt_ttl`, …)
+     that maps onto something we do manually?
+   - Any new Bedrock model family with prompt caching? Confirm which API surface
+     serves it — GPT-5.6 caches **only** over the Responses API, and the same model
+     over Converse caches not at all. Then **measure it, don't read it**:
+
+         cd backend
+         AWS_PROFILE=dev-ai uv run python scripts/probe_bedrock_cache_point_support.py \
+             --model-id <the new model id>
+
+     One command, ~$0.01, and it answers both layers at once — what the pinned
+     Strands emits for that id, and whether Bedrock accepts and honors an explicit
+     cachePoint. A row where Bedrock caches but `_cache_strategy` is `None` is a
+     coverage finding (ii) — file it. Use `--offline-only` for a free check of the
+     SDK half alone after a pin bump.
+   - Movement on #3546 / #4193, or a new `Usage` convention. Both change what our
+     cost math may assume.
+
+   ⚠️ Never adopt an upstream caching default on inspection alone. This stack has
+   already shipped one caching change whose premise was wrong and cost ~57% more
+   in a live measurement. `backend/scripts/probe_gpt56_cache_rates.py` is the gate:
+   beat the current arm, measured, before switching.
+
+   ⚠️ **A caching A/B measures nothing if its prefix is under the model's minimum.**
+   Below that floor Bedrock **silently ignores** the cache point — no error, no
+   cache buckets, a result indistinguishable from "unsupported". Measured on Haiku
+   4.5 in us-west-2 (2026-09-11): 2,351 and 3,911 tokens wrote **nothing**, 5,202
+   wrote in full — a real floor of **4,096**, twice the 2,048 the first-party
+   Anthropic docs publish for Haiku. Do not trust a vendor-documented minimum;
+   bracket it. This already produced one false "does not cache" against our own
+   production model.
 
 3. **Reference repo — `aws-samples/sample-strands-agent-with-agentcore`**
    - https://github.com/aws-samples/sample-strands-agent-with-agentcore/commits/main

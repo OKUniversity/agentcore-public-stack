@@ -28,6 +28,7 @@ import {
   ExportResponse,
   ExportTargetConnector,
 } from '../../services/export/export.model';
+import { SpinnerComponent } from '../../../components/spinner/spinner.component';
 import { UserConnectorsService } from '../../../settings/connectors/services/user-connectors.service';
 import { OAuthConsentService } from '../../../services/oauth-consent/oauth-consent.service';
 import { ToastService } from '../../../services/toast/toast.service';
@@ -38,6 +39,7 @@ import {
   FolderSelection,
 } from '../../../assistants/components/file-source-browser-dialog.component';
 import { FileSourceConnector } from '../../../assistants/models/file-source.model';
+import { DialogDismissDirective } from '../../../components/dialog/dialog-dismiss.directive';
 
 /** Data passed in when the session list opens the export dialog. */
 export interface ExportDialogData {
@@ -75,7 +77,7 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
 @Component({
   selector: 'app-export-dialog',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [NgIcon],
+  imports: [DialogDismissDirective, NgIcon, SpinnerComponent],
   providers: [
     provideIcons({
       heroArrowPath,
@@ -97,11 +99,12 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
     <div
       class="dialog-backdrop fixed inset-0 bg-gray-500/75 dark:bg-gray-900/80"
       aria-hidden="true"
-      (click)="cancel()"
     ></div>
 
     <!-- Centering wrapper -->
-    <div class="fixed inset-0 z-10 flex min-h-full items-center justify-center p-4">
+    <div class="fixed inset-0 z-10 flex min-h-full items-center justify-center p-4"
+      appDialogDismiss
+      (dismissed)="cancel()">
       <div
         class="dialog-panel relative flex max-h-[85vh] w-full max-w-md flex-col overflow-hidden rounded-2xl bg-white shadow-xl dark:bg-gray-800 dark:outline dark:-outline-offset-1 dark:outline-white/10"
         role="dialog"
@@ -121,7 +124,7 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
             type="button"
             (click)="cancel()"
             aria-label="Close"
-            class="-mr-1 rounded-2xl p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:hover:bg-gray-700 dark:hover:text-gray-200"
+            class="-mr-1 rounded-2xl p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 dark:hover:bg-gray-700 dark:hover:text-gray-200"
           >
             <ng-icon name="heroXMark" class="size-5" />
           </button>
@@ -131,7 +134,7 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
           @if (result(); as saved) {
             <!-- ─────────────── Success ─────────────── -->
             <div class="flex flex-col items-center gap-3 py-4 text-center">
-              <ng-icon name="heroCheckCircle" class="size-10 text-green-600 dark:text-green-400" aria-hidden="true" />
+              <ng-icon name="heroCheckCircle" class="size-10 text-state-success-600 dark:text-state-success-400" aria-hidden="true" />
               <p class="text-sm/6 font-medium text-gray-900 dark:text-white">
                 Saved to {{ selectedTargetName() }}
               </p>
@@ -141,7 +144,7 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
                   [href]="saved.webViewLink"
                   target="_blank"
                   rel="noopener noreferrer"
-                  class="inline-flex items-center gap-1.5 rounded-2xl bg-blue-600 px-3.5 py-2 text-sm/6 font-semibold text-white shadow-xs hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:bg-blue-500 dark:hover:bg-blue-600"
+                  class="inline-flex items-center gap-1.5 rounded-2xl bg-primary-accessible px-3.5 py-2 text-sm/6 font-semibold text-white shadow-xs transition-[filter] hover:brightness-95 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500"
                 >
                   <ng-icon name="heroArrowTopRightOnSquare" class="size-4" aria-hidden="true" />
                   Open in {{ selectedTargetName() }}
@@ -150,18 +153,18 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
             </div>
           } @else if (loading()) {
             <div class="flex items-center gap-3 text-sm/6 text-gray-500 dark:text-gray-400">
-              <div class="size-4 animate-spin rounded-full border-2 border-gray-300 border-t-blue-600 dark:border-gray-600 dark:border-t-blue-400"></div>
+              <app-spinner size="sm" label="Loading destinations" />
               Loading destinations…
             </div>
           } @else if (loadError(); as err) {
-            <div class="flex items-start gap-3 rounded-2xl border border-red-200 bg-red-50 p-4 dark:border-red-800 dark:bg-red-900/20">
-              <ng-icon name="heroExclamationTriangle" class="size-5 shrink-0 text-red-600 dark:text-red-400" aria-hidden="true" />
+            <div class="flex items-start gap-3 rounded-2xl border border-state-danger-200 bg-state-danger-50 p-4 dark:border-state-danger-800 dark:bg-state-danger-900/20">
+              <ng-icon name="heroExclamationTriangle" class="size-5 shrink-0 text-state-danger-600 dark:text-state-danger-400" aria-hidden="true" />
               <div>
-                <p class="text-sm/6 text-red-700 dark:text-red-300">{{ err }}</p>
+                <p class="text-sm/6 text-state-danger-700 dark:text-state-danger-300">{{ err }}</p>
                 <button
                   type="button"
                   (click)="loadTargets()"
-                  class="mt-2 text-sm/6 font-medium text-red-700 underline hover:text-red-800 dark:text-red-200"
+                  class="mt-2 text-sm/6 font-medium text-state-danger-700 underline hover:text-state-danger-800 dark:text-state-danger-200"
                 >
                   Retry
                 </button>
@@ -183,20 +186,20 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
                 <label
                   class="flex cursor-pointer items-center gap-3 rounded-2xl border p-3 transition-colors"
                   [class]="selectedConnectorId() === target.providerId
-                    ? 'border-blue-500 bg-blue-50 dark:border-blue-400 dark:bg-blue-500/10'
+                    ? 'border-primary-500 bg-gray-100 dark:border-primary-400 dark:bg-gray-700'
                     : 'border-gray-200 hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-white/5'"
                 >
                   <input
                     type="radio"
                     name="exportDestination"
-                    class="size-4 text-blue-600 focus:ring-blue-500"
+                    class="size-4 text-primary-600 focus:ring-primary-500"
                     [value]="target.providerId"
                     [checked]="selectedConnectorId() === target.providerId"
                     (change)="selectConnector(target)"
                   />
                   <span class="flex-1 text-sm/6 font-medium text-gray-900 dark:text-white">{{ target.displayName }}</span>
                   @if (!target.connected) {
-                    <span class="rounded-full bg-gray-100 px-2 py-0.5 text-xs/5 font-medium text-gray-500 dark:bg-gray-700 dark:text-gray-400">
+                    <span class="rounded-full bg-gray-200 px-2 py-0.5 text-xs/5 font-medium text-gray-700 dark:bg-gray-600 dark:text-gray-200">
                       Not connected
                     </span>
                   }
@@ -210,7 +213,7 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
                 <label for="export-format" class="mb-1.5 block text-sm/6 font-medium text-gray-700 dark:text-gray-300">Format</label>
                 <select
                   id="export-format"
-                  class="block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 focus:border-blue-500 focus:outline-hidden focus:ring-2 focus:ring-blue-500/40 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
+                  class="block w-full rounded-2xl border border-gray-300 bg-white px-3 py-2 text-sm/6 text-gray-900 focus:border-primary-500 focus:outline-hidden focus:ring-2 focus:ring-primary-500/40 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
                   [value]="selectedFormat()"
                   (change)="onFormatChange($event)"
                 >
@@ -232,7 +235,7 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
                     <button
                       type="button"
                       (click)="resetDestinationFolder()"
-                      class="shrink-0 rounded-2xl px-2 py-1 text-sm/6 font-medium text-gray-500 hover:bg-gray-100 hover:text-gray-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:text-gray-400 dark:hover:bg-gray-600 dark:hover:text-gray-200"
+                      class="shrink-0 rounded-2xl px-2 py-1 text-sm/6 font-medium text-gray-500 hover:bg-gray-100 hover:text-gray-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 dark:text-gray-400 dark:hover:bg-gray-600 dark:hover:text-gray-200"
                     >
                       Default
                     </button>
@@ -240,7 +243,7 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
                   <button
                     type="button"
                     (click)="chooseFolder()"
-                    class="shrink-0 rounded-2xl px-2 py-1 text-sm/6 font-medium text-blue-600 hover:bg-blue-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:text-blue-400 dark:hover:bg-blue-500/10"
+                    class="shrink-0 rounded-2xl px-2 py-1 text-sm/6 font-medium text-primary-accessible hover:bg-gray-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 dark:text-primary-accessible-dark dark:hover:bg-gray-700 dark:hover:text-primary-50"
                   >
                     Choose…
                   </button>
@@ -254,14 +257,14 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
               <div class="space-y-1.5">
                 <!-- Messages are the transcript itself: always on, shown disabled. -->
                 <label class="flex items-center gap-2.5 text-sm/6 text-gray-500 dark:text-gray-400">
-                  <input type="checkbox" checked disabled class="size-4 rounded-sm text-blue-600" />
+                  <input type="checkbox" checked disabled class="size-4 rounded-sm text-primary-600" />
                   Messages
                 </label>
                 @for (opt of includeOptions; track opt.key) {
                   <label class="flex cursor-pointer items-center gap-2.5 text-sm/6 text-gray-700 dark:text-gray-300">
                     <input
                       type="checkbox"
-                      class="size-4 rounded-sm text-blue-600 focus:ring-blue-500"
+                      class="size-4 rounded-sm text-primary-600 focus:ring-primary-500"
                       [checked]="include()[opt.key]"
                       (change)="toggleInclude(opt.key)"
                     />
@@ -272,9 +275,9 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
             </fieldset>
 
             @if (error(); as err) {
-              <div class="mt-4 flex items-start gap-2.5 rounded-2xl border border-red-200 bg-red-50 p-3 dark:border-red-800 dark:bg-red-900/20">
-                <ng-icon name="heroExclamationTriangle" class="size-5 shrink-0 text-red-600 dark:text-red-400" aria-hidden="true" />
-                <p class="text-sm/6 text-red-700 dark:text-red-300">{{ err }}</p>
+              <div class="mt-4 flex items-start gap-2.5 rounded-2xl border border-state-danger-200 bg-state-danger-50 p-3 dark:border-state-danger-800 dark:bg-state-danger-900/20">
+                <ng-icon name="heroExclamationTriangle" class="size-5 shrink-0 text-state-danger-600 dark:text-state-danger-400" aria-hidden="true" />
+                <p class="text-sm/6 text-state-danger-700 dark:text-state-danger-300">{{ err }}</p>
               </div>
             }
           }
@@ -285,7 +288,7 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
           <button
             type="button"
             (click)="cancel()"
-            class="rounded-2xl bg-white px-3.5 py-2 text-sm/6 font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:bg-white/10 dark:text-white dark:ring-white/10 dark:hover:bg-white/20"
+            class="rounded-2xl bg-white px-3.5 py-2 text-sm/6 font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 dark:bg-white/10 dark:text-white dark:ring-white/10 dark:hover:bg-white/20"
           >
             {{ result() ? 'Done' : 'Cancel' }}
           </button>
@@ -294,7 +297,7 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
               type="button"
               (click)="save()"
               [disabled]="!canSubmit()"
-              class="inline-flex items-center gap-1.5 rounded-2xl bg-blue-600 px-3.5 py-2 text-sm/6 font-semibold text-white shadow-xs hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-blue-500 dark:hover:bg-blue-600"
+              class="inline-flex items-center gap-1.5 rounded-2xl bg-primary-accessible px-3.5 py-2 text-sm/6 font-semibold text-white shadow-xs transition-[filter] hover:brightness-95 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 disabled:cursor-not-allowed disabled:opacity-50"
             >
               @if (busy()) {
                 <ng-icon name="heroArrowPath" class="size-4 animate-spin" aria-hidden="true" />
@@ -307,8 +310,7 @@ const FORMAT_LABELS: Record<ExportFormat, string> = {
     </div>
   `,
   styles: `
-    @import 'tailwindcss';
-    @custom-variant dark (&:where(.dark, .dark *));
+    @reference "../../../../styles/theme.css";
 
     .dialog-backdrop {
       animation: backdrop-fade-in 200ms ease-out;

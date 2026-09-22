@@ -135,6 +135,11 @@ class ToolCatalogService:
                     category=tool.category,
                     protocol=tool.protocol,
                     status=tool.status,
+                    # UserToolAccess has always declared this field; nothing ever
+                    # passed it, so every tool reported `requiresOauthProvider:
+                    # null` and the SPA had no way to tell that 13 of the 31
+                    # tools in prod need a connection before they will work.
+                    requires_oauth_provider=tool.requires_oauth_provider,
                     granted_by=granted_by,
                     enabled_by_default=tool.enabled_by_default,
                     user_enabled=user_enabled,
@@ -257,17 +262,37 @@ class ToolCatalogService:
         """
         Validate that auth configurations don't conflict.
 
+        There are three ways to put a per-user credential in the Authorization
+        header — forwarding the OIDC token, an OAuth provider token, and an
+        RFC 8693 exchanged token — and only one header, so at most one may be
+        selected.
+
         Raises:
-            ValueError: If forward_auth_token and requires_oauth_provider are both set,
-                or if forward_auth_token is set with a non-'none' MCP auth type.
+            ValueError: If more than one per-user auth mode is set, or if a mode
+                that owns the Authorization header is combined with a non-'none'
+                MCP auth type.
         """
-        if tool.forward_auth_token and tool.requires_oauth_provider:
+        selected = [
+            name
+            for name, on in (
+                ("forward_auth_token", bool(tool.forward_auth_token)),
+                ("requires_oauth_provider", bool(tool.requires_oauth_provider)),
+                ("token_exchange_audience", bool(tool.token_exchange_audience)),
+            )
+            if on
+        ]
+        if len(selected) > 1:
             raise ValueError(
-                "Cannot enable both 'forward_auth_token' and 'requires_oauth_provider'. "
-                "Both use the Authorization header and are mutually exclusive."
+                f"Cannot enable more than one per-user auth mode: {', '.join(selected)}. "
+                "All use the Authorization header and are mutually exclusive."
             )
 
-        if tool.forward_auth_token and tool.mcp_config:
+        # These two put a bearer in the Authorization header themselves, so the
+        # transport must not also be signing it. SigV4 and Bearer cannot coexist.
+        owns_auth_header = bool(tool.forward_auth_token) or bool(
+            tool.token_exchange_audience
+        )
+        if owns_auth_header and tool.mcp_config:
             auth_type = tool.mcp_config.auth_type
             if isinstance(auth_type, str):
                 is_none = auth_type == "none"
@@ -275,9 +300,14 @@ class ToolCatalogService:
                 from apis.shared.tools.models import MCPAuthType
                 is_none = auth_type == MCPAuthType.NONE
             if not is_none:
+                mode = (
+                    "forward_auth_token"
+                    if tool.forward_auth_token
+                    else "token_exchange_audience"
+                )
                 raise ValueError(
-                    "When 'forward_auth_token' is enabled, MCP auth type must be 'none'. "
-                    "The OIDC token will use the Authorization header."
+                    f"When '{mode}' is enabled, MCP auth type must be 'none'. "
+                    "The per-user token will use the Authorization header."
                 )
 
     def _validate_protocol_config(self, tool: ToolDefinition) -> None:
@@ -398,6 +428,7 @@ class ToolCatalogService:
             for k in (
                 "forward_auth_token",
                 "requires_oauth_provider",
+                "token_exchange_audience",
                 "mcp_config",
                 "protocol",
                 "mcp_gateway_config",
@@ -407,10 +438,20 @@ class ToolCatalogService:
             await self.repository.get_tool(tool_id) if needs_existing else None
         )
 
-        # Pre-validate auth config if relevant fields are being updated
+        # Pre-validate auth config if relevant fields are being updated.
+        #
+        # token_exchange_audience belongs here as much as the other two: all
+        # three compete for the Authorization header. Omitting it let an edit
+        # add an audience to a tool that already forwarded the OIDC token, or
+        # combine one with a non-'none' MCP auth type — rules create enforces
+        # and update silently did not. The runtime happens to prefer the
+        # exchanged token, so the result was a broken tool rather than a leaked
+        # credential, but a validation rule that holds on one path and not the
+        # other is worse than no rule.
         if existing and (
             "forward_auth_token" in updates
             or "requires_oauth_provider" in updates
+            or "token_exchange_audience" in updates
             or "mcp_config" in updates
         ):
             # Build a preview of the updated tool for validation
@@ -421,6 +462,9 @@ class ToolCatalogService:
                 protocol=existing.protocol,
                 forward_auth_token=updates.get("forward_auth_token", existing.forward_auth_token),
                 requires_oauth_provider=updates.get("requires_oauth_provider", existing.requires_oauth_provider),
+                token_exchange_audience=updates.get(
+                    "token_exchange_audience", existing.token_exchange_audience
+                ),
                 mcp_config=updates.get("mcp_config", existing.mcp_config),
             )
             self._validate_auth_config(preview)

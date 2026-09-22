@@ -14,12 +14,19 @@ from apis.app_api.documents.models import (
     DocumentResponse,
     DocumentsListResponse,
     DownloadUrlResponse,
+    ExtractedChunkResponse,
+    ExtractedChunksResponse,
     ImportDocumentsRequest,
     ImportDocumentsResponse,
+    KbUsage,
     ReportUploadFailureRequest,
     UploadUrlResponse,
 )
-from apis.app_api.documents.services.document_service import _generate_document_id, create_document, list_assistant_documents, update_document_status
+from apis.app_api.documents.services.chunk_inspector import (
+    DocumentNotInspectable,
+    inspect_document_chunks,
+)
+from apis.app_api.documents.services.document_service import _generate_document_id, create_document, list_assistant_documents, update_document_status, release_reservation_if_managed
 from apis.app_api.documents.services.document_service import get_document as get_document_service
 from apis.app_api.documents.services.import_service import run_import
 from apis.app_api.documents.services.storage_service import (
@@ -29,12 +36,15 @@ from apis.app_api.documents.services.storage_service import (
     generate_upload_url,
 )
 from apis.app_api.file_sources.service import require_file_source_token, resolve_file_source
+from apis.app_api.kb_upgrade.born_managed import STATUS_PROVISIONING, begin_born_managed
 from apis.shared.auth import User, get_current_user_from_session
 from apis.shared.oauth.provider_repository import (
     OAuthProviderRepository,
     get_provider_repository,
 )
 from apis.shared.rbac.service import AppRoleService, get_app_role_service
+from apis.shared.security.log_sanitize import scrub_log
+from apis.shared.kb_backend.byte_cap import ByteCapExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +70,119 @@ async def _require_edit_permission(assistant_id: str, current_user: User) -> str
     return assistant.owner_id
 
 
+async def _resolve_managed_kb(assistant_id: str) -> tuple[bool, bool]:
+    """Return ``(is_managed, elevated)`` for this assistant's knowledge base.
+
+    Reads the KB_Record once. A legacy knowledge base — an absent record, or any
+    record whose engine is not the exact managed literal — returns
+    ``(False, False)`` so the caller skips all cap logic: legacy S3-Vectors
+    knowledge bases stay uncapped (Requirement 12.11 scopes the cap to managed
+    KBs). The elevated tier is READ from the existing ``elevatedByteCap`` flag,
+    never written here — granting it is a separate feature.
+    """
+    from apis.shared.kb_backend.records import ENGINE_MANAGED, get_kb_record, resolve_engine
+
+    # app_kb_id == assistant_id this phase. get_kb_record is a blocking boto3 call.
+    record = await asyncio.to_thread(get_kb_record, assistant_id, assistant_id)
+    if resolve_engine(record) != ENGINE_MANAGED:
+        return False, False
+    return True, bool((record or {}).get("elevatedByteCap"))
+
+
+async def _resolve_kb_usage(assistant_id: str) -> Optional[KbUsage]:
+    """Storage usage + binding cap for this assistant's knowledge base.
+
+    Read once from the KB_Record and shaped for the UI usage bar. A managed KB
+    reports its committed and reserved bytes plus the binding cap
+    (``effective_cap``, the smaller of the owner tier and the per-KB ceiling). A
+    legacy S3-Vectors KB — an absent record, or one whose engine is not the exact
+    managed literal — is uncapped and tracks no bytes (the cap is scoped to
+    managed KBs by Requirement 12.11), so it reports ``cap=None`` with zeroed
+    counters and the UI renders an uncapped indicator. The elevated tier is READ
+    from ``elevatedByteCap``, never written here.
+
+    Best-effort: the usage bar is enrichment, not the point of the endpoint, so a
+    failed record read returns ``None`` (the bar is simply not shown) rather than
+    failing the whole documents list.
+    """
+    from apis.shared.kb_backend import byte_cap
+    from apis.shared.kb_backend.records import (
+        ENGINE_LEGACY,
+        ENGINE_MANAGED,
+        get_kb_record,
+        resolve_engine,
+    )
+
+    try:
+        # app_kb_id == assistant_id this phase. get_kb_record is a blocking boto3 call.
+        record = await asyncio.to_thread(get_kb_record, assistant_id, assistant_id)
+        if resolve_engine(record) != ENGINE_MANAGED:
+            return KbUsage(engine=ENGINE_LEGACY)
+        elevated = bool((record or {}).get("elevatedByteCap"))
+        return KbUsage(
+            engine=ENGINE_MANAGED,
+            storedBytes=int((record or {}).get("storedBytes") or 0),
+            reservedBytes=int((record or {}).get("reservedBytes") or 0),
+            cap=byte_cap.effective_cap(elevated),
+            elevated=elevated,
+        )
+    except Exception as exc:  # noqa: BLE001 — enrichment must not fail the list
+        logger.warning(
+            "Could not resolve KB usage for %s: %s",
+            scrub_log(assistant_id),
+            scrub_log(exc),
+        )
+        return None
+
+
+async def _reserve_managed_upload(assistant_id: str, size_bytes: int) -> int:
+    """Provisionally reserve a declared upload size against the managed-KB cap.
+
+    Returns the number of bytes reserved — ``0`` for a legacy knowledge base,
+    which is uncapped and never touched. Raises
+    :class:`~apis.shared.kb_backend.byte_cap.ByteCapExceeded` if the reservation
+    would breach the binding cap; the endpoint turns that into HTTP 413 with the
+    numbers (Requirement 12.12).
+
+    The reservation is PROVISIONAL. ``size_bytes`` is the client's own declaration
+    and a client that under-reports its size would defeat the cap, so this only
+    buys fast, friendly feedback before a presigned URL is issued — the
+    authoritative gate is the S3-HEAD reconcile at ingestion (Requirement 12.3).
+    ``effective_cap`` folds the per-owner allowance and the per-KB ceiling into one
+    atomic conditional write (Requirement 12.1/12.5).
+    """
+    from apis.shared.kb_backend import byte_cap
+
+    is_managed, elevated = await _resolve_managed_kb(assistant_id)
+    if not is_managed:
+        return 0
+    cap = byte_cap.effective_cap(elevated)
+    await asyncio.to_thread(byte_cap.reserve, assistant_id, assistant_id, size_bytes, cap)
+    return size_bytes
+
+
+async def _release_managed_reservation(assistant_id: str, size_bytes: int) -> None:
+    """Return a managed-KB reservation taken earlier in THIS request.
+
+    Used only to unwind the request-time reservation when a later step of the same
+    upload-URL request fails (document-row create, presigned-URL generation) before
+    the client is ever handed a URL. No ``settle_once`` guard here: the reservation
+    was taken microseconds ago by this same request, the document is not yet
+    visible to any other settlement path, and the ``DOC#`` row may not even exist —
+    stamping a marker on it would conjure a partial row. The abandoned-after-URL
+    cases (client upload failure, stale sweep) settle through their own guarded
+    paths (Requirement 12.6).
+    """
+    from apis.shared.kb_backend import byte_cap
+
+    if size_bytes <= 0:
+        return
+    is_managed, _ = await _resolve_managed_kb(assistant_id)
+    if not is_managed:
+        return
+    await asyncio.to_thread(byte_cap.release, assistant_id, assistant_id, size_bytes)
+
+
 @router.post("/upload-url", response_model=UploadUrlResponse, status_code=status.HTTP_200_OK)
 async def generate_upload_url_endpoint(
     assistant_id: str,
@@ -78,7 +201,33 @@ async def generate_upload_url_endpoint(
     """
     try:
         # 1. Resolve permission — owner or editor may upload documents
-        await _require_edit_permission(assistant_id, current_user)
+        assistant_owner_id = await _require_edit_permission(assistant_id, current_user)
+
+        # 1b. Born-managed (MANAGED_KB_NEW_DEFAULT): the FIRST document is what
+        #     triggers knowledge-base provisioning, so a prompt-only agent or an
+        #     abandoned draft never spends a Bedrock knowledge base. This declares
+        #     the engine managed up front — which is what makes the legacy pipeline
+        #     skip the object about to land — and queues the provisioning job for
+        #     the worker. It never raises: a failure leaves the agent on legacy.
+        #     Returns True only while the knowledge base is still being built.
+        provisioning = await begin_born_managed(
+            assistant_id, owner_user_id=assistant_owner_id
+        )
+
+        # 1c. Managed KBs are byte-capped on EVERY path that adds bytes
+        #     (Requirement 12.11); the interactive upload path is enforced here.
+        #     Reserve the client-declared size BEFORE creating the DOC# row or
+        #     issuing a presigned URL, so an over-cap upload is refused with a 413
+        #     the client can act on rather than after the bytes are already staged.
+        #     Legacy KBs return 0 and are never checked.
+        #
+        #     This runs AFTER the born-managed trigger deliberately: the record it
+        #     creates already resolves to managed, so a born-managed first document
+        #     is capped like every other one. Skipping the reserve for it would be
+        #     the subtle bug — the reconcile at ingestion COMMITS the reservation
+        #     (`reservedBytes -= n`), so a document that committed without reserving
+        #     would drive the counter negative and corrupt the cap permanently.
+        reserved_bytes = await _reserve_managed_upload(assistant_id, request.size_bytes)
 
         # 2. Generate document_id and S3 key
         from apis.app_api.documents.services.storage_service import _get_s3_key, _sanitize_filename
@@ -88,24 +237,48 @@ async def generate_upload_url_endpoint(
         sanitized_filename = _sanitize_filename(request.filename)
         s3_key = _get_s3_key(assistant_id, document_id, sanitized_filename)
 
-        # 3. Create document record in DynamoDB (status='uploading')
-        _ = await create_document(
-            assistant_id=assistant_id,
-            filename=request.filename,
-            content_type=request.content_type,
-            size_bytes=request.size_bytes,
-            s3_key=s3_key,
-            document_id=document_id,
-        )
+        try:
+            # 3. Create document record in DynamoDB (status='uploading', or
+            #    'provisioning' when this upload is what triggered the knowledge
+            #    base being built). The declared size is persisted as sizeBytes —
+            #    the value the ingestion step reconciles the true S3 size against
+            #    (Requirement 12.3).
+            _ = await create_document(
+                assistant_id=assistant_id,
+                filename=request.filename,
+                content_type=request.content_type,
+                size_bytes=request.size_bytes,
+                s3_key=s3_key,
+                document_id=document_id,
+                status=STATUS_PROVISIONING if provisioning else "uploading",
+            )
 
-        # 4. Generate presigned S3 URL
-        presigned_url, _ = await generate_upload_url(
-            assistant_id=assistant_id, document_id=document_id, filename=request.filename, content_type=request.content_type, expires_in=3600
-        )
+            # 4. Generate presigned S3 URL
+            presigned_url, _ = await generate_upload_url(
+                assistant_id=assistant_id, document_id=document_id, filename=request.filename, content_type=request.content_type, expires_in=3600
+            )
+        except Exception:
+            # A step after the reservation failed and the client never received a
+            # URL, so this upload can never settle the bytes. Return the
+            # reservation now rather than leak it (Requirement 12.6).
+            await _release_managed_reservation(assistant_id, reserved_bytes)
+            raise
 
         # 5. Return response
         return UploadUrlResponse(documentId=document_id, uploadUrl=presigned_url, expiresIn=3600)
 
+    except ByteCapExceeded as e:
+        # Requirement 12.12: the numbers make the error actionable — the user can
+        # see how far over they are and request an elevated tier.
+        used = "" if e.already_used is None else f" (currently using {e.already_used} bytes)"
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"This file ({e.requested} bytes) would put the assistant over its "
+                f"{e.cap}-byte knowledge-base limit{used}. Delete unused documents "
+                f"or request an elevated storage tier."
+            ),
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -240,6 +413,12 @@ async def report_upload_failure(
         if not updated:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update document status")
 
+        # The client's upload to S3 never landed, so the bytes reserved at
+        # request time will never be settled by the ingestion consumer. Return
+        # them now (Requirement 12.6). settle_once makes this idempotent against a
+        # concurrent stale-document sweep marking the same document failed.
+        await release_reservation_if_managed(document)
+
         return DocumentResponse.model_validate(updated.model_dump(by_alias=True))
 
     except HTTPException:
@@ -275,7 +454,14 @@ async def list_documents(
         # Convert to response models
         document_responses = [DocumentResponse.model_validate(doc.model_dump(by_alias=True)) for doc in documents]
 
-        return DocumentsListResponse(documents=document_responses, nextToken=next_page_token)
+        # Storage usage + cap for the assistant's knowledge base, so the UI can
+        # render the usage bar without a second round-trip (Requirement 12.11
+        # visibility). Legacy KBs return cap=None and the bar shows uncapped.
+        kb_usage = await _resolve_kb_usage(assistant_id)
+
+        return DocumentsListResponse(
+            documents=document_responses, nextToken=next_page_token, kbUsage=kb_usage
+        )
 
     except HTTPException:
         raise
@@ -338,6 +524,76 @@ async def get_download_url(
     except Exception as e:
         logger.error(f"Error generating download URL: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to generate download URL: {str(e)}")
+
+
+@router.get(
+    "/{document_id}/chunks",
+    response_model=ExtractedChunksResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_document_chunks(
+    assistant_id: str, document_id: str, current_user: User = Depends(get_current_user_from_session)
+) -> ExtractedChunksResponse:
+    """Show what the knowledge base actually extracted from this document.
+
+    The tooling half of the task-16.2 decision on managed-kb-migration §5.41. The
+    managed backend flattens a column-structured diagram or a 2-D table at ingestion,
+    so a per-column question gets a *confident wrong answer with no trace*. We do not
+    fix the parser — it is a managed service and this is a self-service platform — so
+    instead the extraction is made visible and the owner can decide to reformat their
+    source. Guidance nobody can verify is not guidance.
+
+    Owners and editors only, the same gate as every other document endpoint. Read-only:
+    no chunking, parsing or ingestion path is touched (Requirement 5).
+    """
+    try:
+        assistant_owner_id = await _require_edit_permission(assistant_id, current_user)
+        document = await get_document_service(assistant_id, document_id, assistant_owner_id)
+
+        if not document or document.status == "deleting":
+            # A soft-deleted document is being removed on purpose; surfacing its
+            # content would resurrect it in the one place the user is told it is gone.
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Document not found: {document_id}"
+            )
+
+        result = await inspect_document_chunks(
+            assistant_id,
+            document_id,
+            file_name=document.filename,
+            status=document.status,
+        )
+
+        return ExtractedChunksResponse(
+            documentId=result.document_id,
+            fileName=result.file_name,
+            engine=result.engine,
+            available=result.available,
+            reason=result.reason,
+            chunks=[
+                ExtractedChunkResponse(
+                    text=chunk.text, order=chunk.order, score=chunk.score, page=chunk.page
+                )
+                for chunk in result.chunks
+            ],
+            returned=result.returned,
+            capReached=result.cap_reached,
+        )
+
+    except DocumentNotInspectable as e:
+        # 409 rather than 404: the document exists, it simply has no content in the
+        # knowledge base yet. The carried copy is written for the owner, not an
+        # operator — `provisioning` in particular gets its own sentence, because a
+        # born-managed first upload is waiting on the knowledge base itself.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=e.reason)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error inspecting document chunks: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read extracted content: {str(e)}",
+        )
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)

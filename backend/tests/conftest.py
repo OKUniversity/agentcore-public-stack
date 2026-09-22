@@ -106,6 +106,30 @@ _ENV_CONFIG_BLEED_PREFIXES = (
 
 
 @pytest.fixture(autouse=True)
+def _clear_config_cache():
+    """Drop the process-wide config-catalog cache between tests.
+
+    ``apis.shared.caching.config_cache`` memoizes the model / tool /
+    system-prompt / provider catalogs for the life of the process. In
+    production that is invalidated by the write paths themselves, but tests
+    swap the whole table out underneath it — fixtures already reset the
+    module-level repo and service singletons for the same reason, and this is
+    the same class of state. Without it, a test that seeds a catalog leaves the
+    next test reading the previous one's rows.
+
+    A backstop, not the primary contract: production correctness comes from the
+    invalidation in the repositories, not from here.
+    """
+    from apis.shared.caching import config_cache
+
+    config_cache.get_config_cache().clear()
+    try:
+        yield
+    finally:
+        config_cache.get_config_cache().clear()
+
+
+@pytest.fixture(autouse=True)
 def _clear_env_config_bleed():
     saved = {
         k: os.environ.pop(k)
@@ -118,3 +142,202 @@ def _clear_env_config_bleed():
         for k, v in saved.items():
             os.environ[k] = v
 
+
+
+# ---------------------------------------------------------------------------
+# Admin authorization overrides
+# ---------------------------------------------------------------------------
+#
+# Admin routes are no longer guarded by a single `require_admin`: each admin
+# router package declares its own `require_admin_scope(...)` dependency
+# (delegated admin scopes, docs/specs/granular-admin-permissions.md). A test
+# that mounts the root admin router therefore has several distinct dependency
+# objects to satisfy, and overriding `require_admin` alone silently 401s.
+#
+# `override_admin_auth` overrides all of them at once, so a new admin area is
+# covered automatically instead of breaking every route test that mounts the
+# root router.
+
+
+# The closures returned by the dependency factories in
+# `apis/shared/auth/rbac.py`. Matching on qualname rather than importing the
+# module-level names is deliberate: `test_skills_feature_flag.py` reloads
+# `apis.app_api.admin.routes`, which rebuilds every `require_*_admin` object in
+# it. A test app built before that reload still holds the *old* dependency
+# objects, so an import-based override list silently stops matching and every
+# request 401s. Reading the dependencies off the app can't go stale.
+_AUTH_CHECKER_QUALNAMES = frozenset(
+    {
+        "require_app_roles.<locals>.checker",   # includes require_admin
+        "require_admin_scope.<locals>.checker",
+    }
+)
+
+
+def _walk_dependants(dependant):
+    """Yield a route's dependency tree, sub-dependencies included."""
+    for dep in dependant.dependencies:
+        yield dep
+        yield from _walk_dependants(dep)
+
+
+def override_admin_auth(app, impl) -> None:
+    """Point every admin authorization dependency on ``app`` at ``impl``.
+
+    Walks the app's own routes, so it covers whichever admin areas the test
+    mounted and picks up new ones for free.
+
+    Note it targets only the *authorization closures*, not wrappers built on
+    them. `require_marketplace_admin` is a wrapper that also enforces the
+    AGENT_MARKETPLACE_ENABLED kill switch (404 when off); overriding it would
+    authorize the caller *and* silently disable the kill switch, so a test
+    asserting the disabled behavior would sail straight past it. Overriding the
+    scope check it wraps leaves the wrapper running.
+
+    Args:
+        app: The FastAPI app under test.
+        impl: A zero-arg callable returning the User to inject — or one that
+            raises, to exercise the denied path.
+
+    Raises:
+        AssertionError: if the app exposes no authorization dependency at all,
+            which means the test would have 401'd for a non-obvious reason.
+    """
+    matched = 0
+
+    for route in app.routes:
+        dependant = getattr(route, "dependant", None)
+        if dependant is None:
+            continue
+        for dep in _walk_dependants(dependant):
+            call = dep.call
+            if call is None:
+                continue
+            if getattr(call, "__qualname__", "") in _AUTH_CHECKER_QUALNAMES:
+                app.dependency_overrides[call] = impl
+                matched += 1
+
+    assert matched, (
+        "override_admin_auth found no authorization dependency on this app — "
+        "did the router fail to mount, or was the app built before a module "
+        "reload replaced its dependencies?"
+    )
+
+
+# ---------------------------------------------------------------------------
+# No off-box sockets. Every AWS call in this suite is supposed to be mocked
+# (moto), and moto never opens a real socket — so "connected to something that
+# is not localhost" is a precise detector for a test that escaped the mock.
+#
+# It is worth enforcing because the failure is otherwise *invisible*. Service
+# code here is deliberately fail-open (a user should not lose their session
+# because a table blipped), so a test that mocks one dependency and misses a
+# second gets a real DynamoDB client, a real request, a swallowed exception,
+# and a green assertion. That is not hypothetical: 25 cases across 6 files were
+# doing it, and the suite reported the same 9196 passed with and without the
+# connections. On a developer machine `~/.aws/config` carries a `[default]`
+# profile, so those were *authenticated* requests to real AWS from a unit test;
+# in CI one occasionally stalled in TLS and botocore's connect timeout ×
+# retries turned a silent escape into a 72-minute hang.
+#
+# Hooking botocore would be ambiguous — moto intercepts `before-send` itself —
+# so the guard sits at the socket layer, below every SDK.
+#
+# Two halves, because raising is not enough: the fail-open code under test
+# swallows the error, so the violation is also recorded and asserted at
+# teardown. `AWS_TEST_ALLOW_OFF_BOX_SOCKETS=1` disables it for the rare test
+# that genuinely needs the network.
+# ---------------------------------------------------------------------------
+import socket as _socket
+
+_OFF_BOX_ALLOWED_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "0.0.0.0", ""})
+_off_box_attempts: list = []
+_real_socket_connect = _socket.socket.connect
+_real_socket_connect_ex = _socket.socket.connect_ex
+
+
+def _is_off_box(sock, address) -> "str | None":
+    """The destination host when this is an off-box TCP connect, else ``None``.
+
+    Only AF_INET/AF_INET6 **stream** sockets are guarded: UDP is left alone so
+    DNS resolution keeps working, and AF_UNIX has no host to check.
+    """
+    if getattr(sock, "type", None) != _socket.SOCK_STREAM:
+        return None
+    if getattr(sock, "family", None) not in (_socket.AF_INET, _socket.AF_INET6):
+        return None
+    if not isinstance(address, tuple) or not address:
+        return None
+    host = str(address[0])
+    if host in _OFF_BOX_ALLOWED_HOSTS or host.startswith("127."):
+        return None
+    return host
+
+
+def _guard_connect(self, address):
+    host = _is_off_box(self, address)
+    if host is not None:
+        _off_box_attempts.append(host)
+        raise RuntimeError(
+            f"Blocked an off-box connection to {host!r}. Tests must not reach real "
+            "AWS — mock it (moto, or patch the repository/client this code path "
+            "builds). See the 'No off-box sockets' note in tests/conftest.py."
+        )
+    return _real_socket_connect(self, address)
+
+
+def _guard_connect_ex(self, address):
+    host = _is_off_box(self, address)
+    if host is not None:
+        _off_box_attempts.append(host)
+        raise RuntimeError(f"Blocked an off-box connection to {host!r} (see tests/conftest.py).")
+    return _real_socket_connect_ex(self, address)
+
+
+# Warm tiktoken's BPE vocabulary *before* the guard arms. `csv_chunker` calls
+# `tiktoken.get_encoding("cl100k_base")`, which downloads the vocabulary from an
+# external CDN on first use and caches it on disk. That is a legitimate asset
+# fetch, not an escaped AWS call — but it is also a real network dependency of
+# the test run, which is why it only showed up on CI (cold cache) and never
+# locally (warm one). Fetching it here keeps the guarded window hermetic without
+# widening the allowlist, and makes the dependency explicit rather than
+# incidental. Best-effort: offline, the CSV chunker tests fail on their own terms
+# rather than on a confusing socket error.
+try:  # noqa: SIM105
+    import tiktoken as _tiktoken
+
+    _tiktoken.get_encoding("cl100k_base")
+except Exception:  # noqa: BLE001 - never block collection on a cache warm-up
+    pass
+
+
+if os.environ.get("AWS_TEST_ALLOW_OFF_BOX_SOCKETS") != "1":
+    _socket.socket.connect = _guard_connect
+    _socket.socket.connect_ex = _guard_connect_ex
+
+
+
+
+@pytest.fixture(autouse=True)
+def _fail_on_off_box_sockets():
+    """Fail a test that tried to leave the box, *even if it swallowed the error*.
+
+    The raise above stops the connection; this is what makes it visible. Without
+    it a fail-open code path turns the block into a silent no-op and the test
+    still passes — which is exactly how this went unnoticed.
+    """
+    _off_box_attempts.clear()
+    try:
+        yield
+    finally:
+        attempted = list(_off_box_attempts)
+        _off_box_attempts.clear()
+    if not attempted:
+        return
+    hosts = ", ".join(sorted(set(attempted)))
+    pytest.fail(
+        f"This test opened {len(attempted)} connection(s) off-box ({hosts}). "
+        "Something it exercises built a real AWS client. Mock that dependency; "
+        "a fail-open except block hides the failure but the call still happens. "
+        "See the 'No off-box sockets' note above."
+    )

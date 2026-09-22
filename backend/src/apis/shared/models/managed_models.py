@@ -4,6 +4,7 @@ This service handles CRUD operations for managed models.
 Requires DynamoDB storage via DYNAMODB_MANAGED_MODELS_TABLE_NAME.
 """
 
+import asyncio
 import logging
 import os
 import uuid
@@ -14,9 +15,17 @@ from decimal import Decimal
 import boto3
 from botocore.exceptions import ClientError
 
+from apis.shared.caching import config_cache
 from .models import ManagedModel, ManagedModelCreate, ManagedModelUpdate
 
 logger = logging.getLogger(__name__)
+
+
+# Providers whose models prompt-cache by default when the field is unset.
+_CACHING_DEFAULT_PROVIDERS = ('bedrock', 'bedrock-responses')
+
+# Providers where caching is not optional — see _resolve_supports_caching.
+_CACHING_FORCED_PROVIDERS = ('bedrock-responses',)
 
 
 def _resolve_supports_caching(supports_caching: Optional[bool], provider: str) -> bool:
@@ -25,41 +34,81 @@ def _resolve_supports_caching(supports_caching: Optional[bool], provider: str) -
 
     Args:
         supports_caching: Explicit value from model data (None if not set)
-        provider: The model provider (bedrock, openai, gemini)
+        provider: The model provider (bedrock, openai, gemini, mantle,
+            bedrock-responses)
 
     Returns:
         bool: Whether the model supports caching
     """
+    normalized_provider = provider.lower()
+
+    # On bedrock-responses caching is a fact, not a setting: it is implicit and
+    # server-side, and nothing we send turns it off. A stored False there would
+    # be untrue, and its only practical effect is that the cache rates get
+    # cleared — which prices cached tokens at $0.00 while the provider bills
+    # them in full. On a warm conversation nearly every input token is a cache
+    # read, so that is close to total under-reporting of the model's spend.
+    #
+    # Normalized rather than honored, exactly like `apiMode` on the same
+    # transport, so no client can persist the impossible state.
+    if normalized_provider in _CACHING_FORCED_PROVIDERS:
+        return True
+
     if supports_caching is not None:
         return supports_caching
 
-    # Default behavior: Only Bedrock models support caching by default
-    # Admins can explicitly set this to False for Bedrock models that don't support it
-    return provider.lower() == 'bedrock'
+    # Default behavior: Bedrock Converse models, and the bedrock-runtime
+    # Responses transport. Admins can explicitly set this to False for Bedrock
+    # models that don't support it.
+    #
+    # Deliberately NOT 'mantle': Mantle hosts open-weight models that mostly
+    # don't cache, and openai.gpt-5.4 there is implicit-only with no write fee.
+    return normalized_provider in _CACHING_DEFAULT_PROVIDERS
+
+
+# The two OpenAI-compatible Bedrock surfaces. Both ride the OpenAI wire
+# protocol with a short-term bearer token; they differ in host, IAM and
+# model-id shape. The `apiMode` / `region` fields are meaningful on both,
+# which is why they are wire-named generically even though the Python
+# attributes still carry the historical `mantle_` prefix.
+_OPENAI_SURFACE_PROVIDERS = ('mantle', 'bedrock-responses')
 
 
 def _resolve_mantle_api_mode(api_mode: Optional[str], provider: str) -> Optional[str]:
-    """Resolve the Bedrock Mantle API surface for a model.
+    """Resolve the OpenAI-compatible API surface for a model.
 
-    Only meaningful for ``provider == 'mantle'`` — it selects Chat Completions
-    vs the Responses API, a per-model fact Mantle exposes no API to discover.
-    Defaults to ``'chat'`` for Mantle models when unset; ``None`` for every
-    other provider (the field is inert there).
+    On ``provider == 'mantle'`` this selects Chat Completions vs the Responses
+    API — a per-model fact Mantle exposes no API to discover. Defaults to
+    ``'chat'`` when unset.
+
+    On ``provider == 'bedrock-responses'`` the answer is fixed: that transport
+    exists precisely because GPT-5.6 serves prompt caching only over the
+    Responses API, so an admin cannot select Chat Completions there. Anything
+    stored is normalized to ``'responses'`` rather than honored — a model
+    silently downgraded to Chat Completions would lose caching, which is the
+    whole point of the transport, and would fail quietly rather than loudly.
+
+    ``None`` for every other provider (the field is inert there).
     """
-    if provider.lower() != 'mantle':
+    normalized_provider = provider.lower()
+    if normalized_provider == 'bedrock-responses':
+        return 'responses'
+    if normalized_provider != 'mantle':
         return None
     mode = (api_mode or '').lower()
     return mode if mode in ('chat', 'responses') else 'chat'
 
 
 def _resolve_mantle_region(region: Optional[str], provider: str) -> Optional[str]:
-    """Resolve the Bedrock Mantle region override for a model.
+    """Resolve the region override for an OpenAI-compatible Bedrock surface.
 
-    Only meaningful for ``provider == 'mantle'`` — pins inference to the region
-    hosting the model, independent of the app's region. ``None`` (fall back to
-    the app's region at agent-build time) when unset or for other providers.
+    Meaningful on both ``'mantle'`` and ``'bedrock-responses'`` — pins
+    inference to a specific region independent of the app's region, and drives
+    both the endpoint host and the region the bearer token is signed for.
+    ``None`` (fall back to the app's region at agent-build time) when unset or
+    for other providers.
     """
-    if provider.lower() != 'mantle':
+    if provider.lower() not in _OPENAI_SURFACE_PROVIDERS:
         return None
     return region or None
 
@@ -177,7 +226,11 @@ async def create_managed_model(model_data: ManagedModelCreate) -> ManagedModel:
     managed_models_table = os.environ.get('DYNAMODB_MANAGED_MODELS_TABLE_NAME')
     if not managed_models_table:
         raise RuntimeError("DYNAMODB_MANAGED_MODELS_TABLE_NAME environment variable is required")
-    return await _create_managed_model_cloud(model_data, managed_models_table)
+    created = await _create_managed_model_cloud(model_data, managed_models_table)
+    # Invalidate here rather than in the admin route: every write to this table
+    # funnels through these three functions, so a future caller cannot forget.
+    config_cache.invalidate(config_cache.MANAGED_MODELS)
+    return created
 
 
 async def _create_managed_model_cloud(model_data: ManagedModelCreate, table_name: str) -> ManagedModel:
@@ -228,6 +281,8 @@ async def _create_managed_model_cloud(model_data: ManagedModelCreate, table_name
         id=model_id,
         model_id=model_data.model_id,
         model_name=model_data.model_name,
+        short_description=model_data.short_description,
+        icon_slug=model_data.icon_slug,
         provider=model_data.provider,
         provider_name=model_data.provider_name,
         input_modalities=model_data.input_modalities,
@@ -246,6 +301,7 @@ async def _create_managed_model_cloud(model_data: ManagedModelCreate, table_name
         knowledge_cutoff_date=model_data.knowledge_cutoff_date,
         supports_caching=_resolve_supports_caching(model_data.supports_caching, model_data.provider),
         is_default=model_data.is_default,
+        is_featured=model_data.is_featured,
         mantle_api_mode=_resolve_mantle_api_mode(model_data.mantle_api_mode, model_data.provider),
         mantle_region=_resolve_mantle_region(model_data.mantle_region, model_data.provider),
         supported_params=model_data.supported_params,
@@ -273,6 +329,7 @@ async def _create_managed_model_cloud(model_data: ManagedModelCreate, table_name
         'outputPricePerMillionTokens': model_data.output_price_per_million_tokens,
         'supportsCaching': _resolve_supports_caching(model_data.supports_caching, model_data.provider),
         'isDefault': model_data.is_default,
+        'isFeatured': model_data.is_featured,
         'createdAt': now.isoformat(),
         'updatedAt': now.isoformat(),
     }
@@ -286,6 +343,10 @@ async def _create_managed_model_cloud(model_data: ManagedModelCreate, table_name
         item['cacheReadPricePerMillionTokens'] = model_data.cache_read_price_per_million_tokens
     if model_data.knowledge_cutoff_date is not None:
         item['knowledgeCutoffDate'] = model_data.knowledge_cutoff_date
+    if model_data.short_description:
+        item['shortDescription'] = model_data.short_description
+    if model_data.icon_slug:
+        item['iconSlug'] = model_data.icon_slug
     resolved_api_mode = _resolve_mantle_api_mode(model_data.mantle_api_mode, model_data.provider)
     if resolved_api_mode is not None:
         item['apiMode'] = resolved_api_mode
@@ -418,9 +479,41 @@ async def list_all_managed_models() -> List[ManagedModel]:
     return await _list_managed_models_cloud(managed_models_table)
 
 
+def _scan_managed_model_items(table_name: str) -> List[dict]:
+    """Scan the raw MODEL# items. Blocking; call via ``asyncio.to_thread``."""
+    table = dynamodb.Table(table_name)
+
+    response = table.scan(
+        FilterExpression='begins_with(PK, :pk_prefix)',
+        ExpressionAttributeValues={
+            ':pk_prefix': 'MODEL#'
+        }
+    )
+
+    items = response.get('Items', [])
+
+    # Handle pagination
+    while 'LastEvaluatedKey' in response:
+        response = table.scan(
+            FilterExpression='begins_with(PK, :pk_prefix)',
+            ExpressionAttributeValues={
+                ':pk_prefix': 'MODEL#'
+            },
+            ExclusiveStartKey=response['LastEvaluatedKey']
+        )
+        items.extend(response.get('Items', []))
+
+    return items
+
+
 async def _list_managed_models_cloud(table_name: str) -> List[ManagedModel]:
     """
     List all managed models from DynamoDB
+
+    The scan is cached per process (see ``apis.shared.caching.config_cache``);
+    parsing is not. Callers mutate the models they receive — the admin list
+    route hands them straight to ``hydrate_model_roles``, which writes
+    ``allowed_app_roles`` in place — so each caller must get objects it owns.
 
     Args:
         table_name: DynamoDB table name
@@ -428,30 +521,13 @@ async def _list_managed_models_cloud(table_name: str) -> List[ManagedModel]:
     Returns:
         List of ManagedModel objects
     """
-    table = dynamodb.Table(table_name)
     models = []
 
     try:
-        # Scan table for all models (PK starts with MODEL#)
-        response = table.scan(
-            FilterExpression='begins_with(PK, :pk_prefix)',
-            ExpressionAttributeValues={
-                ':pk_prefix': 'MODEL#'
-            }
+        items = await config_cache.get_or_load(
+            config_cache.MANAGED_MODELS,
+            lambda: asyncio.to_thread(_scan_managed_model_items, table_name),
         )
-
-        items = response.get('Items', [])
-
-        # Handle pagination
-        while 'LastEvaluatedKey' in response:
-            response = table.scan(
-                FilterExpression='begins_with(PK, :pk_prefix)',
-                ExpressionAttributeValues={
-                    ':pk_prefix': 'MODEL#'
-                },
-                ExclusiveStartKey=response['LastEvaluatedKey']
-            )
-            items.extend(response.get('Items', []))
 
         # Convert items to ManagedModel objects
         for item in items:
@@ -510,7 +586,9 @@ async def update_managed_model(model_id: str, updates: ManagedModelUpdate) -> Op
     managed_models_table = os.environ.get('DYNAMODB_MANAGED_MODELS_TABLE_NAME')
     if not managed_models_table:
         raise RuntimeError("DYNAMODB_MANAGED_MODELS_TABLE_NAME environment variable is required")
-    return await _update_managed_model_cloud(model_id, updates, managed_models_table)
+    updated = await _update_managed_model_cloud(model_id, updates, managed_models_table)
+    config_cache.invalidate(config_cache.MANAGED_MODELS)
+    return updated
 
 
 async def _update_managed_model_cloud(model_id: str, updates: ManagedModelUpdate, table_name: str) -> Optional[ManagedModel]:
@@ -579,8 +657,18 @@ async def _update_managed_model_cloud(model_id: str, updates: ManagedModelUpdate
 
     # Build update expression
     update_expression_parts = []
+    remove_expression_parts = []
     expression_attribute_names = {}
     expression_attribute_values = {}
+
+    # '' on iconSlug is the wire value for "clear it" — None can't be, because
+    # the model_dump above drops None fields, which is what makes a PATCH a
+    # PATCH. Removing the attribute rather than storing '' keeps the record
+    # shaped like one that never had an icon.
+    if update_data.get('iconSlug') == '':
+        update_data.pop('iconSlug')
+        remove_expression_parts.append('#iconSlug')
+        expression_attribute_names['#iconSlug'] = 'iconSlug'
 
     # Add updatedAt timestamp
     update_data['updatedAt'] = datetime.now(timezone.utc).isoformat()
@@ -603,6 +691,8 @@ async def _update_managed_model_cloud(model_id: str, updates: ManagedModelUpdate
         update_expression_parts.append('#GSI1PK = :GSI1PK')
 
     update_expression = "SET " + ", ".join(update_expression_parts)
+    if remove_expression_parts:
+        update_expression += " REMOVE " + ", ".join(remove_expression_parts)
 
     try:
         response = table.update_item(
@@ -642,6 +732,53 @@ async def _update_managed_model_cloud(model_id: str, updates: ManagedModelUpdate
         raise
 
 
+async def write_model_icon_key(model_id: str, icon_key: Optional[str]) -> None:
+    """Set or clear a model's uploaded-icon key, and nothing else.
+
+    A dedicated writer rather than a field on ``ManagedModelUpdate`` because the
+    key is not admin-supplied data: it is produced by the upload path from the
+    bytes it just stored. Routing it through the general update model would make
+    it forgeable from the model form — an admin could point one model's record at
+    another's object, or at any key in the bucket.
+
+    Invalidates the catalog cache, or the new icon would not appear for up to a
+    minute on the task that served the upload.
+    """
+    table_name = os.environ.get('DYNAMODB_MANAGED_MODELS_TABLE_NAME')
+    if not table_name:
+        raise RuntimeError("DYNAMODB_MANAGED_MODELS_TABLE_NAME environment variable is required")
+
+    table = dynamodb.Table(table_name)
+    key = {'PK': f'MODEL#{model_id}', 'SK': f'MODEL#{model_id}'}
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        if icon_key:
+            table.update_item(
+                Key=key,
+                UpdateExpression='SET #iconKey = :iconKey, #updatedAt = :updatedAt',
+                ExpressionAttributeNames={'#iconKey': 'iconKey', '#updatedAt': 'updatedAt'},
+                ExpressionAttributeValues={':iconKey': icon_key, ':updatedAt': now},
+                ConditionExpression='attribute_exists(PK)',
+            )
+        else:
+            table.update_item(
+                Key=key,
+                UpdateExpression='SET #updatedAt = :updatedAt REMOVE #iconKey',
+                ExpressionAttributeNames={'#iconKey': 'iconKey', '#updatedAt': 'updatedAt'},
+                ExpressionAttributeValues={':updatedAt': now},
+                ConditionExpression='attribute_exists(PK)',
+            )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            raise ValueError(f"Model not found: {model_id}") from e
+        logger.error(f"Failed to write icon key for model {model_id}: {e}")
+        raise
+
+    config_cache.invalidate(config_cache.MANAGED_MODELS)
+    logger.info(f"🖼️ model-icons: record {model_id} now points at {icon_key or '(none)'}")
+
+
 async def delete_managed_model(model_id: str) -> bool:
     """
     Delete an managed model
@@ -655,7 +792,9 @@ async def delete_managed_model(model_id: str) -> bool:
     managed_models_table = os.environ.get('DYNAMODB_MANAGED_MODELS_TABLE_NAME')
     if not managed_models_table:
         raise RuntimeError("DYNAMODB_MANAGED_MODELS_TABLE_NAME environment variable is required")
-    return await _delete_managed_model_cloud(model_id, managed_models_table)
+    deleted = await _delete_managed_model_cloud(model_id, managed_models_table)
+    config_cache.invalidate(config_cache.MANAGED_MODELS)
+    return deleted
 
 
 async def _delete_managed_model_cloud(model_id: str, table_name: str) -> bool:
@@ -682,7 +821,16 @@ async def _delete_managed_model_cloud(model_id: str, table_name: str) -> bool:
         )
 
         # Check if item was actually deleted
-        if response.get('Attributes'):
+        attributes = response.get('Attributes')
+        if attributes:
+            # The record is gone; its uploaded icon should go with it. Best-effort
+            # and after the fact — an orphaned object costs pennies, while failing
+            # the delete over one would leave the admin with a model they can't
+            # remove. A built-in iconSlug has no object to clean up.
+            icon_key = attributes.get('iconKey')
+            if icon_key:
+                from apis.shared.models.model_icons import get_model_icon_store
+                get_model_icon_store().delete(icon_key)
             logger.info(f"🗑️  Deleted managed model from DynamoDB: {model_id}")
             return True
         return False

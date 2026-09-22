@@ -9,9 +9,16 @@ on:
       - 'infrastructure/lib/platform-stack.ts'
       - 'infrastructure/lib/constructs/**'
       - 'infrastructure/lib/config.ts'
+      - 'infrastructure/cdk.context.json'
       - 'infrastructure/bin/infrastructure.ts'
       - 'infrastructure/bootstrap-assets/**'
+      # Staged into the mcp-sandbox bucket at synth (mcp-sandbox-bucket-construct).
+      # Without this a viewer change deploys NOWHERE: frontend-deploy.yml does not
+      # ship it, so the push goes green and the old asset stays live.
+      - 'infrastructure/assets/**'
       - 'scripts/platform/**'
+      # fetch-dcv-sdk.sh runs in THIS workflow, before synth.
+      - 'scripts/build/**'
       - '.github/workflows/platform.yml'
 
 permissions:
@@ -57,7 +64,31 @@ jobs:
       CDK_PROJECT_PREFIX: ${{ vars.CDK_PROJECT_PREFIX }}
       CDK_DOMAIN_NAME: ${{ vars.CDK_DOMAIN_NAME }}
       CDK_CORS_ORIGINS: ${{ vars.CDK_CORS_ORIGINS }}
+      # The Environment tag value. Not cosmetic: it is the filter the managed-KB
+      # reconciler and scripts/teardown/managed-kb.sh match knowledge bases on, so
+      # an unset value here made a dev deploy tag its knowledge bases 'prod' while
+      # teardown looked for 'dev' — matching nothing and reporting success.
+      CDK_TAG_ENVIRONMENT: ${{ vars.CDK_TAG_ENVIRONMENT }}
       CDK_VPC_CIDR: ${{ vars.CDK_VPC_CIDR }}
+      # App API Fargate sizing. Per-environment because dev and prod have
+      # nothing in common here: prod must hold a resident burst (a 250-student
+      # section opening the app at once is ~5k requests in 30s, and a 60s
+      # scale-out cooldown cannot answer that — the headroom has to already be
+      # running), while dev only has to be correct.
+      #
+      # Leave a var unset to inherit the committed default in
+      # infrastructure/cdk.context.json — an unset var arrives as '' and
+      # parseIntEnv maps '' to undefined, so it falls through cleanly.
+      #
+      # cpu/memory must be a valid Fargate pair (1024 -> 2048..8192,
+      # 2048 -> 4096..16384). CFN rejects an invalid combination at deploy.
+      # Keep desiredCount >= 2 in every environment that matters: the shared
+      # BFF cookie key path (bff-cookie-key-construct.ts) only gets exercised
+      # with more than one task, and that is where a 'bad seal' 401 storm hid.
+      CDK_APP_API_CPU: ${{ vars.CDK_APP_API_CPU }}
+      CDK_APP_API_MEMORY: ${{ vars.CDK_APP_API_MEMORY }}
+      CDK_APP_API_DESIRED_COUNT: ${{ vars.CDK_APP_API_DESIRED_COUNT }}
+      CDK_APP_API_MAX_CAPACITY: ${{ vars.CDK_APP_API_MAX_CAPACITY }}
       CDK_ALB_SUBDOMAIN: ${{ vars.CDK_ALB_SUBDOMAIN }}
       CDK_CERTIFICATE_ARN: ${{ vars.CDK_CERTIFICATE_ARN }}
       # Shared us-east-1 CloudFront cert (wildcard covering {domain} + *.{domain}).
@@ -71,6 +102,18 @@ jobs:
       # a different AWS account (records are then created manually from the
       # deploy's CfnOutputs). Defaults to true.
       CDK_MANAGE_DNS_RECORDS: ${{ vars.CDK_MANAGE_DNS_RECORDS }}
+      # AgentCore Gateway inbound authorizer: "iam" (default) or "jwt".
+      # The authorizer is IMMUTABLE after Gateway creation — the AgentCore
+      # control plane rejects a change on an existing Gateway. Leave unset (or
+      # "iam") for any environment whose Gateway already exists; "jwt" only
+      # applies to a newly created Gateway.
+      CDK_GATEWAY_INBOUND_AUTH: ${{ vars.CDK_GATEWAY_INBOUND_AUTH }}
+      # RFC 8693 token exchange (optional). Leave both unset unless the
+      # organisation runs a token service with a token-exchange endpoint; the
+      # feature is dormant when the URL is empty. Not secrets — the client
+      # secret itself lives in Secrets Manager and is populated out of band.
+      CDK_TOKEN_EXCHANGE_URL: ${{ vars.CDK_TOKEN_EXCHANGE_URL }}
+      CDK_TOKEN_EXCHANGE_CLIENT_ID: ${{ vars.CDK_TOKEN_EXCHANGE_CLIENT_ID }}
       CDK_HOSTED_ZONE_DOMAIN: ${{ vars.CDK_HOSTED_ZONE_DOMAIN }}
       CDK_COGNITO_DOMAIN_PREFIX: ${{ vars.CDK_COGNITO_DOMAIN_PREFIX }}
       CDK_COGNITO_CALLBACK_URLS: ${{ vars.CDK_COGNITO_CALLBACK_URLS }}
@@ -82,7 +125,29 @@ jobs:
       # http://localhost:4200 for a local SPA pointed at this deployment.
       # Empty on prod. Mirrors CDK_MCP_SANDBOX_EXTRA_FRAME_ANCESTORS below.
       CDK_ARTIFACTS_EXTRA_FRAME_ANCESTORS: ${{ vars.CDK_ARTIFACTS_EXTRA_FRAME_ANCESTORS }}
+      # "Shared with you" inbox on the artifact library. Default ON with a
+      # kill switch, like the flags above: unset resolves to an empty string,
+      # which config.ts treats as "use the default (on)". Set the
+      # `CDK_ARTIFACT_SHARE_INBOX_ENABLED` variable to "false" in an
+      # environment to keep it dark there. The fan-out rows the inbox reads
+      # are written regardless of this flag, so toggling it never needs a
+      # backfill.
+      CDK_ARTIFACT_SHARE_INBOX_ENABLED: ${{ vars.CDK_ARTIFACT_SHARE_INBOX_ENABLED }}
       CDK_FRONTEND_CERTIFICATE_ARN: ${{ vars.CDK_FRONTEND_CERTIFICATE_ARN }}
+      # Hostnames Chromium refuses to navigate to during a browser session —
+      # the control that stops a human in a browser takeover reaching a system
+      # the agent must not act inside. Comma-separated, e.g.
+      # "instructure.com,vendor.example.com".
+      #
+      # ⚠️ There is NO built-in default: unset resolves to an empty string,
+      # which config.ts treats as "not configured" and leaves the list EMPTY,
+      # so browser sessions can reach any host and RBAC on browse_web /
+      # request_user_login becomes the only control. The stack ships
+      # fork-neutral on purpose (the hosts that matter are a per-institution
+      # policy call), so every environment that needs a blocklist must set
+      # this variable. The synth log prints the list, or warns when it is
+      # empty — check it after a deploy.
+      CDK_BROWSER_URL_BLOCKLIST: ${{ vars.CDK_BROWSER_URL_BLOCKLIST }}
       # MCP Apps sandbox-proxy origin (mcp-sandbox.{domain}). Without the
       # cert ARN the construct silently falls back to the CloudFront default
       # domain and creates no Route53 ALIAS — the SPA then frames a
@@ -116,6 +181,25 @@ jobs:
       # and see the ones their role grants. Which skills a cohort gets is a
       # role's `grantedSkills`, managed in the admin roles UI.
       CDK_SKILLS_ENABLED: ${{ vars.CDK_SKILLS_ENABLED }}
+      # SageMaker fine-tuning. The tables, bucket, SageMaker role and IAM
+      # grants deploy unconditionally, but these two decide whether the feature
+      # is reachable and how it is rationed, and neither was forwarded before —
+      # so every deployed environment served 404s from `/fine-tuning/*` while
+      # the repo variable `CDK_FINE_TUNING_ENABLED` read "true".
+      #
+      # ENABLED is default ON with a kill switch: unset resolves to empty
+      # string, which config.ts treats as the default (on). Set it to "false"
+      # to dark-stop the routes; storage is untouched either way, so no dataset
+      # or trained model is orphaned.
+      #
+      # DEFAULT_QUOTA_HOURS picks the access model: `0` (the default) is
+      # whitelist-only, where an admin grants each user explicitly; a positive
+      # value auto-grants that monthly GPU-hour budget to any signed-in user.
+      CDK_FINE_TUNING_ENABLED: ${{ vars.CDK_FINE_TUNING_ENABLED }}
+      CDK_FINE_TUNING_DEFAULT_QUOTA_HOURS: ${{ vars.CDK_FINE_TUNING_DEFAULT_QUOTA_HOURS }}
+      # Extra CORS origins for the fine-tuning data bucket, beyond the global
+      # CDK_CORS_ORIGINS above. Also never forwarded until now.
+      CDK_FINE_TUNING_CORS_ORIGINS: ${{ vars.CDK_FINE_TUNING_CORS_ORIGINS }}
       # Agent Designer /agents surface. Default OFF (opt-in) until the Phase-4
       # Designer UI ships — a headless API helps no forker. Set the
       # `CDK_AGENTS_API_ENABLED` variable to "true" in an environment (e.g. dev)
@@ -134,6 +218,78 @@ jobs:
       # cdk.context.json stay inert.
       CDK_MCP_TOKEN_ENRICHMENT_ENABLED: ${{ vars.CDK_MCP_TOKEN_ENRICHMENT_ENABLED }}
       CDK_MCP_TOKEN_ENRICHMENT_CLAIMS: ${{ vars.CDK_MCP_TOKEN_ENRICHMENT_CLAIMS }}
+      # Managed knowledge bases (.kiro/specs/managed-kb-migration). FOUR
+      # INDEPENDENT OPT-IN flags, all defaulting to OFF — the inverse of the
+      # kill-switch flags above, and the difference matters here. An unset
+      # GitHub Actions variable renders as an EMPTY STRING, not as absent, so
+      # a `!== 'false'` reading of an unset variable would resolve to TRUE and
+      # arm the feature on every fork. config.ts reads these with
+      # parseBooleanEnv, which maps both unset and empty to undefined and falls
+      # through to `false` (Requirement 19.8). Leave all four unset to deploy
+      # the managed backend without starting a fleet migration.
+      #
+      #   CDK_MANAGED_KB_NEW_DEFAULT           new KBs are created managed
+      #   CDK_MANAGED_KB_MIGRATION_ENABLED     the background migrator runs at all
+      #   CDK_MANAGED_KB_RECONCILER_ARMED      the daily reconciler DELETES orphans
+      #                                        rather than only reporting them
+      #   CDK_MANAGED_KB_DOC_RECONCILER_ARMED  the nightly document reconciler
+      #                                        CORRECTS stranded DOC# rows (marks
+      #                                        retrievable-but-stranded docs complete,
+      #                                        re-ingests missing ones) rather than
+      #                                        only reporting them (task 16.5, §5.37)
+      #
+      # The two ARMED flags are the inverted ones: both reconcilers are deployed
+      # and running from day one but DISARMED, so their judgement can be reviewed
+      # against real data before they delete/correct anything (Requirements 14.7,
+      # 19.7). Report-only is read-only, so their schedules run regardless.
+      CDK_MANAGED_KB_NEW_DEFAULT: ${{ vars.CDK_MANAGED_KB_NEW_DEFAULT }}
+      CDK_MANAGED_KB_MIGRATION_ENABLED: ${{ vars.CDK_MANAGED_KB_MIGRATION_ENABLED }}
+      CDK_MANAGED_KB_RECONCILER_ARMED: ${{ vars.CDK_MANAGED_KB_RECONCILER_ARMED }}
+      CDK_MANAGED_KB_DOC_RECONCILER_ARMED: ${{ vars.CDK_MANAGED_KB_DOC_RECONCILER_ARMED }}
+      # Storage cost controls. Byte_Caps are in BYTES (Requirement 12.2),
+      # defaulting to 100 MB standard / 1 GB elevated / 500 MB per knowledge
+      # base; the retention window is in DAYS and must stay >= 30
+      # (Requirement 15.11). Leave unset to take those defaults — these exist
+      # so an environment can tune them without a code change.
+      CDK_MANAGED_KB_PER_OWNER_BYTES: ${{ vars.CDK_MANAGED_KB_PER_OWNER_BYTES }}
+      CDK_MANAGED_KB_PER_OWNER_ELEVATED_BYTES: ${{ vars.CDK_MANAGED_KB_PER_OWNER_ELEVATED_BYTES }}
+      CDK_MANAGED_KB_PER_KB_CEILING_BYTES: ${{ vars.CDK_MANAGED_KB_PER_KB_CEILING_BYTES }}
+      CDK_MANAGED_KB_RETENTION_WINDOW_DAYS: ${{ vars.CDK_MANAGED_KB_RETENTION_WINDOW_DAYS }}
+      # Fleet-level alarm thresholds (Requirement 12.13). The Byte_Caps above
+      # bound ONE owner; these two bound the whole account, which is the gap
+      # between ~$169/month expected and ~$15,000/month that per-owner caps
+      # alone permit. Storage is in GB (default 500), daily cost in USD
+      # (default 100). Leave unset to take those defaults.
+      CDK_MANAGED_KB_STORAGE_ALARM_GB: ${{ vars.CDK_MANAGED_KB_STORAGE_ALARM_GB }}
+      CDK_MANAGED_KB_DAILY_COST_ALARM_USD: ${{ vars.CDK_MANAGED_KB_DAILY_COST_ALARM_USD }}
+      # Observability. All optional — unset means the default in config.ts.
+      # XRAY_SAMPLING_RATE is a rate (0.0-1.0), not a percentage.
+      CDK_OBSERVABILITY_ALARM_TOPIC_ENABLED: ${{ vars.CDK_OBSERVABILITY_ALARM_TOPIC_ENABLED }}
+      CDK_OBSERVABILITY_LOG_RETENTION_DAYS: ${{ vars.CDK_OBSERVABILITY_LOG_RETENTION_DAYS }}
+      CDK_OBSERVABILITY_ALB_TARGET_5XX_THRESHOLD: ${{ vars.CDK_OBSERVABILITY_ALB_TARGET_5XX_THRESHOLD }}
+      CDK_OBSERVABILITY_ALB_P99_LATENCY_MS: ${{ vars.CDK_OBSERVABILITY_ALB_P99_LATENCY_MS }}
+      CDK_OBSERVABILITY_AGENTCORE_LATENCY_MS: ${{ vars.CDK_OBSERVABILITY_AGENTCORE_LATENCY_MS }}
+      CDK_OBSERVABILITY_AGENTCORE_ERROR_THRESHOLD: ${{ vars.CDK_OBSERVABILITY_AGENTCORE_ERROR_THRESHOLD }}
+      # Concurrent AgentCore Runtime sessions. A cost signal — Runtime bills
+      # memory for the whole session lifetime — not a quota one.
+      CDK_OBSERVABILITY_AGENTCORE_ACTIVE_SESSION_THRESHOLD: ${{ vars.CDK_OBSERVABILITY_AGENTCORE_ACTIVE_SESSION_THRESHOLD }}
+      CDK_OBSERVABILITY_LAMBDA_ERROR_THRESHOLD: ${{ vars.CDK_OBSERVABILITY_LAMBDA_ERROR_THRESHOLD }}
+      CDK_OBSERVABILITY_LAMBDA_DURATION_PERCENT_OF_TIMEOUT: ${{ vars.CDK_OBSERVABILITY_LAMBDA_DURATION_PERCENT_OF_TIMEOUT }}
+      CDK_OBSERVABILITY_DYNAMO_THROTTLE_THRESHOLD: ${{ vars.CDK_OBSERVABILITY_DYNAMO_THROTTLE_THRESHOLD }}
+      CDK_OBSERVABILITY_ECS_CPU_PERCENT: ${{ vars.CDK_OBSERVABILITY_ECS_CPU_PERCENT }}
+      CDK_OBSERVABILITY_ECS_MEMORY_PERCENT: ${{ vars.CDK_OBSERVABILITY_ECS_MEMORY_PERCENT }}
+      CDK_OBSERVABILITY_XRAY_SAMPLING_RATE: ${{ vars.CDK_OBSERVABILITY_XRAY_SAMPLING_RATE }}
+      CDK_OBSERVABILITY_XRAY_SAMPLING_RESERVOIR: ${{ vars.CDK_OBSERVABILITY_XRAY_SAMPLING_RESERVOIR }}
+      CDK_OBSERVABILITY_XRAY_INSIGHTS_NOTIFICATIONS: ${{ vars.CDK_OBSERVABILITY_XRAY_INSIGHTS_NOTIFICATIONS }}
+      CDK_OBSERVABILITY_AGENTCORE_APPLICATION_LOGS_ENABLED: ${{ vars.CDK_OBSERVABILITY_AGENTCORE_APPLICATION_LOGS_ENABLED }}
+      CDK_OBSERVABILITY_PROMPT_CACHE_AVOIDABLE_MISS_THRESHOLD: ${{ vars.CDK_OBSERVABILITY_PROMPT_CACHE_AVOIDABLE_MISS_THRESHOLD }}
+      CDK_OBSERVABILITY_PROMPT_CACHE_WASTED_USD_THRESHOLD: ${{ vars.CDK_OBSERVABILITY_PROMPT_CACHE_WASTED_USD_THRESHOLD }}
+      CDK_OBSERVABILITY_PROMPT_CACHE_SESSION_WASTED_USD_THRESHOLD: ${{ vars.CDK_OBSERVABILITY_PROMPT_CACHE_SESSION_WASTED_USD_THRESHOLD }}
+      CDK_OBSERVABILITY_BEDROCK_TPM_QUOTA_PERCENT: ${{ vars.CDK_OBSERVABILITY_BEDROCK_TPM_QUOTA_PERCENT }}
+      # JSON object: Bedrock ModelId -> that model's TPM quota. Unset means no
+      # per-model quota alarms. Read the live values with
+      #   aws service-quotas list-service-quotas --service-code bedrock
+      CDK_OBSERVABILITY_BEDROCK_TPM_QUOTAS: ${{ vars.CDK_OBSERVABILITY_BEDROCK_TPM_QUOTAS }}
       # Secrets
       AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -158,6 +314,15 @@ jobs:
           aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # The browser sign-in live view is served from the mcp-sandbox origin and
+      # needs the Amazon DCV Web Client SDK deployed alongside it. The SDK is a
+      # EULA-licensed AWS download and this repo is PUBLIC, so it is fetched and
+      # verified here rather than committed. Must run BEFORE the deploy: CDK
+      # stages assets/mcp-sandbox at synth time, so an absent SDK silently ships
+      # a viewer that cannot load. See docs/specs/authenticated-web-assessment.md.
+      - name: Fetch Amazon DCV Web Client SDK
+        run: bash scripts/build/fetch-dcv-sdk.sh
 
       - name: Deploy PlatformStack
         run: bash scripts/platform/deploy.sh

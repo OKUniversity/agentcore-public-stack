@@ -1,15 +1,17 @@
 """DynamoDB repository for admin-managed system prompts."""
 
+import asyncio
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
 from typing import List, Optional
 
 import boto3
 from botocore.exceptions import ClientError
 
+from apis.shared.caching import config_cache
 from .models import SystemPrompt, SystemPromptCreate, SystemPromptUpdate
+from apis.shared.timestamps import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -53,18 +55,12 @@ class SystemPromptsRepository:
             return []
 
         try:
-            response = self._table.scan(
-                FilterExpression="SK = :sk",
-                ExpressionAttributeValues={":sk": "METADATA"},
+            # Cached per process; parsing stays per-call so each caller owns
+            # the SystemPrompt objects it gets back.
+            items = await config_cache.get_or_load(
+                config_cache.SYSTEM_PROMPTS,
+                lambda: asyncio.to_thread(self._scan_prompt_items),
             )
-            items = response.get("Items", [])
-            while "LastEvaluatedKey" in response:
-                response = self._table.scan(
-                    FilterExpression="SK = :sk",
-                    ExpressionAttributeValues={":sk": "METADATA"},
-                    ExclusiveStartKey=response["LastEvaluatedKey"],
-                )
-                items.extend(response.get("Items", []))
         except ClientError:
             logger.error("Error listing system prompts", exc_info=True)
             raise
@@ -74,6 +70,22 @@ class SystemPromptsRepository:
             prompts = [p for p in prompts if p.status == "enabled"]
         prompts.sort(key=lambda p: p.name.lower())
         return prompts
+
+    def _scan_prompt_items(self) -> List[dict]:
+        """Scan the raw PROMPT# items. Blocking; call via ``asyncio.to_thread``."""
+        response = self._table.scan(
+            FilterExpression="SK = :sk",
+            ExpressionAttributeValues={":sk": "METADATA"},
+        )
+        items = response.get("Items", [])
+        while "LastEvaluatedKey" in response:
+            response = self._table.scan(
+                FilterExpression="SK = :sk",
+                ExpressionAttributeValues={":sk": "METADATA"},
+                ExclusiveStartKey=response["LastEvaluatedKey"],
+            )
+            items.extend(response.get("Items", []))
+        return items
 
     async def get_prompt(self, prompt_id: str) -> Optional[SystemPrompt]:
         """Return a single prompt by ID, or None if not found."""
@@ -98,7 +110,7 @@ class SystemPromptsRepository:
         if not self._enabled:
             raise RuntimeError("System prompts repository is not enabled")
 
-        now = datetime.now(timezone.utc).isoformat() + "Z"
+        now = utc_now_iso()
         prompt = SystemPrompt(
             prompt_id=str(uuid.uuid4()),
             name=data.name,
@@ -119,6 +131,7 @@ class SystemPromptsRepository:
             logger.error("Error creating system prompt", exc_info=True)
             raise
 
+        config_cache.invalidate(config_cache.SYSTEM_PROMPTS)
         logger.info(f"Created system prompt: {prompt.prompt_id} name={prompt.name!r}")
         return prompt
 
@@ -141,7 +154,7 @@ class SystemPromptsRepository:
         update_fields = updates.model_dump(exclude_none=True)
         for field_name, value in update_fields.items():
             setattr(existing, field_name, value)
-        existing.updated_at = datetime.now(timezone.utc).isoformat() + "Z"
+        existing.updated_at = utc_now_iso()
 
         try:
             self._table.put_item(
@@ -156,6 +169,7 @@ class SystemPromptsRepository:
             logger.error("Error updating system prompt", exc_info=True)
             raise
 
+        config_cache.invalidate(config_cache.SYSTEM_PROMPTS)
         logger.info(f"Updated system prompt: {prompt_id}")
         return existing
 
@@ -173,6 +187,7 @@ class SystemPromptsRepository:
         except ClientError:
             logger.error("Error deleting system prompt", exc_info=True)
             raise
+        config_cache.invalidate(config_cache.SYSTEM_PROMPTS)
         logger.info(f"Deleted system prompt: {prompt_id}")
         return True
 

@@ -274,6 +274,17 @@ export interface MetadataEvent {
   contextWindow?: number;
   /** Per-turn system / tools / messages token breakdown. */
   contextBreakdown?: ContextBreakdown;
+  /**
+   * How long the whole turn took, server-measured from the invocation
+   * arriving to the stream ending.
+   *
+   * Deliberately its own field rather than reusing `metrics.latencyMs`: that
+   * one IS the turn duration on the live stream, but the persisted
+   * `latency.endToEndLatency` it maps to prefers the provider's own API-call
+   * time — so a reloaded conversation would quietly show a smaller number for
+   * what looks like the same thing.
+   */
+  turnDurationMs?: number;
 }
 
 export interface ExceptionEvent {

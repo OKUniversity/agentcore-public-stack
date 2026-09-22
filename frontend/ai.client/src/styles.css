@@ -1,8 +1,10 @@
 /* You can add global styles to this file, and also import other style files */
 
-@import "tailwindcss";
+/* Tailwind + the brand/surface theme overrides live in one shared entry
+   (styles/theme.css) so component stylesheets can @reference the exact
+   same theme this global sheet emits. See styles/theme.css header. */
+@import './styles/theme.css';
 @import '@ctrl/ngx-emoji-mart/picker';
-@custom-variant dark (&:where(.dark, .dark *));
 
 @font-face {
     font-family: 'InterVariable';
@@ -78,7 +80,7 @@
     }
 
     tr:nth-child(odd) td {
-        background-color: white;
+        background-color: var(--color-white);
     }
 
     tr:nth-child(even) td {
@@ -276,6 +278,7 @@ html.dark body {
 @theme {
     --font-sans: 'InterVariable', sans-serif;
     --font-sans--font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+<<<<<<< HEAD
 
     /* Original Primary color scale - #0033a0 */
 
@@ -321,4 +324,6 @@ html.dark body {
     --color-tertiary-800: oklch(from #4e0002 calc(l - 0.2) c h);
     --color-tertiary-900: oklch(from #4e0002 calc(l - 0.25) c h);
     --color-tertiary-950: oklch(from #4e0002 calc(l - 0.3) c h);
+=======
+>>>>>>> upstream/main
 }

@@ -2,6 +2,14 @@
   display: block;
 }
 
+/* The rail renders inside `.message-block`, whose global prose rule
+   (styles.css) gives every <p> a 16px margin-bottom. The batch summary is a
+   banded row in an accordion, not a prose paragraph — the margin punched a
+   gap between it and the calls it summarizes. */
+.batch-summary {
+  margin-bottom: 0;
+}
+
 /* Status dot base */
 .status-dot {
   width: 6px;
@@ -39,6 +47,30 @@
 .collapsible-content.open > div {
   opacity: 1;
   transition: opacity 0.15s ease-out 0.05s; /* fade in after slight delay on expand */
+}
+
+/* Accordion detail panel. The row list itself is plain flow; only the
+   revealed panel animates, which is enough to read as an accordion without
+   keeping every collapsed row's payload in the DOM. Honours reduced-motion. */
+.detail-panel {
+  animation: detail-enter 0.18s ease-out;
+}
+
+@keyframes detail-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .detail-panel {
+    animation: none;
+  }
 }
 
 /* Shimmer animation for pending status dots */

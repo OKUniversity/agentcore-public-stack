@@ -12,36 +12,41 @@ import { ChatStateService } from './services/chat/chat-state.service';
 import { SidenavService } from '../services/sidenav/sidenav.service';
 import { HeaderService } from '../services/header/header.service';
 import { ModelService } from './services/model/model.service';
-import { ModelSettings } from '../components/model-settings/model-settings';
 import { UserService } from '../auth/user.service';
 import { ChatHttpService } from './services/chat/chat-http.service';
 import { StreamParserService } from './services/chat/stream-parser.service';
 import { CompactionSummaryService } from './services/chat/compaction-summary.service';
+import { SteeringService } from './services/chat/steering.service';
 import { ArtifactStateService } from './services/artifacts/artifact-state.service';
+import { FilePreviewStateService } from './services/file-preview/file-preview-state.service';
 import { ArtifactHttpService } from './services/artifacts/artifact-http.service';
-import { McpAppStateService } from './services/mcp-apps/mcp-app-state.service';
 import { McpAppCardStateService } from './services/mcp-apps/mcp-app-card-state.service';
 import { McpAppCardHttpService } from './services/mcp-apps/mcp-app-card-http.service';
+import { McpAppTeardownService } from './services/mcp-apps/mcp-app-teardown.service';
 import { McpAppConsentService } from './services/mcp-apps/mcp-app-consent.service';
 import { Dialog } from '@angular/cdk/dialog';
 import { AssistantService } from '../assistants/services/assistant.service';
 import { Assistant } from '../assistants/models/assistant.model';
 import { AgentService } from '../agents/services/agent.service';
-import { Agent } from '../agents/models/agent.model';
+import { AgentMentionService } from '../agents/services/agent-mention.service';
+import { routeMention } from './services/chat/mention-routing';
+import { ToastService } from '../services/toast/toast.service';
+import { Agent, AgentRunnability } from '../agents/models/agent.model';
 import { ToolService } from '../services/tool/tool.service';
 import { SkillService } from '../services/skill/skill.service';
 import { ChatContainerComponent, ChatContainerConfig } from './components/chat-container/chat-container.component';
 import {
-  ShareAssistantDialogComponent,
-  ShareAssistantDialogData,
-} from '../assistants/components/share-assistant-dialog.component';
+  ShareAgentDialogComponent,
+  ShareAgentDialogData,
+} from '../agents/components/share-agent-dialog.component';
 import { VoiceChatService } from './services/voice';
 import { SystemPromptsService } from '../services/system-prompts/system-prompts.service';
 import { OAuthConsentService } from '../services/oauth-consent/oauth-consent.service';
+import { GreetingProvider } from '../../branding/greeting.provider';
 
 @Component({
   selector: 'app-session-page',
-  imports: [ChatContainerComponent, ModelSettings],
+  imports: [ChatContainerComponent],
   templateUrl: './session.page.html',
   styleUrl: './session.page.css',
 })
@@ -58,10 +63,12 @@ export class ConversationPage implements OnDestroy {
   private chatHttpService = inject(ChatHttpService);
   private streamParserService = inject(StreamParserService);
   private compactionSummary = inject(CompactionSummaryService);
+  private steering = inject(SteeringService);
   private artifactState = inject(ArtifactStateService);
-  private mcpAppState = inject(McpAppStateService);
+  private filePreviewState = inject(FilePreviewStateService);
   private mcpAppCardState = inject(McpAppCardStateService);
   private mcpAppCardHttp = inject(McpAppCardHttpService);
+  private mcpAppTeardown = inject(McpAppTeardownService);
   private mcpAppConsent = inject(McpAppConsentService);
   private oauthConsent = inject(OAuthConsentService);
   private artifactHttp = inject(ArtifactHttpService);
@@ -73,7 +80,10 @@ export class ConversationPage implements OnDestroy {
   private dialog = inject(Dialog);
   private voiceChatService = inject(VoiceChatService);
   private systemPromptsService = inject(SystemPromptsService);
+  private greetingProvider = inject(GreetingProvider);
   private scrollPositions = inject(ScrollPositionService);
+  private agentMentionService = inject(AgentMentionService);
+  private toast = inject(ToastService);
   private platformId = inject(PLATFORM_ID);
   private isBrowser = isPlatformBrowser(this.platformId);
 
@@ -106,8 +116,14 @@ export class ConversationPage implements OnDestroy {
   // assistantId), when the /agents surface is enabled and it resolves. Drives
   // the per-primitive picker locks; null for plain chat or a legacy assistant.
   agent = signal<Agent | null>(null);
+  /**
+   * D6 for the launch card, when it resolves. Deliberately a third signal rather than a
+   * field on `agent`: it fans out across the viewer's model/tool/skill catalogs, so it
+   * settles in after the card has already painted — the same two-load split the store's
+   * detail page uses.
+   */
+  runnability = signal<AgentRunnability | null>(null);
   isLoadingAssistant = signal(false);
-  isSettingsOpen = signal(false);
 
   /**
    * Staged session ID for file uploads before the first message is sent.
@@ -144,35 +160,10 @@ export class ConversationPage implements OnDestroy {
     return user?.firstName || null;
   });
 
-  // Greeting message templates (use {name} as placeholder for first name)
-  private greetingTemplates = [
-    'How can I help you today, {name}?',
-    'What would you like to know, {name}?',
-    'Ready to assist you, {name}!',
-    'What can I do for you, {name}?',
-    "Let's get started, {name}!",
-  ];
-
-  // Fallback greetings when user name is not available
-  private fallbackGreetings = [
-    'How can I help you today?',
-    'What would you like to know?',
-    'Ready to assist you!',
-    'What can I do for you?',
-    "Let's get started!",
-  ];
-
-  // Store the selected template index for consistency
-  private selectedGreetingIndex = Math.floor(Math.random() * this.greetingTemplates.length);
-
-  // Computed greeting message that reacts to user changes
-  greetingMessage = computed(() => {
-    const name = this.firstName();
-    if (name) {
-      return this.greetingTemplates[this.selectedGreetingIndex].replace('{name}', name);
-    }
-    return this.fallbackGreetings[this.selectedGreetingIndex];
-  });
+  // Computed greeting message that reacts to user changes. Delegates
+  // selection and `{name}` substitution to GreetingProvider, which reads
+  // the greeting templates/fallbacks from BrandingService.
+  greetingMessage = computed(() => this.greetingProvider.resolveGreeting(this.firstName()));
 
   private routeSubscription?: Subscription;
   private queryParamSubscription?: Subscription;
@@ -253,7 +244,10 @@ export class ConversationPage implements OnDestroy {
       const session = this.sessionConversation();
 
       if (!id || session?.sessionId !== id) {
-        this.systemPromptsService.hydrateFromSession(id, null);
+        // Provisional: clears the previous conversation's selection without
+        // claiming this session, so the real hydration below is not blocked
+        // when the metadata arrives a tick later.
+        this.systemPromptsService.hydrateFromSession(id, null, false);
         return;
       }
 
@@ -345,6 +339,7 @@ export class ConversationPage implements OnDestroy {
         this.assistant.set(null);
         this.assistantError.set(null);
         this.agent.set(null);
+        this.runnability.set(null);
       }
       // Always release the picker locks. They live in root singleton services
       // that OUTLIVE this component, so a freshly-created "new chat" component
@@ -421,17 +416,44 @@ export class ConversationPage implements OnDestroy {
       // currentSession.totalSummarizedTurns once the metadata fetch lands.
       this.compactionSummary.reset();
 
+      // Mid-turn steering acks and the "this turn uses tools" flag are both
+      // per-conversation. A stale ack would clear a queued follow-up in the
+      // conversation the user just moved to, whose composer minted a
+      // different entry id — a no-op today, but only by luck.
+      this.steering.reset();
+
       // Artifacts are session-scoped — clear before the next session
       // loads so a prior session's cards don't bleed in, then re-hydrate
       // from the app-api list endpoint below.
       this.artifactState.reset();
 
-      // MCP App frames persist for the conversation's lifetime per the
-      // scoping doc; teardown is on conversation change. Clear before the
-      // next load — loadMessagesForSession re-seeds from the persisted
-      // `uiResources` sidecar on the messages response so frames survive a
-      // refresh (the inline `ui_resource` event itself only arrives live).
-      this.mcpAppState.reset();
+      // Same scoping for a docked .docx preview: it points at an upload
+      // owned by the conversation being left, and the two panes share
+      // one rail, so leaving it open would also hold the gutter for a
+      // session that has nothing to show in it.
+      this.filePreviewState.reset();
+
+      // Tell every open MCP App it is going away BEFORE its iframe
+      // unmounts with the message list (SEP-1865: the host sends
+      // `ui/resource-teardown` for any teardown, so the App can flush state
+      // to its own server — the host is deliberately not the store of
+      // record for App state). Fired, not awaited: this effect is
+      // synchronous, and the value is in the timing, not the wait — the
+      // notification goes out while the Views are still alive, and each
+      // bridge keeps listening through its grace window so a save call the
+      // App makes in response is still proxied. A truly blocking wait would
+      // need a route guard; see the follow-up note in the teardown service.
+      void this.mcpAppTeardown.teardownAll('conversation-change');
+
+      // MCP App UI resources are deliberately NOT cleared here. They are
+      // held per conversation in McpAppStateService and retained for the
+      // SPA session, mirroring the message cache: the only server-side
+      // replay is the `uiResources` sidecar on `GET /messages`, and
+      // loadMessagesForSession skips that request once a conversation's
+      // messages are already in memory — so a reset on navigation had no
+      // way back and dropped every frame to a plain tool card until a hard
+      // refresh. The iframes themselves still tear down with the message
+      // list components on conversation change.
 
       // Option A (PR #6): app-initiated tool cards DO re-hydrate (the
       // broker is in-memory). Any open consent prompt for the prior
@@ -570,7 +592,7 @@ export class ConversationPage implements OnDestroy {
       });
   }
 
-  onMessageSubmitted(message: { content: string, timestamp: Date, fileUploadIds?: string[] }) {
+  onMessageSubmitted(message: { content: string, timestamp: Date, fileUploadIds?: string[], mentionAgentId?: string, invokedSkillIds?: string[] }) {
     // Use the effective session ID (route sessionId or staged sessionId)
     const sessionIdToUse = this.effectiveSessionId();
 
@@ -581,18 +603,41 @@ export class ConversationPage implements OnDestroy {
     // `assistant()` signal guards the brief window during the `/` → `/s/:id`
     // route transition where the component is recreated and the query
     // param hasn't yet propagated to the new instance.
-    const assistantIdToUse =
+    const boundAssistantId =
       this.assistantIdFromQuery() || this.assistant()?.assistantId || undefined;
+
+    // An `@`-mention means "talk to this Agent", and always yields a conversation the
+    // Agent keeps its tools in — never the one-turn borrow that used to leave the *next*
+    // message agent-less with no signal to the user or the model. Rule in
+    // `mention-routing.ts` so it is testable without this component's ~30 injections.
+    const routed = routeMention({
+      mentionedAgentId: message.mentionAgentId,
+      boundAssistantId,
+      sessionId: sessionIdToUse,
+      threadHasMessages: this.hasMessages(),
+    });
+
+    if (routed.handedOff && message.mentionAgentId) {
+      this.toast.info(
+        `Starting a new conversation with ${this.mentionedAgentName(message.mentionAgentId)}`,
+        'Agents keep their tools and knowledge in their own conversation, so this message opens one.',
+      );
+    }
 
     // Loading state is set inside submitChatRequest once the (possibly
     // freshly generated) session id is known — it's per-session now.
 
-    // Submit the chat request with file upload IDs and assistant ID if present
+    // `mentionAgentId` is deliberately not forwarded any more: the backend's
+    // `agent_mention` flag exists only to suppress binding, which is the behaviour being
+    // removed. Sending the Agent as the bound `assistantId` is what puts it on the URL
+    // and keeps it on every following turn.
     this.chatRequestService.submitChatRequest(
       message.content,
-      sessionIdToUse,
+      routed.sessionId,
       message.fileUploadIds,
-      assistantIdToUse
+      routed.assistantId,
+      undefined,
+      message.invokedSkillIds
     ).catch((error) => {
       console.error('Error sending chat request:', error);
     });
@@ -601,6 +646,19 @@ export class ConversationPage implements OnDestroy {
     if (this.stagedSessionId()) {
       this.stagedSessionId.set(null);
     }
+  }
+
+  /**
+   * Display name for a mentioned Agent, for the hand-off notice.
+   *
+   * Falls back to a generic noun rather than an id: the toast explains what just happened
+   * to the user's message, and a raw `ast-…` in that sentence is worse than no name.
+   */
+  private mentionedAgentName(agentId: string): string {
+    const match = this.agentMentionService
+      .mentionable()
+      .find((candidate) => candidate.agentId === agentId);
+    return match?.name || 'this agent';
   }
 
   /**
@@ -713,14 +771,6 @@ export class ConversationPage implements OnDestroy {
     }
   }
 
-  toggleSettings() {
-    this.isSettingsOpen.update(open => !open);
-  }
-
-  closeSettings() {
-    this.isSettingsOpen.set(false);
-  }
-
   /**
    * Load assistant by ID - only checks existence, not access.
    * Access and mid-session conflicts are validated on the backend when the
@@ -775,7 +825,18 @@ export class ConversationPage implements OnDestroy {
       this.applyAgentBindingLocks(agent);
     } catch {
       this.agent.set(null);
+      this.runnability.set(null);
       this.clearAgentBindingLocks();
+      return;
+    }
+
+    // D6 for the launch card's run line. Not awaited by anything the conversation needs,
+    // and a failure leaves the line absent rather than erroring — "will this run for you?"
+    // is advisory here exactly as it is on the store's detail page.
+    try {
+      this.runnability.set(await this.agentService.getRunnability(assistantId));
+    } catch {
+      this.runnability.set(null);
     }
   }
 
@@ -853,12 +914,17 @@ export class ConversationPage implements OnDestroy {
   }
 
   /**
-   * Navigate to the assistant edit page.
+   * Navigate to the Designer for the Agent driving this session.
+   *
+   * The id is the same record either way — the compat mapping renders a legacy Assistant
+   * *as* an Agent, so `/agents/:id/edit` opens what `/assistants/:id/edit` used to. Routed
+   * directly rather than through the redirect so the address bar never shows the retired
+   * path.
    */
   editAssistant(): void {
     const assistantId = this.assistant()?.assistantId;
     if (assistantId) {
-      this.router.navigate(['/assistants', assistantId, 'edit']);
+      this.router.navigate(['/agents', assistantId, 'edit']);
     }
   }
 
@@ -869,8 +935,16 @@ export class ConversationPage implements OnDestroy {
     const assistant = this.assistant();
     if (!assistant) return;
 
-    this.dialog.open<unknown, ShareAssistantDialogData>(ShareAssistantDialogComponent, {
-      data: { assistant },
+    this.dialog.open<unknown, ShareAgentDialogData>(ShareAgentDialogComponent, {
+      data: {
+        agent: {
+          assistantId: assistant.assistantId,
+          name: assistant.name,
+          visibility: assistant.visibility,
+          userPermission: assistant.userPermission ?? 'owner',
+          emoji: assistant.emoji,
+        },
+      },
       hasBackdrop: false,
     });
   }

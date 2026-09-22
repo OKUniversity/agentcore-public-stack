@@ -1,8 +1,13 @@
-import { Injectable, signal, computed, inject } from '@angular/core';
+import { Injectable, signal, computed, effect, inject, untracked } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
 import { ConfigService } from '../../../services/config.service';
-import { ManagedModel } from '../../../admin/manage-models/models/managed-model.model';
+import {
+  EffortControl,
+  ManagedModel,
+  resolveEffortControl,
+  EFFORT_PARAM_KEYS,
+} from '../../../admin/manage-models/models/managed-model.model';
 import { UserSettingsService } from '../../../services/user-settings.service';
 
 interface ManagedModelsListResponse {
@@ -95,10 +100,92 @@ export class ModelService {
     return this._inferenceOverrides()[model.modelId] ?? {};
   });
 
+  /**
+   * Models shown at the top level of the chat model picker.
+   *
+   * `isFeatured !== false` rather than `=== true` on purpose: a record written
+   * before the field existed has it absent, and those models must keep showing
+   * where they always have. Only an explicit `false` demotes one.
+   *
+   * The selected model is always included even when demoted — a picker whose
+   * trigger names a model you can't find in the open menu (and that shows no
+   * check mark) reads as broken.
+   */
+  readonly featuredModels = computed<ManagedModel[]>(() => {
+    const selectedId = this.selectedModel()?.modelId;
+    return this.models().filter(m => m.isFeatured !== false || m.modelId === selectedId);
+  });
+
+  /** Models collapsed behind the picker's "More models" submenu. */
+  readonly moreModels = computed<ManagedModel[]>(() => {
+    const selectedId = this.selectedModel()?.modelId;
+    return this.models().filter(m => m.isFeatured === false && m.modelId !== selectedId);
+  });
+
+  /**
+   * The effort control the selected model offers, or null when it offers none.
+   * Null is the common case — only models whose admin enumerated the `allowed`
+   * effort levels get a control (see `resolveEffortControl`).
+   */
+  readonly effortControl = computed<EffortControl | null>(() =>
+    resolveEffortControl(this.selectedModel()),
+  );
+
+  /**
+   * The effort level in force for the selected model: the user's override when
+   * they've set one, otherwise the admin's default. Null when the model has no
+   * effort control, or has one with no admin default and no user choice yet —
+   * in which case the provider's own default applies and we don't claim to
+   * know what it is.
+   */
+  readonly selectedEffort = computed<string | null>(() => {
+    const control = this.effortControl();
+    if (!control) return null;
+    const override = this.selectedModelOverrides()[control.key];
+    if (typeof override === 'string' && control.levels.includes(override)) {
+      return override;
+    }
+    return control.defaultLevel;
+  });
+
   constructor() {
     // Load models on initialization
     this.loadModels().catch(err => {
       console.error('Failed to load models on initialization:', err);
+    });
+
+    // Re-apply a pending agent model lock once the model list arrives.
+    //
+    // WHY: `lockToAgentModel` resolves the pinned id against `models()`, which
+    // is loaded asynchronously. A lock applied before that request lands set the
+    // lock FLAG (disabling the picker) while `setSelectedModelById` returned
+    // false and left the selection alone — so the picker sat disabled, showing
+    // the user's default, claiming an agent runs on a model it does not. The
+    // boolean said so and every caller discarded it. Nothing re-ran when the
+    // models turned up, because the callers' effects track the agent's model id,
+    // not the model list.
+    //
+    // Fixing it here rather than in the Designer preview: the session page locks
+    // the same way for an agent-bound conversation, so the race belongs to the
+    // lock, not to one of its callers.
+    //
+    // ⚠️ The reads below are deliberately split. `_agentLockedModelId` and
+    // `models` are tracked — those are the inputs this should re-run on. The
+    // current selection is read via `untracked`, and the write goes through
+    // `untracked` too: `setSelectedModelById` writes `_selectedModel`, and
+    // tracking that read would make this effect retrigger itself forever.
+    effect(() => {
+      const lockedId = this._agentLockedModelId();
+      const models = this.models();
+      if (!lockedId || models.length === 0) {
+        return;
+      }
+      untracked(() => {
+        if (this._selectedModel()?.modelId === lockedId) {
+          return; // already showing the pinned model
+        }
+        this.setSelectedModelById(lockedId);
+      });
     });
   }
 
@@ -295,7 +382,7 @@ export class ModelService {
    */
   private async findUserDefaultModel(enabledModels: ManagedModel[]): Promise<ManagedModel | null> {
     try {
-      const settings = await this.userSettings.fetchSettings();
+      const settings = await this.userSettings.getSettings();
       const id = settings?.defaultModelId;
       if (!id) return null;
       return enabledModels.find(m => m.modelId === id) ?? null;
@@ -329,6 +416,21 @@ export class ModelService {
     this.persistOverrides(next);
   }
 
+  /**
+   * Set the effort level for the selected model. Writes through the same
+   * per-model override store as every other inference param, so it rides the
+   * existing `inference_params` request path with no special casing.
+   *
+   * A level the model doesn't declare is ignored rather than stored — the
+   * backend would drop it anyway, and a stored value that never takes effect
+   * would keep showing as the active level in the picker.
+   */
+  setEffort(level: string): void {
+    const control = this.effortControl();
+    if (!control || !control.levels.includes(level)) return;
+    this.setInferenceParamOverride(control.key, level);
+  }
+
   /** Clear all inference param overrides for the currently selected model. */
   clearInferenceParamOverrides(): void {
     const model = this.selectedModel();
@@ -351,11 +453,57 @@ export class ModelService {
       const raw = sessionStorage.getItem(this.INFERENCE_OVERRIDES_KEY);
       if (!raw) return {};
       const parsed = JSON.parse(raw);
-      return parsed && typeof parsed === 'object' ? parsed : {};
+      if (!parsed || typeof parsed !== 'object') return {};
+      return this.dropRetiredOverrides(parsed as Record<string, Record<string, unknown>>);
     } catch (e) {
       console.warn('Could not read inference overrides from sessionStorage:', e);
       return {};
     }
+  }
+
+  /**
+   * Strip overrides for params that no longer have a user-facing control.
+   *
+   * The drawer's Advanced form is gone: effort (in the model picker) is the one
+   * knob a user sets, and the rest are the admin's to govern. But this store is
+   * `sessionStorage`, so a tab open across that change still holds whatever the
+   * user last typed — a temperature or max_tokens that would keep riding every
+   * request with nothing in the UI to show it or reset it. Invisible state that
+   * changes model behaviour is worse than either keeping the form or having
+   * never had it.
+   *
+   * Effort is deliberately preserved: it writes through this same store
+   * (`setEffort` → `setInferenceParamOverride`), so a blanket purge would clear
+   * a control the user can still see and is still using.
+   */
+  private dropRetiredOverrides(
+    stored: Record<string, Record<string, unknown>>,
+  ): Record<string, Record<string, unknown>> {
+    const keep = new Set<string>(EFFORT_PARAM_KEYS);
+    const next: Record<string, Record<string, unknown>> = {};
+    let changed = false;
+
+    for (const [modelId, params] of Object.entries(stored)) {
+      if (!params || typeof params !== 'object') {
+        changed = true;
+        continue;
+      }
+      const kept = Object.fromEntries(
+        Object.entries(params).filter(([key]) => keep.has(key)),
+      );
+      if (Object.keys(kept).length !== Object.keys(params).length) {
+        changed = true;
+      }
+      if (Object.keys(kept).length > 0) {
+        next[modelId] = kept;
+      }
+    }
+
+    // Rewrite storage so the strip happens once rather than on every read.
+    if (changed) {
+      this.persistOverrides(next);
+    }
+    return next;
   }
 
   private persistOverrides(value: Record<string, Record<string, unknown>>): void {

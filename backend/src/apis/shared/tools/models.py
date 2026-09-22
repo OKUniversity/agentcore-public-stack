@@ -7,9 +7,19 @@ Integrates with the existing AppRole RBAC system.
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Set
+from typing import Any, Dict, List, Literal, Optional, Set, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+from apis.shared.timestamps import from_iso, to_iso
+
+# EntityTypeIndex (GSI5) partition value for tool-catalog rows.
+#
+# The index is generic — "list every item of type X" on a table that mixes
+# tools, skills, roles, role grants and one preferences row per user. Only the
+# tool partition is written and read today; a second entity type can be added
+# without another GSI, which matters because DynamoDB allows only one GSI
+# creation per UpdateTable.
+ENTITY_TYPE_TOOL = "ENTITY#TOOL"
 
 
 class ToolCategory(str, Enum):
@@ -629,6 +639,35 @@ class ToolDefinition(BaseModel):
         description="If true, forward the user's OIDC authentication token to the MCP server. "
         "Only use for same-team controlled servers. Mutually exclusive with requires_oauth_provider.",
     )
+    token_exchange_audience: Optional[str] = Field(
+        None,
+        description="Token-service applicationId to exchange the user's token for (RFC 8693). "
+        "When set, the runtime trades the user's Cognito access token for a token-service JWT "
+        "scoped to this application and forwards that instead of the raw token — so APIs "
+        "that already trust token-service JWTs can serve agent requests as the signed-in user. "
+        "Takes precedence over forward_auth_token, which would send a token the target API "
+        "cannot validate. Mutually exclusive with requires_oauth_provider.",
+    )
+
+    @field_validator("token_exchange_audience", mode="before")
+    @classmethod
+    def _clean_token_exchange_audience(cls, v: object) -> object:
+        """
+        Strip surrounding whitespace and treat blank as unset.
+
+        A pasted audience arrived with a leading space, which made the token
+        service refuse every exchange: it compares the audience against its
+        allowlist with an ordinal comparison, so " <guid>" != "<guid>". The tool
+        still appeared to work because the endpoint it called happened to allow
+        anonymous access — the request simply went unauthenticated. Silent
+        downgrade from delegated identity to anonymous is the worst possible
+        failure mode for this feature, so the value is normalised on the way in
+        rather than trusted.
+        """
+        if isinstance(v, str):
+            v = v.strip()
+            return v or None
+        return v
 
     # Access control
     is_public: bool = Field(
@@ -713,6 +752,13 @@ class ToolDefinition(BaseModel):
             "SK": "METADATA",
             "GSI1PK": f"CATEGORY#{self.category}",
             "GSI1SK": f"TOOL#{self.tool_id}",
+            # EntityTypeIndex — lets "list every tool" be a Query on one
+            # partition instead of a Scan of a table shared with roles, skills
+            # and a preferences row per user. Sparse: a row without these two
+            # attributes simply is not in the index, which is why existing rows
+            # need backfill_tool_catalog_index.py.
+            "GSI5PK": ENTITY_TYPE_TOOL,
+            "GSI5SK": f"TOOL#{self.tool_id}",
             "toolId": self.tool_id,
             "displayName": self.display_name,
             "description": self.description,
@@ -721,10 +767,11 @@ class ToolDefinition(BaseModel):
             "status": self.status if isinstance(self.status, str) else self.status.value,
             "requiresOauthProvider": self.requires_oauth_provider,
             "forwardAuthToken": self.forward_auth_token,
+            "tokenExchangeAudience": self.token_exchange_audience,
             "isPublic": self.is_public,
             "enabledByDefault": self.enabled_by_default,
-            "createdAt": self.created_at.isoformat() + "Z" if self.created_at else None,
-            "updatedAt": self.updated_at.isoformat() + "Z" if self.updated_at else None,
+            "createdAt": to_iso(self.created_at) if self.created_at else None,
+            "updatedAt": to_iso(self.updated_at) if self.updated_at else None,
             "createdBy": self.created_by,
             "updatedBy": self.updated_by,
         }
@@ -784,13 +831,14 @@ class ToolDefinition(BaseModel):
             status=item.get("status", ToolStatus.ACTIVE),
             requires_oauth_provider=item.get("requiresOauthProvider"),
             forward_auth_token=item.get("forwardAuthToken", False),
+            token_exchange_audience=item.get("tokenExchangeAudience"),
             is_public=item.get("isPublic", False),
             enabled_by_default=item.get("enabledByDefault", False),
             mcp_config=mcp_config,
             a2a_config=a2a_config,
             mcp_gateway_config=mcp_gateway_config,
-            created_at=datetime.fromisoformat(created_at.rstrip("Z")) if created_at else datetime.now(timezone.utc),
-            updated_at=datetime.fromisoformat(updated_at.rstrip("Z")) if updated_at else datetime.now(timezone.utc),
+            created_at=from_iso(created_at) if created_at else datetime.now(timezone.utc),
+            updated_at=from_iso(updated_at) if updated_at else datetime.now(timezone.utc),
             created_by=item.get("createdBy"),
             updated_by=item.get("updatedBy"),
         )
@@ -816,7 +864,7 @@ class UserToolPreference(BaseModel):
             "SK": "TOOL_PREFERENCES",
             "userId": self.user_id,
             "toolPreferences": self.tool_preferences,
-            "updatedAt": self.updated_at.isoformat() + "Z" if self.updated_at else None,
+            "updatedAt": to_iso(self.updated_at) if self.updated_at else None,
         }
 
     @classmethod
@@ -826,7 +874,7 @@ class UserToolPreference(BaseModel):
         return cls(
             user_id=item.get("userId", ""),
             tool_preferences=item.get("toolPreferences", {}),
-            updated_at=datetime.fromisoformat(updated_at.rstrip("Z")) if updated_at else datetime.now(timezone.utc),
+            updated_at=from_iso(updated_at) if updated_at else datetime.now(timezone.utc),
         )
 
 
@@ -1073,6 +1121,7 @@ class ToolCreateRequest(BaseModel):
     status: ToolStatus = Field(default=ToolStatus.ACTIVE)
     requires_oauth_provider: Optional[str] = Field(None, alias="requiresOauthProvider")
     forward_auth_token: bool = Field(default=False, alias="forwardAuthToken")
+    token_exchange_audience: Optional[str] = Field(None, alias="tokenExchangeAudience")
     is_public: bool = Field(default=False, alias="isPublic")
     enabled_by_default: bool = Field(default=False, alias="enabledByDefault")
 
@@ -1098,6 +1147,7 @@ class ToolUpdateRequest(BaseModel):
     status: Optional[ToolStatus] = None
     requires_oauth_provider: Optional[str] = Field(None, alias="requiresOauthProvider")
     forward_auth_token: Optional[bool] = Field(None, alias="forwardAuthToken")
+    token_exchange_audience: Optional[str] = Field(None, alias="tokenExchangeAudience")
     is_public: Optional[bool] = Field(None, alias="isPublic")
     enabled_by_default: Optional[bool] = Field(None, alias="enabledByDefault")
 
@@ -1284,6 +1334,7 @@ class AdminToolResponse(BaseModel):
     status: ToolStatus
     requires_oauth_provider: Optional[str] = Field(None, alias="requiresOauthProvider")
     forward_auth_token: bool = Field(default=False, alias="forwardAuthToken")
+    token_exchange_audience: Optional[str] = Field(None, alias="tokenExchangeAudience")
     is_public: bool = Field(..., alias="isPublic")
     allowed_app_roles: List[str] = Field(..., alias="allowedAppRoles")
     enabled_by_default: bool = Field(..., alias="enabledByDefault")
@@ -1330,11 +1381,12 @@ class AdminToolResponse(BaseModel):
             status=tool.status,
             requires_oauth_provider=tool.requires_oauth_provider,
             forward_auth_token=tool.forward_auth_token,
+            token_exchange_audience=tool.token_exchange_audience,
             is_public=tool.is_public,
             allowed_app_roles=allowed_roles or tool.allowed_app_roles,
             enabled_by_default=tool.enabled_by_default,
-            created_at=tool.created_at.isoformat() + "Z" if tool.created_at else "",
-            updated_at=tool.updated_at.isoformat() + "Z" if tool.updated_at else "",
+            created_at=to_iso(tool.created_at) if tool.created_at else "",
+            updated_at=to_iso(tool.updated_at) if tool.updated_at else "",
             created_by=tool.created_by,
             updated_by=tool.updated_by,
             mcp_config=mcp_config_response,
@@ -1381,6 +1433,7 @@ class MCPDiscoverRequest(BaseModel):
     api_key_header: Optional[str] = Field(None, alias="apiKeyHeader")
     secret_arn: Optional[str] = Field(None, alias="secretArn")
     forward_auth_token: bool = Field(default=False, alias="forwardAuthToken")
+    token_exchange_audience: Optional[str] = Field(None, alias="tokenExchangeAudience")
     requires_oauth_provider: Optional[str] = Field(
         None, alias="requiresOauthProvider"
     )
@@ -1432,3 +1485,240 @@ class GatewayTargetStatusResponse(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+
+
+# =============================================================================
+# MCP capability snapshot
+# =============================================================================
+#
+# An MCP server exposes three listings: tools, prompts and resources. The stack
+# has only ever called ``tools/list``, so prompts and resources were invisible
+# to every surface in the product.
+#
+# The snapshot is stored beside the catalog row (``PK=TOOL#<id>, SK=CAPABILITIES``)
+# rather than inside it, on purpose. The catalog row is read on the agent build
+# path; prompts and resources are of no use to the agent today, and folding a few
+# KB of prompt text into an item read on every turn would be a latency and cost
+# regression for a feature the agent does not consume.
+
+
+# A single stored snapshot is bounded well under the 400KB DynamoDB item limit.
+# Servers are free to expose hundreds of resources, and a description can be a
+# whole docstring, so both the per-entry text and the entry counts are capped.
+MAX_CAPABILITY_ENTRIES = 200
+MAX_CAPABILITY_TEXT = 500
+# Guards against a server that paginates forever.
+MAX_CAPABILITY_PAGES = 20
+
+
+def _clip(value: Optional[str]) -> Optional[str]:
+    """Bound a single description/title so one verbose entry can't blow the item."""
+    if value is None:
+        return None
+    text = value.strip()
+    if len(text) <= MAX_CAPABILITY_TEXT:
+        return text
+    return text[: MAX_CAPABILITY_TEXT - 1] + "…"
+
+
+class MCPPromptArgument(BaseModel):
+    """One argument an MCP prompt accepts (``PromptArgument``).
+
+    Capture originally flattened this to the name alone, which is enough to
+    *describe* a prompt and not enough to *fill one in*: a form needs
+    ``required`` to validate and ``description`` for the field's hint.
+
+    ``required`` defaults to False because that is what the MCP type says —
+    ``required`` is ``bool | None`` and absent means not required. A snapshot
+    taken before this model existed stored bare strings; those rehydrate here
+    with the same default, so an old snapshot under-constrains a form rather
+    than blocking the user on a field we never actually learned about.
+    """
+
+    name: str
+    description: Optional[str] = None
+    required: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "required": self.required,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Union[str, dict]) -> "MCPPromptArgument":
+        # Pre-widening snapshots stored the name as a bare string.
+        if isinstance(data, str):
+            return cls(name=data)
+        return cls(
+            name=data.get("name", ""),
+            description=data.get("description"),
+            required=bool(data.get("required", False)),
+        )
+
+
+class MCPPromptEntry(BaseModel):
+    """A prompt template exposed by an MCP server (``prompts/list``)."""
+
+    name: str
+    title: Optional[str] = None
+    description: Optional[str] = None
+    arguments: List[MCPPromptArgument] = Field(
+        default_factory=list,
+        description="Arguments the prompt accepts, in the order the server listed them.",
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "title": self.title,
+            "description": self.description,
+            "arguments": [a.to_dict() for a in self.arguments],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MCPPromptEntry":
+        return cls(
+            name=data.get("name", ""),
+            title=data.get("title"),
+            description=data.get("description"),
+            arguments=[
+                MCPPromptArgument.from_dict(a) for a in (data.get("arguments") or [])
+            ],
+        )
+
+
+class MCPResourceEntry(BaseModel):
+    """A resource exposed by an MCP server (``resources/list``).
+
+    ``uri_template`` is set for entries that came from
+    ``resources/templates/list`` — those are patterns such as
+    ``canvas://courses/{course_id}/syllabus`` rather than concrete URIs, and a
+    caller has to fill the placeholders before reading one.
+    """
+
+    uri: str
+    name: Optional[str] = None
+    description: Optional[str] = None
+    mime_type: Optional[str] = Field(None, alias="mimeType")
+    uri_template: bool = Field(default=False, alias="uriTemplate")
+
+    model_config = {"populate_by_name": True}
+
+    def to_dict(self) -> dict:
+        return {
+            "uri": self.uri,
+            "name": self.name,
+            "description": self.description,
+            "mimeType": self.mime_type,
+            "uriTemplate": self.uri_template,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MCPResourceEntry":
+        return cls(
+            uri=data.get("uri", ""),
+            name=data.get("name"),
+            description=data.get("description"),
+            mime_type=data.get("mimeType"),
+            uri_template=bool(data.get("uriTemplate", False)),
+        )
+
+
+class ToolCapabilitySnapshot(BaseModel):
+    """What one MCP server told us it offers, and when it said so.
+
+    Persisted so a detail view never has to open a live MCP session to render.
+    A 31-card catalogue opening one session per server would be unusable, and
+    OAuth-gated servers cannot be reached at all without a consent token.
+
+    ``supports_prompts`` / ``supports_resources`` record whether the server
+    answered the listing at all. A server that does not implement prompts
+    returns a JSON-RPC "method not found", which is a different fact from a
+    server that implements prompts and has none — and the UI should say
+    different things about each.
+    """
+
+    tool_id: str = Field(..., alias="toolId")
+    prompts: List[MCPPromptEntry] = Field(default_factory=list)
+    resources: List[MCPResourceEntry] = Field(default_factory=list)
+    supports_prompts: bool = Field(default=False, alias="supportsPrompts")
+    supports_resources: bool = Field(default=False, alias="supportsResources")
+    discovered_at: Optional[str] = Field(None, alias="discoveredAt")
+    discovered_by: Optional[str] = Field(None, alias="discoveredBy")
+    #: Set when the last attempt failed, so the UI can distinguish "this server
+    #: offers nothing" from "we could not ask".
+    error: Optional[str] = None
+    #: True when a listing was cut short by the entry cap above.
+    truncated: bool = Field(default=False)
+
+    model_config = {"populate_by_name": True}
+
+    def to_dynamo_item(self) -> dict:
+        return {
+            "PK": f"TOOL#{self.tool_id}",
+            "SK": "CAPABILITIES",
+            "toolId": self.tool_id,
+            "prompts": [p.to_dict() for p in self.prompts],
+            "resources": [r.to_dict() for r in self.resources],
+            "supportsPrompts": self.supports_prompts,
+            "supportsResources": self.supports_resources,
+            "discoveredAt": self.discovered_at,
+            "discoveredBy": self.discovered_by,
+            "error": self.error,
+            "truncated": self.truncated,
+        }
+
+    @classmethod
+    def from_dynamo_item(cls, item: dict) -> "ToolCapabilitySnapshot":
+        return cls(
+            tool_id=item.get("toolId", ""),
+            prompts=[MCPPromptEntry.from_dict(p) for p in item.get("prompts") or []],
+            resources=[
+                MCPResourceEntry.from_dict(r) for r in item.get("resources") or []
+            ],
+            supports_prompts=bool(item.get("supportsPrompts", False)),
+            supports_resources=bool(item.get("supportsResources", False)),
+            discovered_at=item.get("discoveredAt"),
+            discovered_by=item.get("discoveredBy"),
+            error=item.get("error"),
+            truncated=bool(item.get("truncated", False)),
+        )
+
+
+# =============================================================================
+# Resolved prompt (prompts/get)
+# =============================================================================
+#
+# Unlike the capability snapshot, a resolved prompt is never persisted. It is
+# composed from arguments the user just typed, it can be large, and it is of no
+# use to anyone but the person who asked for it — storing it would be a cost
+# with no reader.
+
+#: A resolved prompt is shown to a person, so it is bounded by what a person
+#: will actually read rather than by the DynamoDB item limit.
+MAX_RESOLVED_PROMPT_CHARS = 20000
+MAX_RESOLVED_PROMPT_MESSAGES = 20
+
+
+class ResolvedPromptMessage(BaseModel):
+    """One message a server composed for a prompt.
+
+    ``kind`` is the MCP content type. Anything other than ``text`` carries no
+    body — see ``_message_text`` — and the UI says so rather than rendering an
+    empty message.
+    """
+
+    role: str
+    kind: str = "text"
+    text: str = ""
+
+
+class ResolvedPrompt(BaseModel):
+    """The result of ``prompts/get`` for one prompt."""
+
+    description: Optional[str] = None
+    messages: List[ResolvedPromptMessage] = Field(default_factory=list)
+    #: True when the message list or its text was cut short by the caps above.
+    truncated: bool = Field(default=False)

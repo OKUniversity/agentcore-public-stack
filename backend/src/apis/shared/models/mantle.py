@@ -18,6 +18,8 @@ the declared API mode and forward the region + already-native params.
 from enum import Enum
 from typing import Any, Dict, Optional
 
+from .usage_normalization import usage_normalized
+
 
 class MantleApiMode(str, Enum):
     """OpenAI-compatible API surface a Bedrock Mantle model speaks.
@@ -69,10 +71,13 @@ def _ensure_gemma4_openai_v1_routing() -> None:
 
     Per its AWS model card, Gemma 4 is served *only* on the Mantle
     ``/openai/v1`` base path — "different from the ``v1`` path used by other
-    models." But the SDK's ``_OPENAI_PATH_MODEL_PREFIXES`` only lists
-    ``openai.gpt-5.``, so ``google.gemma-4-*`` falls through to ``/v1`` and the
-    endpoint 401s ("... is not enabled for this account"). Append the family
-    prefix at build time until it lands upstream (strands-agents/sdk-python).
+    models." A model whose prefix is missing from the SDK's
+    ``_OPENAI_PATH_MODEL_PREFIXES`` falls through to ``/v1`` and the endpoint
+    401s ("... is not enabled for this account").
+
+    strands-agents 1.51.0 ships ``google.gemma-4-`` upstream, so this is now a
+    no-op on the pinned SDK; the guard stays as a floor in case a future pin
+    regresses the list.
 
     ``google.gemma-4-`` specifically — NOT ``google.gemma-``: Gemma 3 is served
     on ``/v1`` and must not be rerouted. Idempotent; safe to call on every build.
@@ -118,7 +123,12 @@ def build_mantle_model(
     if region:
         bedrock_mantle_config["region"] = region
 
-    model_cls = (
+    # Wrapped so the model reports Bedrock-Converse token-bucket semantics:
+    # OpenAI's `input_tokens` is inclusive of the cache buckets, and Strands
+    # drops `cache_write_tokens` outright. Applied here — the single OpenAI-
+    # family construction seam both consumers share — so no downstream reader
+    # of the usage dict needs to know which provider produced it.
+    model_cls = usage_normalized(
         OpenAIResponsesModel
         if api_mode == MantleApiMode.RESPONSES
         else OpenAIModel

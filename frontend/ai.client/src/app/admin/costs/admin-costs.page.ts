@@ -20,8 +20,10 @@ import {
   SystemSummaryCardComponent,
 } from './components/system-summary-card.component';
 import { TopUsersTableComponent } from './components/top-users-table.component';
+import { TopSessionsTableComponent } from './components/top-sessions-table.component';
 import { CostTrendsChartComponent } from './components/cost-trends-chart.component';
 import { ModelBreakdownComponent } from './components/model-breakdown.component';
+import { SpinnerComponent } from '../../components/spinner/spinner.component';
 
 /**
  * Admin cost dashboard page.
@@ -35,8 +37,10 @@ import { ModelBreakdownComponent } from './components/model-breakdown.component'
     PeriodSelectorComponent,
     SystemSummaryCardComponent,
     TopUsersTableComponent,
+    TopSessionsTableComponent,
     CostTrendsChartComponent,
     ModelBreakdownComponent,
+    SpinnerComponent,
   ],
   providers: [provideIcons({ heroArrowLeft, heroArrowDownTray, heroMagnifyingGlass })],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -62,7 +66,7 @@ import { ModelBreakdownComponent } from './components/model-breakdown.component'
               type="button"
               (click)="onExport()"
               [disabled]="loading()"
-              class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 rounded-sm text-sm font-medium text-gray-700 hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700 transition-colors"
+              class="inline-flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 rounded-2xl text-sm font-medium text-gray-700 hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-primary-500 disabled:opacity-50 disabled:cursor-not-allowed dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700 transition-colors"
             >
               <ng-icon name="heroArrowDownTray" class="size-4" />
               Export
@@ -96,13 +100,13 @@ import { ModelBreakdownComponent } from './components/model-breakdown.component'
                 [ngModel]="sessionLookupId()"
                 (ngModelChange)="sessionLookupId.set($event)"
                 placeholder="Session ID…"
-                class="block w-full rounded-2xl border border-gray-300 bg-white py-2 pl-9 pr-3 font-mono text-sm/6 text-gray-900 placeholder:font-sans placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500"
+                class="block w-full rounded-2xl border border-gray-300 bg-white py-2 pl-9 pr-3 font-mono text-sm/6 text-gray-900 placeholder:font-sans placeholder:text-gray-400 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-500 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500"
               />
             </div>
             <button
               type="submit"
               [disabled]="!sessionLookupId().trim()"
-              class="shrink-0 rounded-2xl bg-blue-600 px-4 py-2 text-sm/6 font-medium text-white hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-blue-500 dark:hover:bg-blue-600"
+              class="shrink-0 rounded-2xl bg-primary-accessible px-4 py-2 text-sm/6 font-medium text-white hover:brightness-95 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 disabled:cursor-not-allowed disabled:opacity-50"
             >
               Inspect
             </button>
@@ -113,9 +117,7 @@ import { ModelBreakdownComponent } from './components/model-breakdown.component'
           <!-- Loading State -->
           <div class="flex items-center justify-center h-64">
             <div class="flex flex-col items-center gap-4">
-              <div
-                class="animate-spin rounded-full size-12 border-4 border-gray-300 dark:border-gray-600 border-t-blue-600 dark:border-t-blue-400"
-              ></div>
+              <app-spinner size="xl" label="Loading dashboard data" />
               <p class="text-sm text-gray-500 dark:text-gray-400">
                 Loading dashboard data...
               </p>
@@ -124,12 +126,12 @@ import { ModelBreakdownComponent } from './components/model-breakdown.component'
         } @else if (error()) {
           <!-- Error State -->
           <div
-            class="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-6"
+            class="bg-state-danger-50 dark:bg-state-danger-900/20 border border-state-danger-200 dark:border-state-danger-800 rounded-lg p-6"
           >
             <div class="flex items-start gap-3">
               <div class="shrink-0">
                 <svg
-                  class="size-5 text-red-400"
+                  class="size-5 text-state-danger-400"
                   viewBox="0 0 20 20"
                   fill="currentColor"
                 >
@@ -141,16 +143,16 @@ import { ModelBreakdownComponent } from './components/model-breakdown.component'
                 </svg>
               </div>
               <div>
-                <h3 class="text-sm font-medium text-red-800 dark:text-red-200">
+                <h3 class="text-sm font-medium text-state-danger-800 dark:text-state-danger-200">
                   Failed to load dashboard
                 </h3>
-                <p class="mt-1 text-sm text-red-700 dark:text-red-300">
+                <p class="mt-1 text-sm text-state-danger-700 dark:text-state-danger-300">
                   {{ error() }}
                 </p>
                 <button
                   type="button"
                   (click)="loadDashboard()"
-                  class="mt-3 text-sm font-medium text-red-600 dark:text-red-400 hover:text-red-500 dark:hover:text-red-300"
+                  class="mt-3 text-sm font-medium text-state-danger-600 dark:text-state-danger-400 hover:text-state-danger-500 dark:hover:text-state-danger-300"
                 >
                   Try again
                 </button>
@@ -202,6 +204,18 @@ import { ModelBreakdownComponent } from './components/model-breakdown.component'
               (loadMore)="onLoadMoreUsers()"
             />
           </div>
+
+          <!-- Most expensive conversations -->
+          <div class="mt-8">
+            <app-top-sessions-table
+              [sessions]="topSessions()"
+              [loading]="loadingTopSessions()"
+              [truncated]="topSessionsTruncated()"
+              [hasLoaded]="topSessionsLoaded()"
+              (load)="onLoadTopSessions()"
+              (sessionClick)="onSessionClick($event)"
+            />
+          </div>
         }
     </div>
   `,
@@ -217,11 +231,18 @@ export class AdminCostsPage implements OnInit {
   selectedPeriod = this.stateService.selectedPeriod;
   topUsers = this.stateService.topUsers;
   topUsersCount = this.stateService.topUsersCount;
+  topSessions = this.stateService.topSessions;
+  topSessionsTruncated = this.stateService.topSessionsTruncated;
+  loadingTopSessions = this.stateService.loadingTopSessions;
   trends = this.stateService.trends;
   modelUsage = this.stateService.modelUsage;
 
   // Session-id lookup for the cost-anatomy drill-down
   sessionLookupId = signal('');
+
+  // The expensive-conversations scan is on demand (one query per scanned
+  // user), so the table needs to tell "not loaded yet" from "nothing found".
+  topSessionsLoaded = signal(false);
 
   // Track pagination state for top users
   private topUsersLimit = signal(20);
@@ -269,6 +290,10 @@ export class AdminCostsPage implements OnInit {
 
   onPeriodChange(period: string): void {
     this.stateService.setPeriod(period);
+    // The expensive-conversations list is period-scoped; drop it rather than
+    // leave last period's rows under a new period's heading.
+    this.topSessionsLoaded.set(false);
+    this.stateService.topSessions.set([]);
     this.loadDashboard();
   }
 
@@ -282,6 +307,19 @@ export class AdminCostsPage implements OnInit {
 
   onUserClick(userId: string): void {
     this.router.navigate(['/admin/users', userId]);
+  }
+
+  async onLoadTopSessions(): Promise<void> {
+    try {
+      await this.stateService.loadTopSessions({ limit: 25 });
+      this.topSessionsLoaded.set(true);
+    } catch {
+      // Error is handled by state service
+    }
+  }
+
+  onSessionClick(sessionId: string): void {
+    this.router.navigate(['/admin/costs/sessions', sessionId]);
   }
 
   onInspectSession(): void {

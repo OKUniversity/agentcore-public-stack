@@ -31,6 +31,7 @@ from apis.shared.skills.repository import (
 )
 
 from .service import SkillCatalogService, get_skill_catalog_service
+from apis.shared.security.log_sanitize import scrub_log
 
 logger = logging.getLogger(__name__)
 
@@ -179,10 +180,10 @@ class UserSkillService:
         self._invalidate(skill_id)
 
         logger.info(
-            f"User {user.email} created skill: {skill_id}",
+            f"User {scrub_log(user.email)} created skill: {scrub_log(skill_id)}",
             extra={
                 "event": "user_skill_created",
-                "skill_id": skill_id,
+                "skill_id": scrub_log(skill_id),
                 "owner_user_id": user.user_id,
             },
         )
@@ -209,10 +210,10 @@ class UserSkillService:
         self._invalidate(skill_id)
 
         logger.info(
-            f"User {user.email} updated skill: {skill_id}",
+            f"User {scrub_log(user.email)} updated skill: {scrub_log(skill_id)}",
             extra={
                 "event": "user_skill_updated",
-                "skill_id": skill_id,
+                "skill_id": scrub_log(skill_id),
                 "owner_user_id": user.user_id,
                 "changes": list(updates.keys()),
             },
@@ -238,10 +239,10 @@ class UserSkillService:
         self._invalidate(skill_id)
 
         logger.info(
-            f"User {user.email} deleted skill: {skill_id}",
+            f"User {scrub_log(user.email)} deleted skill: {scrub_log(skill_id)}",
             extra={
                 "event": "user_skill_deleted",
-                "skill_id": skill_id,
+                "skill_id": scrub_log(skill_id),
                 "owner_user_id": user.user_id,
             },
         )

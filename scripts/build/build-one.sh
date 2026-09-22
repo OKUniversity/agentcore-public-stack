@@ -91,11 +91,19 @@ case "$SERVICE" in
         SOURCE_DIRS=(
             "backend/src/apis/app_api/documents/ingestion"
             "backend/src/apis/shared/embeddings"
+            # handler.py reads records.resolve_engine to skip documents whose
+            # knowledge base is promoted to the managed engine. Without this
+            # entry a change to that gate would not move the content hash, and
+            # the Lambda would keep running the previous image.
+            "backend/src/apis/shared/kb_backend"
         )
-        # shared/__init__.py is a single file, hashed as a manifest.
-        # The requirements.lock lives inside the first source-dir
-        # already, so it doesn't need a separate --manifest entry.
-        MANIFESTS=("backend/src/apis/shared/__init__.py")
+        # shared/__init__.py and shared/timestamps.py are single files,
+        # hashed as manifests. The requirements.lock lives inside the
+        # first source-dir already, so it doesn't need its own entry.
+        MANIFESTS=(
+            "backend/src/apis/shared/__init__.py"
+            "backend/src/apis/shared/timestamps.py"
+        )
         # The RAG ingestion Lambda is arm64 (see the rag-ingestion CDK
         # construct), and the Dockerfile installs arm64 torch wheels.
         # Build for arm64 — an amd64 image fails the arm64 Lambda at
@@ -113,23 +121,68 @@ case "$SERVICE" in
         # would ship stale code under an unchanged content-hash tag.
         SOURCE_DIRS=(
             "backend/src/apis/app_api/kb_sync"
+            # cleanup_service.py reads records.resolve_engine and calls
+            # ManagedKbBackend to delete from a promoted knowledge base.
+            "backend/src/apis/shared/kb_backend"
+            # observability/ — reached via kb_backend/metrics.py when
+            # document_service releases a managed-KB byte reservation.
+            "backend/src/apis/shared/observability"
             "backend/src/apis/app_api/file_sources"
             "backend/src/apis/app_api/documents"
             "backend/src/apis/app_api/web_sources"
             "backend/src/apis/shared/sync_policies"
             "backend/src/apis/shared/oauth"
             "backend/src/apis/shared/embeddings"
+            "backend/src/apis/shared/assistants"
+            # caching/ — oauth/provider_repository.py memoizes its provider
+            # list in the process-wide config cache.
+            "backend/src/apis/shared/caching"
         )
-        # shared/__init__.py hashed as a manifest (same as rag-ingestion);
+        # Single-file COPYs hashed as manifests (same as rag-ingestion);
         # kb_sync/requirements.txt lives inside the first source dir.
-        MANIFESTS=("backend/src/apis/shared/__init__.py")
+        MANIFESTS=(
+            "backend/src/apis/shared/__init__.py"
+            "backend/src/apis/shared/timestamps.py"
+            "backend/src/apis/shared/dynamo_errors.py"
+            "backend/src/apis/shared/feature_flags.py"
+            "backend/src/apis/shared/aws_clients.py"
+        )
         # Both kb-sync Lambdas are arm64 (see the kb-sync CDK construct).
         PLATFORM="linux/arm64"
         SSM_KEY="/${CDK_PROJECT_PREFIX}/kb-sync/image-tag"
         ;;
+    kb-migration)
+        DOCKERFILE="backend/Dockerfile.kb-migration"
+        # ONE image, FOUR Lambdas (dispatcher + worker + reconciler +
+        # ingestion consumer, selected per function by ImageConfig
+        # command overrides). Keep SOURCE_DIRS in lockstep with the
+        # Dockerfile's COPY list — a path copied but not hashed here
+        # would ship stale code under an unchanged content-hash tag,
+        # making the deploy a silent no-op.
+        #
+        # Deliberately short: the handlers' whole import closure is 16
+        # first-party modules, because kb_backend is its own package with
+        # stdlib-only module scope. If this list ever needs
+        # apis/shared/assistants, something has broken the boundary that
+        # test_kb_backend_boundary.py guards.
+        SOURCE_DIRS=(
+            "backend/src/apis/app_api/kb_migration"
+            "backend/src/apis/shared/kb_backend"
+            "backend/src/apis/shared/observability"
+        )
+        # Single-file COPYs hashed as manifests (same as kb-sync);
+        # kb_migration/requirements.txt lives inside the first source dir.
+        MANIFESTS=(
+            "backend/src/apis/shared/__init__.py"
+            "backend/src/apis/shared/timestamps.py"
+        )
+        # All four kb-migration Lambdas are arm64 (see the managed-kb
+        # CDK construct).
+        PLATFORM="linux/arm64"
+        SSM_KEY="/${CDK_PROJECT_PREFIX}/kb-migration/image-tag"
+        ;;
     scheduled-runs)
-        DOCKERFILE="backend/Dockerfile.scheduled-runs"
-        # One image, two Lambdas (dispatcher + worker via ImageConfig
+        DOCKERFILE="backend/Dockerfile.scheduled-runs"        # One image, two Lambdas (dispatcher + worker via ImageConfig
         # command overrides). Keep SOURCE_DIRS in lockstep with the
         # Dockerfile's COPY list — a path copied but not hashed here
         # would ship stale code under an unchanged content-hash tag.
@@ -140,10 +193,17 @@ case "$SERVICE" in
             "backend/src/apis/shared/scheduled_prompts"
             "backend/src/apis/shared/sessions_bff"
             "backend/src/apis/shared/sessions"
+            "backend/src/apis/shared/browser_takeover"
+            "backend/src/apis/shared/storage"
+            "backend/src/apis/shared/observability"
         )
-        # shared/__init__.py hashed as a manifest (same as kb-sync/rag-ingestion);
+        # Single-file COPYs hashed as manifests (same as kb-sync/rag-ingestion);
         # the dispatcher's requirements.txt lives inside its own source dir.
-        MANIFESTS=("backend/src/apis/shared/__init__.py")
+        MANIFESTS=(
+            "backend/src/apis/shared/__init__.py"
+            "backend/src/apis/shared/errors.py"
+            "backend/src/apis/shared/feature_flags.py"
+        )
         # Both scheduled-runs Lambdas are arm64 (see the scheduled-runs
         # CDK construct).
         PLATFORM="linux/arm64"

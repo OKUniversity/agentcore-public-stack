@@ -49,14 +49,26 @@ export interface AppConfig {
   inferenceApi: InferenceApiConfig;
   ragIngestion: RagIngestionConfig;
   kbSync: KbSyncConfig;
+  managedKb: ManagedKbConfig;
   scheduledRuns: ScheduledRunsConfig;
   memorySpaces: MemorySpacesConfig;
+  feedbackEvalSampling: FeedbackEvalSamplingConfig;
   skills: SkillsConfig;
   agents: AgentsConfig;
+  agentMarketplace: AgentMarketplaceConfig;
   fineTuning: FineTuningConfig;
   artifacts: ArtifactsConfig;
   mcpSandbox: McpSandboxConfig;
+  browser: BrowserConfig;
   mcpIdentity: McpIdentityConfig;
+  gateway: GatewayConfig;
+  /**
+   * Optional. Absent for any deployment without an external token service, which
+   * is the default. Kept optional rather than defaulted so a fork constructing
+   * AppConfig by hand does not have to know this feature exists.
+   */
+  tokenExchange?: TokenExchangeConfig;
+  observability: ObservabilityConfig;
   appVersion: string;
   tags: { [key: string]: string };
 }
@@ -83,6 +95,31 @@ export interface McpSandboxConfig {
   extraFrameAncestors: string[];
 }
 
+/**
+ * AgentCore Browser policy (docs/specs/authenticated-web-assessment.md D6).
+ */
+export interface BrowserConfig {
+  /**
+   * Hosts the browser must refuse to navigate to, as Chromium
+   * `URLBlocklist` entries.
+   *
+   * This is a **security control**, not a preference. A browser takeover hands
+   * a human a fully interactive Chromium, so the only thing that stops them
+   * navigating to the LMS and having an agent act as them is Chromium itself
+   * refusing — no check in our own code can, because it only ever sees the
+   * page the takeover started on.
+   *
+   * A blocklist rather than an allowlist because the list has to be
+   * maintainable: an allowlist of vendors under assessment would churn with
+   * every VPAT review, while institutional systems change about yearly.
+   *
+   * Lives here rather than as an S3 object edited in place, so a change to it
+   * is a reviewed deploy. Match the origin actually navigated to — a vanity
+   * CNAME that redirects is not what Chromium sees.
+   */
+  urlBlocklist: string[];
+}
+
 export interface ArtifactsConfig {
   // ACM certificate ARN for the artifact iframe origin (artifacts.{domainName}).
   // MUST be in us-east-1 — CloudFront requires its certs there. Validation
@@ -94,6 +131,12 @@ export interface ArtifactsConfig {
   // iframes via CSP frame-ancestors — e.g. http://localhost:4200 for a
   // local SPA pointed at this deployment. Empty on prod.
   extraFrameAncestors: string[];
+  // Whether recipients can *discover* artifacts shared with them (the
+  // library's "Shared with you" tab, backed by GET /shared-artifacts).
+  // Default ON with a kill switch, like the other flags in this file.
+  // Gates the read only — the fan-out rows behind it are written
+  // unconditionally, so toggling this never needs a backfill.
+  shareInboxEnabled: boolean;
 }
 
 export interface FrontendConfig {
@@ -146,6 +189,91 @@ export interface KbSyncConfig {
 }
 
 /**
+ * Managed knowledge bases — Amazon Bedrock Managed KB as a second
+ * retrieval backend (.kiro/specs/managed-kb-migration, Requirement 19).
+ *
+ * Three INDEPENDENT booleans, all defaulting to **false**, all treating
+ * an empty string as false. This inverts the repo's usual "default ON
+ * with a kill switch" idiom on purpose: managed storage bills at
+ * $5.00/GB-month against ~$0.15/GB-month today, so every one of these
+ * has to be a deliberate, reviewable opt-in rather than something a
+ * fork inherits by cloning.
+ *
+ * The empty-string rule is not pedantry (Requirement 19.8). An unset
+ * GitHub Actions variable renders as an EMPTY STRING, not as absent, so
+ * a naive truthiness check on the forwarded value is fine but a naive
+ * `!== 'false'` check — the shape used by the default-ON flags above —
+ * would resolve an unset variable to **true** and silently arm the
+ * feature on every fork. `parseBooleanEnv` returns `undefined` for both
+ * unset and empty, so the `??` chain falls through to context and then
+ * to `false`.
+ *
+ * - `newDefault` (MANAGED_KB_NEW_DEFAULT) — newly created knowledge
+ *   bases are provisioned managed instead of legacy.
+ * - `migrationEnabled` (MANAGED_KB_MIGRATION_ENABLED) — whether the
+ *   background Migration_Worker runs at all. Off ⇒ the dispatcher's
+ *   EventBridge rule is created DISABLED and the dispatcher itself
+ *   no-ops (Requirement 19.6), so migration work is inert two ways
+ *   over.
+ * - `reconcilerArmed` (MANAGED_KB_RECONCILER_ARMED) — whether the daily
+ *   Reconciler DELETES orphans or merely logs what it would have
+ *   deleted. This is the inverted-convention flag: the Reconciler is
+ *   *deployed and running* from day one but *disarmed*, so its
+ *   judgement can be reviewed against weeks of real data before it is
+ *   allowed to delete anything (Requirements 14.7, 19.7). Note the
+ *   consequence for the schedule: the Reconciler's rule is ENABLED even
+ *   with every flag off, because report-only is the point. Report-only
+ *   is read-only, so it changes nothing.
+ *
+ * Byte caps (Requirement 12.2) are expressed in BYTES rather than MB so
+ * nothing downstream has to guess at a unit, and they resolve by role
+ * tier. The standard tier sits deliberately **below** the platform's
+ * existing 1 GB user-files precedent: at 30,000 users the 1 GB
+ * precedent would permit 30 TB, i.e. ~$150,000/month. These figures
+ * still require product sign-off before enforcement is switched on.
+ *
+ * `storageAlarmGb` / `dailyCostAlarmUsd` are the fleet-level guards
+ * (Requirement 12.13). Per-owner caps bound one user; only these bound
+ * the account, and the gap between ~$169/month expected and ~$15,000
+ * permitted is why they are not optional.
+ */
+export interface ManagedKbConfig {
+  /** New knowledge bases are created managed. Default false. */
+  newDefault: boolean;
+  /** The background Migration_Worker runs at all. Default false. */
+  migrationEnabled: boolean;
+  /** The Reconciler deletes rather than only reporting. Default false. */
+  reconcilerArmed: boolean;
+  /**
+   * The dead-letter document reconciler CORRECTS stranded DOC# rows —
+   * marking retrievable-but-stranded documents complete and re-ingesting
+   * missing ones — rather than only reporting them. Same inverted
+   * convention as `reconcilerArmed`: deployed and running from day one but
+   * disarmed, so its judgement is auditable before it writes. Default false.
+   */
+  docReconcilerArmed: boolean;
+  /** Per-owner Byte_Cap, standard role tier. Default 100 MB. */
+  perOwnerDefaultBytes: number;
+  /** Per-owner Byte_Cap, elevated (admin-granted) role tier. Default 1 GB. */
+  perOwnerElevatedBytes: number;
+  /** Per-knowledge-base ceiling, bounding a single runaway corpus. Default 500 MB. */
+  perKnowledgeBaseCeilingBytes: number;
+  /** Rollback window during `retain`, in days. At least 30 (Requirement 15.11). */
+  retentionWindowDays: number;
+  /** Fleet-wide managed-storage alarm threshold, in GB. */
+  storageAlarmGb: number;
+  /** Daily Knowledge-Base usagetype cost alarm threshold, in USD. */
+  dailyCostAlarmUsd: number;
+}
+
+/** Per-owner Byte_Cap defaults by role tier (Requirement 12.2). */
+export const MANAGED_KB_DEFAULT_PER_OWNER_BYTES = 100 * 1024 * 1024; // 100 MB
+export const MANAGED_KB_ELEVATED_PER_OWNER_BYTES = 1024 * 1024 * 1024; // 1 GB
+export const MANAGED_KB_PER_KB_CEILING_BYTES = 500 * 1024 * 1024; // 500 MB
+/** Minimum legacy-data rollback window (Requirement 15.11). */
+export const MANAGED_KB_RETENTION_WINDOW_DAYS = 30;
+
+/**
  * Scheduled runs — headless agent runs as a user (the Harness primitive,
  * docs/specs/scheduled-agent-runs.md).
  *
@@ -170,6 +298,16 @@ export interface ScheduledRunsConfig {
  * are provisioned unconditionally, so this only gates route mounting at runtime.
  */
 export interface MemorySpacesConfig {
+  enabled: boolean;
+}
+
+/**
+ * Feedback eval sampling (response-feedback spec §11 PR-4): lets an admin
+ * send down-thumbed conversations to AgentCore Evaluations. **Opt-in** —
+ * the managed evaluator reads the conversation's spans (system prompt and
+ * user messages), so each environment turns it on deliberately.
+ */
+export interface FeedbackEvalSamplingConfig {
   enabled: boolean;
 }
 
@@ -202,8 +340,35 @@ export interface AgentsConfig {
   enabled: boolean;
 }
 
+/**
+ * Agent Marketplace (docs/specs/agent-marketplace.md).
+ *
+ * Default ON with a kill switch: CDK_AGENT_MARKETPLACE_ENABLED=false (or an
+ * `agentMarketplace.enabled: false` cdk.json context) turns it off. Sets the
+ * AGENT_MARKETPLACE_ENABLED env var on **app-api only** — publication is a catalog
+ * concern and the marketplace adds no inference-api routes.
+ */
+export interface AgentMarketplaceConfig {
+  enabled: boolean;
+}
+
 export interface FineTuningConfig {
   additionalCorsOrigins?: string; // Extra CORS origins to append (comma-separated)
+  /**
+   * Mounts the `/fine-tuning` and `/admin/fine-tuning` routers in app-api.
+   *
+   * Distinct from the long-deleted `CDK_FINE_TUNING_ENABLED`, which gated
+   * whether the SageMaker *stack* deployed and went away with the single-stack
+   * migration (#396). The tables, bucket and SageMaker role are provisioned
+   * unconditionally; this only decides whether the routes are reachable.
+   */
+  enabled: boolean;
+  /**
+   * Monthly GPU-hour quota granted to any authenticated user on first use.
+   * `0` keeps the original whitelist-only behaviour, where an admin has to
+   * grant each user explicitly.
+   */
+  defaultQuotaHours: number;
 }
 
 /**
@@ -242,6 +407,236 @@ export interface McpIdentityConfig {
 }
 
 /**
+ * AgentCore Gateway configuration.
+ *
+ * `inboundAuth` selects the Gateway's single inbound authorizer. AgentCore
+ * allows exactly one authorizer type per Gateway (`authorizerType` is a scalar:
+ * CUSTOM_JWT | AWS_IAM | NONE | AUTHENTICATE_ONLY) — there is no "accept either
+ * SigV4 or JWT" mode. Outbound credentials remain per-target, so a single
+ * Gateway still serves both IAM-invoked Lambda targets and OAuth/token-exchange
+ * targets.
+ *
+ * ## The authorizer is immutable after creation
+ *
+ * Changing this value on an **existing** Gateway does not work. The AgentCore
+ * control plane rejects it:
+ *
+ * ```
+ * Authorizer type cannot be updated for an existing gateway
+ * (Service: BedrockAgentCoreControl, Status Code: 400)
+ * ```
+ *
+ * This is *not* visible from CloudFormation: the resource schema documents both
+ * `AuthorizerType` and `AuthorizerConfiguration` as "Update requires: No
+ * interruption", and `cdk diff` — even via a real change set — reports an
+ * in-place `[~]` modify. Both reflect CFN's model, not the service's validation.
+ * The failure only surfaces at deploy time, mid-update.
+ *
+ * So `inboundAuth` effectively sets the authorizer **at Gateway creation**.
+ * Moving an existing deployment from AWS_IAM to CUSTOM_JWT requires a *new*
+ * Gateway plus target re-registration and a cutover — not a config flip. See
+ * docs/specs/AGENTCORE_GATEWAY_TOKEN_EXCHANGE_PLAN.md.
+ *
+ * Defaults to `iam`, matching every Gateway already deployed. Do not change the
+ * default to `jwt`: it would make `PlatformStack` fail on every existing
+ * deployment (this repo's included) and — because the agent reads the same
+ * value — point the agent at an auth mode its Gateway does not accept.
+ */
+export interface GatewayConfig {
+  inboundAuth: 'jwt' | 'iam';
+}
+
+/**
+ * RFC 8693 token exchange against an external token service.
+ *
+ * Lets the agent trade the signed-in user's Cognito access token for a token
+ * issued by a token service the organisation already runs, so downstream APIs
+ * that trust that service can serve agent requests as the user without being
+ * modified. Useful anywhere internal APIs already accept a JWT from an existing
+ * identity or token service — the pattern is not specific to any one kind of
+ * organisation.
+ *
+ * Deliberately not done by AgentCore Gateway: its outbound OAuth credential
+ * provider supports only CLIENT_CREDENTIALS and AUTHORIZATION_CODE
+ * (`OAuthGrantType` in the bedrock-agentcore-control API model has exactly those
+ * two values), so a token-exchange grant cannot be expressed there. A Gateway
+ * with AWS_IAM inbound auth also never sees the user's token, so it would have
+ * nothing to exchange. The runtime performs the exchange instead.
+ *
+ * Entirely optional and additive. Leave it unset and no resources, permissions,
+ * or environment variables are created — a deployment that only ever uses SigV4
+ * for MCP traffic is unaffected.
+ */
+export interface TokenExchangeConfig {
+  /** Exchange endpoint, e.g. https://tokens.example.org/v2/oauth/token */
+  url: string;
+  /** client_id this deployment authenticates as. */
+  clientId: string;
+}
+
+// Observability defaults. Tuned for cost: these are what a fork inherits when it
+// configures nothing. See .kiro/steering/observability.md.
+
+/** Retention for every log group in the stack. */
+export const OBSERVABILITY_DEFAULT_LOG_RETENTION_DAYS = 30;
+
+/** X-Ray sampling rate, 0.0-1.0. Billed per trace recorded, so keep it low. */
+export const OBSERVABILITY_DEFAULT_XRAY_SAMPLING_RATE = 0.01;
+
+/** Traces per second recorded before the sampling rate applies. */
+export const OBSERVABILITY_DEFAULT_XRAY_SAMPLING_RESERVOIR = 1;
+
+/** ALB target 5xx per 5-minute period. */
+export const OBSERVABILITY_DEFAULT_ALB_TARGET_5XX_THRESHOLD = 10;
+
+/** p99 latency floor (ms). High because the chat path is SSE: a healthy turn
+ *  runs for seconds and peaks around 25s, so a tight threshold only makes noise. */
+export const OBSERVABILITY_DEFAULT_P99_LATENCY_MS = 120_000;
+
+/** AgentCore Runtime errors per 5-minute period. */
+export const OBSERVABILITY_DEFAULT_AGENTCORE_ERROR_THRESHOLD = 10;
+
+/**
+ * Concurrent AgentCore Runtime sessions (`ActiveSessionCount`, Maximum) above
+ * which to alarm.
+ *
+ * This is a **cost** alarm, not a quota alarm. The us-west-2 default runtime
+ * quota is 5,000 concurrent sessions, so 75 is 1.5% of it — `agentcore-throttles`
+ * is still the signal for actual quota exhaustion. What this watches is session
+ * *accumulation*, because Runtime bills memory for a session's whole lifetime,
+ * not for compute time, and AWS offers no API to list or force-terminate an
+ * active runtime session (aws/bedrock-agentcore-starter-toolkit#498).
+ *
+ * Calibrated against this repo's own incident. While the `/ping` reaper bug of
+ * #338 was live, July 2026 burned 71,954 microVM-hours — an average of ~99
+ * concurrent sessions sustained across the whole month, weekends and nights
+ * included. After #827 restored idle reaping, mean microVM life went from
+ * 488-496 min back to 21.5-33.6 min.
+ *
+ * **Magnitude alone cannot separate a regression from a load test, so the real
+ * discriminator is DURATION — see `evaluationPeriods` at the alarm site.**
+ * Measured against 7 days of real prod `ActiveSessionCount` (2026-09-04..11),
+ * a week that contained three nightly load tests peaking at 241, 608 and 1404:
+ *
+ * | threshold | window | firings |
+ * |-----------|--------|---------|
+ * | 200       | 15 min | 3 (every load test) |
+ * | 75        | 30 min | 2 |
+ * | **75**    | **60 min** | **0** |
+ *
+ * Raising the threshold does not help: load tests still fire it at 500, and it
+ * only goes quiet near 1500 — which is *above* the ~99 regime this alarm exists
+ * to catch, so it would then never fire on the real thing. The longest
+ * continuous run above 75 that week was 45 min, so a 60-minute window clears
+ * every observed load test with 15 min of margin, while a sustained 99 still
+ * alarms one hour after onset.
+ *
+ * Ordinary prod traffic outside those bursts was max 8-16, mean 2.4-6.8; dev
+ * peaks at 5. 75 clears both by a wide margin.
+ */
+export const OBSERVABILITY_DEFAULT_AGENTCORE_ACTIVE_SESSION_THRESHOLD = 75;
+
+/** Lambda errors per 5-minute period. */
+export const OBSERVABILITY_DEFAULT_LAMBDA_ERROR_THRESHOLD = 5;
+
+/** Lambda duration alarm as a percentage of the function's own timeout. */
+export const OBSERVABILITY_DEFAULT_LAMBDA_DURATION_PERCENT_OF_TIMEOUT = 80;
+
+/** DynamoDB throttle events per 5-minute period. */
+export const OBSERVABILITY_DEFAULT_DYNAMO_THROTTLE_THRESHOLD = 10;
+
+/** ECS service CPU / memory utilisation alarm thresholds (percent). */
+export const OBSERVABILITY_DEFAULT_ECS_CPU_PERCENT = 80;
+export const OBSERVABILITY_DEFAULT_ECS_MEMORY_PERCENT = 85;
+
+/** Avoidable prompt-cache misses per 5-minute period. */
+export const OBSERVABILITY_DEFAULT_PROMPT_CACHE_AVOIDABLE_MISS_THRESHOLD = 10;
+
+/** Dollars of fleet prompt-cache waste per 5-minute period. */
+export const OBSERVABILITY_DEFAULT_PROMPT_CACHE_WASTED_USD_THRESHOLD = 1;
+
+/** Cumulative partial-miss waste for one session, in dollars. A fleet sum
+ *  cannot see a single conversation re-writing its prefix every turn. */
+export const OBSERVABILITY_DEFAULT_PROMPT_CACHE_SESSION_WASTED_USD_THRESHOLD = 5;
+
+/**
+ * Percent of a model's tokens-per-minute quota at which to alarm.
+ *
+ * Below 100 on purpose: a Bedrock quota increase takes lead time, so the alarm
+ * is only useful if it fires while there is still time to request one.
+ */
+export const OBSERVABILITY_DEFAULT_BEDROCK_TPM_QUOTA_PERCENT = 75;
+
+/**
+ * Per-model tokens-per-minute quotas, keyed by the `ModelId` dimension value
+ * Bedrock publishes on `EstimatedTPMQuotaUsage`.
+ *
+ * Empty by default, and that is the only honest default. TPM quotas are per
+ * model *and* per account, most are adjustable, and they differ by two orders
+ * of magnitude between models in the same account — 40,000,000 for one
+ * inference profile next to 200,000 for another. Any shipped number would be
+ * wrong for every fork and would go stale silently the first time somebody
+ * requested an increase.
+ *
+ * With no entries, no quota alarm is created at all. That is deliberate: the
+ * backstop is `bedrock-invocation-throttles`, which fires on real refusals and
+ * needs no quota configured. Populating this buys the *leading* indicator.
+ *
+ * Read the values actually applied to an account with:
+ *   aws service-quotas list-service-quotas --service-code bedrock \
+ *     --query "Quotas[?contains(QuotaName,'tokens per minute')]"
+ */
+export const OBSERVABILITY_DEFAULT_BEDROCK_TPM_QUOTAS: { [modelId: string]: number } = {};
+
+/**
+ * Observability configuration.
+ *
+ * Precedence per field: CDK_OBSERVABILITY_* env var, then the flat dotted
+ * context key, then a nested `observability` object, then the default constant.
+ */
+export interface ObservabilityConfig {
+  /** Create the SNS alarm topic and route every alarm to it. */
+  alarmTopicEnabled: boolean;
+  logRetentionDays: number;
+  albTarget5xxThreshold: number;
+  /** ALB p99 TargetResponseTime floor, in ms. */
+  albP99LatencyMs: number;
+  /** AgentCore Runtime p99 Latency floor, in ms. */
+  agentCoreLatencyMs: number;
+  agentCoreErrorThreshold: number;
+  /**
+   * Concurrent AgentCore Runtime sessions above which to alarm. A cost signal
+   * (Runtime bills memory for session lifetime), not a quota one.
+   */
+  agentCoreActiveSessionThreshold: number;
+  lambdaErrorThreshold: number;
+  lambdaDurationPercentOfTimeout: number;
+  dynamoThrottleThreshold: number;
+  ecsCpuPercent: number;
+  ecsMemoryPercent: number;
+
+  promptCacheAvoidableMissThreshold: number;
+  promptCacheWastedUsdThreshold: number;
+  promptCacheSessionWastedUsdThreshold: number;
+
+  /** Percent of a model's TPM quota at which its usage alarm fires. */
+  bedrockTpmQuotaPercent: number;
+  /**
+   * Per-model TPM quotas keyed by `ModelId`. Empty creates no quota alarms at
+   * all; see OBSERVABILITY_DEFAULT_BEDROCK_TPM_QUOTAS for why there is no
+   * shippable default.
+   */
+  bedrockTpmQuotas: { [modelId: string]: number };
+
+  xraySamplingRate: number;
+  xraySamplingReservoir: number;
+  xrayInsightsNotifications: boolean;
+  /** AgentCore APPLICATION_LOGS vended delivery. Off by default: the records
+   *  carry full prompts and responses, so it is both high-volume and PII. */
+  agentCoreApplicationLogsEnabled: boolean;
+}
+
+/**
  * Load and validate configuration from CDK context
  * @param scope The CDK construct scope
  * @returns Validated AppConfig object
@@ -249,6 +644,14 @@ export interface McpIdentityConfig {
 export function loadConfig(scope: cdk.App): AppConfig {
   // Load required configuration from environment variables or context
   const projectPrefix = process.env.CDK_PROJECT_PREFIX || scope.node.tryGetContext('projectPrefix');
+  const tokenExchangeUrl =
+    process.env.CDK_TOKEN_EXCHANGE_URL
+    || scope.node.tryGetContext('tokenExchange')?.url
+    || '';
+  const tokenExchangeClientId =
+    process.env.CDK_TOKEN_EXCHANGE_CLIENT_ID
+    || scope.node.tryGetContext('tokenExchange')?.clientId
+    || '';
   const awsRegion = process.env.CDK_AWS_REGION || scope.node.tryGetContext('awsRegion');
   
   // Validate required variables
@@ -346,10 +749,32 @@ export function loadConfig(scope: cdk.App): AppConfig {
       additionalCorsOrigins: process.env.CDK_FRONTEND_CORS_ORIGINS || scope.node.tryGetContext('frontend')?.additionalCorsOrigins,
     },
     appApi: {
-      cpu: parseIntEnv(process.env.CDK_APP_API_CPU) || scope.node.tryGetContext('appApi')?.cpu,
-      memory: parseIntEnv(process.env.CDK_APP_API_MEMORY) || scope.node.tryGetContext('appApi')?.memory,
-      desiredCount: parseIntEnv(process.env.CDK_APP_API_DESIRED_COUNT) ?? scope.node.tryGetContext('appApi')?.desiredCount,
-      maxCapacity: parseIntEnv(process.env.CDK_APP_API_MAX_CAPACITY) || scope.node.tryGetContext('appApi')?.maxCapacity,
+      // Precedence for every sizing knob: env var > FLAT dotted context >
+      // nested context object.
+      //
+      // The flat form is not optional. `--context appApi.cpu=2048` — which is
+      // exactly what scripts/common/load-env.sh emits — sets the flat key
+      // context['appApi.cpu']; it does NOT build a nested { appApi: { cpu } }.
+      // Reading only the nested form accepted the operator's flag and silently
+      // ignored it, so every --context sizing override was dead. Same failure
+      // mode as the observability tunables (see OBSERVABILITY_DEFAULT_* notes).
+      //
+      // `??` rather than `||` throughout: parseIntEnv already maps '' and
+      // unparseable input to undefined, so `??` is safe, and it stops a
+      // legitimate 0 (e.g. desiredCount: 0 to park an environment) from being
+      // swallowed as falsy.
+      cpu: parseIntEnv(process.env.CDK_APP_API_CPU)
+        ?? parseIntEnv(scope.node.tryGetContext('appApi.cpu'))
+        ?? scope.node.tryGetContext('appApi')?.cpu,
+      memory: parseIntEnv(process.env.CDK_APP_API_MEMORY)
+        ?? parseIntEnv(scope.node.tryGetContext('appApi.memory'))
+        ?? scope.node.tryGetContext('appApi')?.memory,
+      desiredCount: parseIntEnv(process.env.CDK_APP_API_DESIRED_COUNT)
+        ?? parseIntEnv(scope.node.tryGetContext('appApi.desiredCount'))
+        ?? scope.node.tryGetContext('appApi')?.desiredCount,
+      maxCapacity: parseIntEnv(process.env.CDK_APP_API_MAX_CAPACITY)
+        ?? parseIntEnv(scope.node.tryGetContext('appApi.maxCapacity'))
+        ?? scope.node.tryGetContext('appApi')?.maxCapacity,
       additionalCorsOrigins: process.env.CDK_APP_API_CORS_ORIGINS || scope.node.tryGetContext('appApi')?.additionalCorsOrigins,
     },
     inferenceApi: {
@@ -373,6 +798,106 @@ export function loadConfig(scope: cdk.App): AppConfig {
         ? process.env.CDK_KB_SYNC_ENABLED !== 'false'
         : scope.node.tryGetContext('kbSync')?.enabled ?? true,
     },
+    // Managed knowledge bases (.kiro/specs/managed-kb-migration).
+    //
+    // OPT-IN, inverting the default-ON idiom used by the flags above and
+    // below, because managed storage costs ~35x legacy per GB-month. All
+    // three booleans default to FALSE and an EMPTY STRING resolves to
+    // false (Requirement 19.8): `parseBooleanEnv` returns undefined for
+    // both unset and empty — which is exactly what an unset GitHub
+    // Actions variable forwards — so the `??` chain falls through to
+    // cdk.json context and then to the `false` literal. Deliberately NOT
+    // the `X ? X !== 'false' : default` shape used by kbSync /
+    // scheduledRuns / skills: that shape reads an unset (empty-string)
+    // variable as the default, which is correct when the default is ON
+    // and catastrophic when it is OFF.
+    //
+    // Precedence, highest first:
+    //   1. CDK_MANAGED_KB_* environment variable
+    //   2. `--context managedKb.<flag>=...` from build_cdk_context_params
+    //   3. a nested `managedKb: { ... }` object in cdk.context.json
+    //   4. false
+    //
+    // Step 2 reads the FLAT dotted key on purpose. `--context a.b=c` sets
+    // context["a.b"], it does NOT build a nested object — verified
+    // empirically: with `--context probe.flag=true`,
+    // tryGetContext('probe.flag') is the string "true" while
+    // tryGetContext('probe') is undefined. So a section that reads only
+    // `tryGetContext('managedKb')?.flag` silently ignores its own
+    // --context flag, which is the state the sibling dotted flags in
+    // load-env.sh are in. Reading both keys is what makes the documented
+    // GitHub-variable → workflow → load-env → synth/deploy → config
+    // chain actually deliver a value. Do not "simplify" this away.
+    managedKb: {
+      newDefault:
+        parseBooleanEnv(process.env.CDK_MANAGED_KB_NEW_DEFAULT)
+        ?? parseBooleanEnv(scope.node.tryGetContext('managedKb.newDefault'))
+        ?? scope.node.tryGetContext('managedKb')?.newDefault
+        ?? false,
+      migrationEnabled:
+        parseBooleanEnv(process.env.CDK_MANAGED_KB_MIGRATION_ENABLED)
+        ?? parseBooleanEnv(scope.node.tryGetContext('managedKb.migrationEnabled'))
+        ?? scope.node.tryGetContext('managedKb')?.migrationEnabled
+        ?? false,
+      reconcilerArmed:
+        parseBooleanEnv(process.env.CDK_MANAGED_KB_RECONCILER_ARMED)
+        ?? parseBooleanEnv(scope.node.tryGetContext('managedKb.reconcilerArmed'))
+        ?? scope.node.tryGetContext('managedKb')?.reconcilerArmed
+        ?? false,
+      docReconcilerArmed:
+        parseBooleanEnv(process.env.CDK_MANAGED_KB_DOC_RECONCILER_ARMED)
+        ?? parseBooleanEnv(scope.node.tryGetContext('managedKb.docReconcilerArmed'))
+        ?? scope.node.tryGetContext('managedKb')?.docReconcilerArmed
+        ?? false,
+      // Byte caps in BYTES so no consumer has to guess a unit. The
+      // standard tier is deliberately below the 1 GB user-files
+      // precedent (Requirement 12.2).
+      //
+      // Same three-step precedence as the flags above, and for the same
+      // reason: step 2 reads the FLAT dotted key that
+      // `--context managedKb.perOwnerDefaultBytes=...` actually sets.
+      // Without it, load-env.sh's --context flag for these tunables
+      // would be accepted by the CLI and then silently ignored.
+      perOwnerDefaultBytes:
+        parseIntEnv(process.env.CDK_MANAGED_KB_PER_OWNER_BYTES)
+        ?? parseIntEnv(scope.node.tryGetContext('managedKb.perOwnerDefaultBytes'))
+        ?? scope.node.tryGetContext('managedKb')?.perOwnerDefaultBytes
+        ?? MANAGED_KB_DEFAULT_PER_OWNER_BYTES,
+      perOwnerElevatedBytes:
+        parseIntEnv(process.env.CDK_MANAGED_KB_PER_OWNER_ELEVATED_BYTES)
+        ?? parseIntEnv(scope.node.tryGetContext('managedKb.perOwnerElevatedBytes'))
+        ?? scope.node.tryGetContext('managedKb')?.perOwnerElevatedBytes
+        ?? MANAGED_KB_ELEVATED_PER_OWNER_BYTES,
+      perKnowledgeBaseCeilingBytes:
+        parseIntEnv(process.env.CDK_MANAGED_KB_PER_KB_CEILING_BYTES)
+        ?? parseIntEnv(scope.node.tryGetContext('managedKb.perKnowledgeBaseCeilingBytes'))
+        ?? scope.node.tryGetContext('managedKb')?.perKnowledgeBaseCeilingBytes
+        ?? MANAGED_KB_PER_KB_CEILING_BYTES,
+      retentionWindowDays:
+        parseIntEnv(process.env.CDK_MANAGED_KB_RETENTION_WINDOW_DAYS)
+        ?? parseIntEnv(scope.node.tryGetContext('managedKb.retentionWindowDays'))
+        ?? scope.node.tryGetContext('managedKb')?.retentionWindowDays
+        ?? MANAGED_KB_RETENTION_WINDOW_DAYS,
+      // Fleet-level alarm thresholds (Requirement 12.13). Same three-step
+      // precedence as everything above, INCLUDING the flat dotted read —
+      // load-env.sh emits `--context managedKb.storageAlarmGb=...` and
+      // `--context managedKb.dailyCostAlarmUsd=...`, which set the flat
+      // keys `context['managedKb.storageAlarmGb']` /
+      // `context['managedKb.dailyCostAlarmUsd']`. Omitting the dotted read
+      // makes the CLI accept those flags and then silently ignore them, so
+      // an operator who raises a threshold via context keeps the old one
+      // and only finds out when an alarm fires at the wrong number.
+      storageAlarmGb:
+        parseIntEnv(process.env.CDK_MANAGED_KB_STORAGE_ALARM_GB)
+        ?? parseIntEnv(scope.node.tryGetContext('managedKb.storageAlarmGb'))
+        ?? scope.node.tryGetContext('managedKb')?.storageAlarmGb
+        ?? 500,
+      dailyCostAlarmUsd:
+        parseIntEnv(process.env.CDK_MANAGED_KB_DAILY_COST_ALARM_USD)
+        ?? parseIntEnv(scope.node.tryGetContext('managedKb.dailyCostAlarmUsd'))
+        ?? scope.node.tryGetContext('managedKb')?.dailyCostAlarmUsd
+        ?? 100,
+    },
     scheduledRuns: {
       // Default ON with a kill switch: enabled unless explicitly disabled.
       // The workflow forwards `${{ vars.CDK_SCHEDULED_RUNS_ENABLED }}`,
@@ -383,6 +908,17 @@ export function loadConfig(scope: cdk.App): AppConfig {
       enabled: process.env.CDK_SCHEDULED_RUNS_ENABLED
         ? process.env.CDK_SCHEDULED_RUNS_ENABLED !== 'false'
         : scope.node.tryGetContext('scheduledRuns')?.enabled ?? true,
+    },
+    feedbackEvalSampling: {
+      // Default OFF, opt-in (the `fineTuning`-style deferred pattern inverted):
+      // only the literal "true" enables. Sending real conversations to an
+      // AWS-managed judge is the scoping decision the evaluations spike says to
+      // make explicitly per environment — a workflow's empty/unset variable must
+      // never make it. A `feedbackEvalSampling.enabled: true` cdk.json context
+      // also enables it.
+      enabled: process.env.CDK_FEEDBACK_EVAL_SAMPLING_ENABLED
+        ? process.env.CDK_FEEDBACK_EVAL_SAMPLING_ENABLED === 'true'
+        : scope.node.tryGetContext('feedbackEvalSampling')?.enabled ?? false,
     },
     memorySpaces: {
       // Default ON with a kill switch: Memory Spaces is a complete feature and
@@ -419,8 +955,29 @@ export function loadConfig(scope: cdk.App): AppConfig {
         ? process.env.CDK_AGENTS_API_ENABLED !== 'false'
         : scope.node.tryGetContext('agents')?.enabled ?? true,
     },
+    agentMarketplace: {
+      // Default ON with a kill switch, same empty-string-safe ternary as `agents`
+      // above: the workflow forwards an EMPTY STRING when the variable is unset, so
+      // treat empty/unset as the default (on) and only the literal "false" as off.
+      // Phase 1 ships nothing user-visible — the author submit routes and the admin
+      // Review queue / Listings pages — so it is safe on everywhere from the start.
+      enabled: process.env.CDK_AGENT_MARKETPLACE_ENABLED
+        ? process.env.CDK_AGENT_MARKETPLACE_ENABLED !== 'false'
+        : scope.node.tryGetContext('agentMarketplace')?.enabled ?? true,
+    },
     fineTuning: {
       additionalCorsOrigins: process.env.CDK_FINE_TUNING_CORS_ORIGINS || scope.node.tryGetContext('fineTuning')?.additionalCorsOrigins,
+      // Default ON with a kill switch, same empty-string-safe ternary as
+      // `agentMarketplace` above: the workflow forwards an EMPTY STRING when the
+      // variable is unset, so treat empty/unset as the default (on) and only the
+      // literal "false" as off.
+      enabled: process.env.CDK_FINE_TUNING_ENABLED
+        ? process.env.CDK_FINE_TUNING_ENABLED !== 'false'
+        : scope.node.tryGetContext('fineTuning')?.enabled ?? true,
+      defaultQuotaHours:
+        parseIntEnv(process.env.CDK_FINE_TUNING_DEFAULT_QUOTA_HOURS)
+        ?? scope.node.tryGetContext('fineTuning')?.defaultQuotaHours
+        ?? 0,
     },
     artifacts: {
       certificateArn: process.env.CDK_ARTIFACTS_CERTIFICATE_ARN || scope.node.tryGetContext('artifacts')?.certificateArn,
@@ -429,6 +986,56 @@ export function loadConfig(scope: cdk.App): AppConfig {
         .map((s) => s.trim()).filter(Boolean)
         || scope.node.tryGetContext('artifacts')?.extraFrameAncestors
         || [],
+      // Default ON with a kill switch: the recipient inbox is a complete
+      // feature and ships enabled for every deployer (opt-out, not opt-in).
+      // It shipped opt-in in 1.18.0 because the surface landed ahead of the
+      // product decision; that decision is made, so a fork should get the
+      // finished feature without having to discover a variable.
+      // The workflow forwards `${{ vars.CDK_ARTIFACT_SHARE_INBOX_ENABLED }}`,
+      // which is an EMPTY STRING when the variable is unset — so treat
+      // empty/unset as "use the default (on)" and only the literal "false"
+      // as the off switch. (Same ternary as scheduledRuns above — keep in sync.)
+      shareInboxEnabled: process.env.CDK_ARTIFACT_SHARE_INBOX_ENABLED
+        ? process.env.CDK_ARTIFACT_SHARE_INBOX_ENABLED !== 'false'
+        : scope.node.tryGetContext('artifacts')?.shareInboxEnabled ?? true,
+    },
+    browser: {
+      // Hostnames Chromium refuses to navigate to during a browser session.
+      // This is a security control: it is what stops a human in a browser
+      // takeover navigating to a system the agent must not act inside.
+      //
+      // **Deliberately empty by default.** The contents are a per-deployment
+      // policy decision, not a property of this stack — the hosts that matter
+      // to one institution mean nothing to another — so this follows the
+      // `domainName` / `corsOrigins` convention: fork-neutral in the repo,
+      // supplied per environment by the `CDK_BROWSER_URL_BLOCKLIST` GitHub
+      // Actions variable that `platform.yml` forwards. Deployments that
+      // carried the old hardcoded seed MUST set that variable; a deploy whose
+      // list comes out empty while the browser tool is grantable says so in
+      // the deploy log (see the warning below).
+      //
+      // Comma-separated in the env var. Empty/unset falls through to context
+      // and then to `[]` — the house empty-string rule, because an unset
+      // GitHub Actions variable arrives as '' and must not be distinguishable
+      // from "not configured". "Block nothing" is the default, so opting out
+      // needs no sentinel; note it leaves the RBAC grant as the only control
+      // (spec Security 3).
+      //
+      // ⚠️ Chromium's URLBlocklist matches on HOST, not on the service behind
+      // it, so a site is only as blocked as its hostname list is complete.
+      // When adding an entry, enumerate the service's aliases first — vendor
+      // host, vanity CNAME, regional and mobile hostnames — and prefer the
+      // registrable domain (`instructure.com`) over one instance, so `.test.`
+      // and `.beta.` variants are covered rather than left as side doors.
+      //
+      // ⚠️ Blocking a vendor's *sign-in* host is usually wrong: an
+      // institutional login page is exactly what an accessibility or VPAT
+      // review needs to reach, which is the use case this feature exists for.
+      // Block where it LEADS, not the doorway.
+      urlBlocklist:
+        parseListEnv(process.env.CDK_BROWSER_URL_BLOCKLIST)
+        ?? scope.node.tryGetContext('browser')?.urlBlocklist
+        ?? [],
     },
     mcpSandbox: {
       certificateArn: process.env.CDK_MCP_SANDBOX_CERTIFICATE_ARN || scope.node.tryGetContext('mcpSandbox')?.certificateArn,
@@ -458,8 +1065,151 @@ export function loadConfig(scope: cdk.App): AppConfig {
           ?? {},
       },
     },
+    gateway: {
+      // Inbound authorizer selection. Defaults to 'iam' — the authorizer is
+      // immutable after Gateway creation (the AgentCore control plane rejects
+      // an authorizerType change), so every already-deployed Gateway is
+      // AWS_IAM and the default must match that. 'jwt' applies to a *newly
+      // created* Gateway. See GatewayConfig.
+      inboundAuth:
+        (process.env.CDK_GATEWAY_INBOUND_AUTH as 'jwt' | 'iam' | undefined)
+        || scope.node.tryGetContext('gateway')?.inboundAuth
+        || 'iam',
+    },
+    // Left undefined unless a URL is configured, so the feature and every
+    // resource behind it stay absent for deployments that do not want it.
+    tokenExchange: tokenExchangeUrl
+      ? {
+          url: tokenExchangeUrl,
+          clientId: tokenExchangeClientId,
+        }
+      : undefined,
+    // Same precedence as managedKb above. The flat dotted read at step 2 is
+    // load-bearing: `--context observability.x=y` sets context['observability.x'],
+    // it does NOT build a nested object.
+    observability: {
+      alarmTopicEnabled:
+        parseBooleanEnv(process.env.CDK_OBSERVABILITY_ALARM_TOPIC_ENABLED)
+        ?? parseBooleanEnv(scope.node.tryGetContext('observability.alarmTopicEnabled'))
+        ?? scope.node.tryGetContext('observability')?.alarmTopicEnabled
+        ?? true,
+      logRetentionDays:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_LOG_RETENTION_DAYS)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.logRetentionDays'))
+        ?? scope.node.tryGetContext('observability')?.logRetentionDays
+        ?? OBSERVABILITY_DEFAULT_LOG_RETENTION_DAYS,
+      albTarget5xxThreshold:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_ALB_TARGET_5XX_THRESHOLD)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.albTarget5xxThreshold'))
+        ?? scope.node.tryGetContext('observability')?.albTarget5xxThreshold
+        ?? OBSERVABILITY_DEFAULT_ALB_TARGET_5XX_THRESHOLD,
+      albP99LatencyMs:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_ALB_P99_LATENCY_MS)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.albP99LatencyMs'))
+        ?? scope.node.tryGetContext('observability')?.albP99LatencyMs
+        ?? OBSERVABILITY_DEFAULT_P99_LATENCY_MS,
+      agentCoreLatencyMs:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_AGENTCORE_LATENCY_MS)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.agentCoreLatencyMs'))
+        ?? scope.node.tryGetContext('observability')?.agentCoreLatencyMs
+        ?? OBSERVABILITY_DEFAULT_P99_LATENCY_MS,
+      agentCoreErrorThreshold:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_AGENTCORE_ERROR_THRESHOLD)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.agentCoreErrorThreshold'))
+        ?? scope.node.tryGetContext('observability')?.agentCoreErrorThreshold
+        ?? OBSERVABILITY_DEFAULT_AGENTCORE_ERROR_THRESHOLD,
+      agentCoreActiveSessionThreshold:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_AGENTCORE_ACTIVE_SESSION_THRESHOLD)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.agentCoreActiveSessionThreshold'))
+        ?? scope.node.tryGetContext('observability')?.agentCoreActiveSessionThreshold
+        ?? OBSERVABILITY_DEFAULT_AGENTCORE_ACTIVE_SESSION_THRESHOLD,
+      lambdaErrorThreshold:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_LAMBDA_ERROR_THRESHOLD)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.lambdaErrorThreshold'))
+        ?? scope.node.tryGetContext('observability')?.lambdaErrorThreshold
+        ?? OBSERVABILITY_DEFAULT_LAMBDA_ERROR_THRESHOLD,
+      lambdaDurationPercentOfTimeout:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_LAMBDA_DURATION_PERCENT_OF_TIMEOUT)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.lambdaDurationPercentOfTimeout'))
+        ?? scope.node.tryGetContext('observability')?.lambdaDurationPercentOfTimeout
+        ?? OBSERVABILITY_DEFAULT_LAMBDA_DURATION_PERCENT_OF_TIMEOUT,
+      dynamoThrottleThreshold:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_DYNAMO_THROTTLE_THRESHOLD)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.dynamoThrottleThreshold'))
+        ?? scope.node.tryGetContext('observability')?.dynamoThrottleThreshold
+        ?? OBSERVABILITY_DEFAULT_DYNAMO_THROTTLE_THRESHOLD,
+      ecsCpuPercent:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_ECS_CPU_PERCENT)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.ecsCpuPercent'))
+        ?? scope.node.tryGetContext('observability')?.ecsCpuPercent
+        ?? OBSERVABILITY_DEFAULT_ECS_CPU_PERCENT,
+      ecsMemoryPercent:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_ECS_MEMORY_PERCENT)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.ecsMemoryPercent'))
+        ?? scope.node.tryGetContext('observability')?.ecsMemoryPercent
+        ?? OBSERVABILITY_DEFAULT_ECS_MEMORY_PERCENT,
+      promptCacheAvoidableMissThreshold:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_PROMPT_CACHE_AVOIDABLE_MISS_THRESHOLD)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.promptCacheAvoidableMissThreshold'))
+        ?? scope.node.tryGetContext('observability')?.promptCacheAvoidableMissThreshold
+        ?? OBSERVABILITY_DEFAULT_PROMPT_CACHE_AVOIDABLE_MISS_THRESHOLD,
+      promptCacheWastedUsdThreshold:
+        parseFloatEnv(process.env.CDK_OBSERVABILITY_PROMPT_CACHE_WASTED_USD_THRESHOLD)
+        ?? parseFloatEnv(scope.node.tryGetContext('observability.promptCacheWastedUsdThreshold'))
+        ?? scope.node.tryGetContext('observability')?.promptCacheWastedUsdThreshold
+        ?? OBSERVABILITY_DEFAULT_PROMPT_CACHE_WASTED_USD_THRESHOLD,
+      promptCacheSessionWastedUsdThreshold:
+        parseFloatEnv(process.env.CDK_OBSERVABILITY_PROMPT_CACHE_SESSION_WASTED_USD_THRESHOLD)
+        ?? parseFloatEnv(scope.node.tryGetContext('observability.promptCacheSessionWastedUsdThreshold'))
+        ?? scope.node.tryGetContext('observability')?.promptCacheSessionWastedUsdThreshold
+        ?? OBSERVABILITY_DEFAULT_PROMPT_CACHE_SESSION_WASTED_USD_THRESHOLD,
+      bedrockTpmQuotaPercent:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_BEDROCK_TPM_QUOTA_PERCENT)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.bedrockTpmQuotaPercent'))
+        ?? scope.node.tryGetContext('observability')?.bedrockTpmQuotaPercent
+        ?? OBSERVABILITY_DEFAULT_BEDROCK_TPM_QUOTA_PERCENT,
+      // A map, not a scalar. Reaches us as an object from nested context, or as
+      // a JSON / `k=v,k=v` string from the env var and flat context key.
+      bedrockTpmQuotas:
+        parseModelQuotaMapEnv(process.env.CDK_OBSERVABILITY_BEDROCK_TPM_QUOTAS)
+        ?? parseModelQuotaMapEnv(scope.node.tryGetContext('observability.bedrockTpmQuotas'))
+        ?? scope.node.tryGetContext('observability')?.bedrockTpmQuotas
+        ?? OBSERVABILITY_DEFAULT_BEDROCK_TPM_QUOTAS,
+      // parseFloatEnv: parseIntEnv turns 0.05 into 0, disabling sampling.
+      xraySamplingRate:
+        parseFloatEnv(process.env.CDK_OBSERVABILITY_XRAY_SAMPLING_RATE)
+        ?? parseFloatEnv(scope.node.tryGetContext('observability.xraySamplingRate'))
+        ?? scope.node.tryGetContext('observability')?.xraySamplingRate
+        ?? OBSERVABILITY_DEFAULT_XRAY_SAMPLING_RATE,
+      xraySamplingReservoir:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_XRAY_SAMPLING_RESERVOIR)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.xraySamplingReservoir'))
+        ?? scope.node.tryGetContext('observability')?.xraySamplingReservoir
+        ?? OBSERVABILITY_DEFAULT_XRAY_SAMPLING_RESERVOIR,
+      xrayInsightsNotifications:
+        parseBooleanEnv(process.env.CDK_OBSERVABILITY_XRAY_INSIGHTS_NOTIFICATIONS)
+        ?? parseBooleanEnv(scope.node.tryGetContext('observability.xrayInsightsNotifications'))
+        ?? scope.node.tryGetContext('observability')?.xrayInsightsNotifications
+        ?? false,
+      agentCoreApplicationLogsEnabled:
+        parseBooleanEnv(process.env.CDK_OBSERVABILITY_AGENTCORE_APPLICATION_LOGS_ENABLED)
+        ?? parseBooleanEnv(scope.node.tryGetContext('observability.agentCoreApplicationLogsEnabled'))
+        ?? scope.node.tryGetContext('observability')?.agentCoreApplicationLogsEnabled
+        ?? false,
+    },
     tags: {
       ...(scope.node.tryGetContext('tags') || {}),
+      // `--context tags.Environment=dev` sets the FLAT dotted key
+      // `context['tags.Environment']`; it does NOT merge into the nested `tags`
+      // object above, so a nested-only read silently ignores an operator's own
+      // flag. That trap has already bitten this repo twice (the managed-KB byte
+      // caps and then the alarm thresholds), and here it had a sharper edge: the
+      // Environment tag is a *filter* for the reconciler and for teardown, so
+      // ignoring it does not degrade cosmetically — it makes teardown match
+      // nothing and report success.
+      ...(scope.node.tryGetContext('tags.Environment')
+        ? { Environment: String(scope.node.tryGetContext('tags.Environment')) }
+        : {}),
     },
   };
 
@@ -489,11 +1239,58 @@ export function loadConfig(scope: cdk.App): AppConfig {
   console.log(`   Retain Data on Delete: ${config.retainDataOnDelete}`);
   console.log(`   Manage DNS Records: ${config.manageDnsRecords}`);
   console.log(`   App Version: ${config.appVersion}`);
+  // Printed so a deploy log shows which values actually took effect.
+  console.log(
+    `   Observability: alarmTopic=${config.observability.alarmTopicEnabled}`
+    + ` logRetentionDays=${config.observability.logRetentionDays}`
+    + ` xraySamplingRate=${config.observability.xraySamplingRate}`
+    + ` xrayReservoir=${config.observability.xraySamplingReservoir}`
+    + ` agentCoreAppLogs=${config.observability.agentCoreApplicationLogsEnabled}`
+  );
+
+  // Printed because this list is a security control supplied entirely from
+  // outside the repo: a deploy that ships an empty one has to say so, or a
+  // forgotten `CDK_BROWSER_URL_BLOCKLIST` variable is indistinguishable in
+  // the log from a deliberate "block nothing".
+  if (config.browser.urlBlocklist.length > 0) {
+    console.log(
+      `   Browser URL blocklist (${config.browser.urlBlocklist.length}): `
+      + config.browser.urlBlocklist.join(', ')
+    );
+  } else {
+    console.warn(
+      '   ⚠️  Browser URL blocklist is EMPTY — browser sessions can reach any'
+      + ' host. Set the CDK_BROWSER_URL_BLOCKLIST variable if this environment'
+      + ' is meant to block one. RBAC on browse_web / request_user_login is'
+      + ' then the only control.'
+    );
+  }
 
   // Validate configuration
   validateConfig(config);
 
   return config;
+}
+
+/**
+ * Parse a comma-separated list environment variable.
+ *
+ * Returns undefined for a missing OR empty value so that nullish coalescing
+ * (??) falls through to context defaults — the house empty-string rule. An
+ * unset GitHub Actions variable is forwarded as '', and treating that as an
+ * explicit "empty list" would let a forgotten variable silently override a
+ * configured default.
+ *
+ * @param value The environment variable value to parse
+ * @returns Trimmed, non-empty entries, or undefined if unset/empty
+ */
+export function parseListEnv(value: string | undefined): string[] | undefined {
+  if (value === undefined || value.trim() === '') {
+    return undefined;
+  }
+
+  const entries = value.split(',').map((s) => s.trim()).filter(Boolean);
+  return entries.length > 0 ? entries : undefined;
 }
 
 /**
@@ -542,6 +1339,23 @@ function parseIntEnv(value: string | undefined): number | undefined {
 }
 
 /**
+ * Parse a floating-point environment/context value.
+ *
+ * Separate from parseIntEnv because the fractional observability tunables
+ * (notably the X-Ray sampling rate) round to 0 under parseInt — "0.05" would
+ * become 0 and switch sampling off entirely rather than setting it to 5%.
+ * Returns undefined for unset/empty/invalid input so nullish coalescing can
+ * fall through to a context value or default.
+ */
+function parseFloatEnv(value: string | undefined): number | undefined {
+  if (value === undefined || value === '') {
+    return undefined;
+  }
+  const parsed = parseFloat(value);
+  return isNaN(parsed) ? undefined : parsed;
+}
+
+/**
  * Parse a JSON object of string->string from an environment variable.
  *
  * Used for structured config that can't be expressed as a scalar `--context`
@@ -572,6 +1386,73 @@ export function parseJsonRecordEnv(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Parse a per-model quota map: `ModelId` -> tokens-per-minute quota.
+ *
+ * Accepts three input shapes, because this value reaches config by three routes
+ * and only one of them can carry double quotes safely:
+ *
+ *   1. a real object — from a nested `observability` block in cdk.context.json
+ *   2. a JSON string — `{"global.anthropic.claude-sonnet-5":40000000}`
+ *   3. a compact `k=v,k=v` string — `global.anthropic.claude-sonnet-5=40000000`
+ *
+ * Form 3 exists because `deploy.sh` runs `eval npx cdk synth ${CDK_CONTEXT_PARAMS}`.
+ * Under eval the shell removes quote characters, so a JSON value passed through a
+ * `--context` flag arrives as `{model:40000000}` — no longer valid JSON. Form 3
+ * contains no quotes at all and therefore survives eval unchanged, which makes it
+ * the form to use for CI variables. load-env.sh single-quotes the value as well,
+ * so form 2 also survives, but form 3 needs nothing to go right.
+ *
+ * Malformed input returns undefined so nullish coalescing falls through to the
+ * default; individual bad entries are filtered rather than throwing. Non-finite
+ * values are rejected — a NaN threshold is accepted by CloudFormation and can
+ * never be crossed by any metric, which is a silent dead alarm.
+ */
+export function parseModelQuotaMapEnv(
+  value: unknown,
+): { [modelId: string]: number } | undefined {
+  let parsed: unknown = value;
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed === '') {
+      return undefined;
+    }
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      // Not JSON — try the eval-safe `k=v,k=v` form before giving up.
+      const pairs: { [modelId: string]: number } = {};
+      let sawOne = false;
+      for (const part of trimmed.split(',')) {
+        const eq = part.lastIndexOf('=');
+        if (eq <= 0) continue;
+        const key = part.slice(0, eq).trim();
+        const num = Number(part.slice(eq + 1).trim());
+        if (key !== '' && Number.isFinite(num)) {
+          pairs[key] = num;
+          sawOne = true;
+        }
+      }
+      return sawOne ? pairs : undefined;
+    }
+  } else if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return undefined;
+  }
+
+  const result: { [modelId: string]: number } = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (typeof k === 'string' && typeof v === 'number' && Number.isFinite(v)) {
+      result[k] = v;
+    }
+  }
+  return result;
 }
 
 /**
@@ -641,6 +1522,15 @@ function validateConfig(config: AppConfig): void {
     throw new Error(`Invalid VPC CIDR format: ${config.vpcCidr}`);
   }
 
+  // Validate Gateway inbound auth selection. A typo here would otherwise
+  // silently fall through to an unintended authorizer and 401 every Gateway
+  // call, so fail fast at synth instead.
+  if (!['jwt', 'iam'].includes(config.gateway.inboundAuth)) {
+    throw new Error(
+      `gateway.inboundAuth must be 'jwt' or 'iam'. Got: ${config.gateway.inboundAuth}`
+    );
+  }
+
   // Validate RAG Ingestion configuration (always provisioned).
   // Validate Lambda memory size (128 MB to 10240 MB)
   if (config.ragIngestion.lambdaMemorySize < 128 || config.ragIngestion.lambdaMemorySize > 10240) {
@@ -686,11 +1576,25 @@ function validateConfig(config: AppConfig): void {
     });
   }
 
-  // Validate top-level CORS origins.
-  if (!config.corsOrigins) {
-    console.warn(
-      'Warning: no CORS origins configured. ' +
-      'Set CDK_DOMAIN_NAME or CDK_CORS_ORIGINS to enable browser uploads.'
+  // Validate top-level CORS origins. Without at least one origin the uploads
+  // bucket (`FileUploadConstruct`) is created with NO CORS rule, and every
+  // browser upload fails at S3 with no server-side signal. A production-mirror
+  // load test shipped exactly that (docs/specs/load-test-assessment-2026-09.md
+  // §1 fix 4) because this used to be a console.warn lost in synth output.
+  // Fail synth instead; a deployment that genuinely has no browser front-end
+  // opts out explicitly.
+  //
+  // Gate on `buildCorsOrigins` -- the same filtered list FileUploadConstruct
+  // consumes -- not on the raw string. A value that is truthy but filters to
+  // nothing (`","` from a templated list's trailing comma, `" "` from a YAML
+  // value that quotes to a space, `"${UNSET_VAR},"` in CI) would otherwise
+  // pass the guard and still produce a bucket with no CORS rule. Pass no
+  // `additionalOrigins` here, for the same reason: the construct does not.
+  if (buildCorsOrigins(config).length === 0 && parseBooleanEnv(process.env.CDK_ALLOW_NO_CORS_ORIGINS) !== true) {
+    throw new Error(
+      'No CORS origins configured: the uploads bucket would be created without a CORS rule ' +
+      'and every browser upload would fail. Set CDK_DOMAIN_NAME (or CDK_CORS_ORIGINS), ' +
+      'or set CDK_ALLOW_NO_CORS_ORIGINS=true for a deployment with no browser front-end.'
     );
   }
 
@@ -717,6 +1621,45 @@ function validateConfig(config: AppConfig): void {
   // and the respective certificate ARNs for a real deployment. Synth and
   // tests proceed without them (constructs handle the undefined case by
   // falling back to CloudFront default domains).
+
+  // ── Observability ──
+  // CloudWatch Logs accepts only a fixed set of retention values; an arbitrary
+  // number is rejected at deploy time, long after CI has gone green.
+  const validRetentionDays = [
+    1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096,
+    1827, 2192, 2557, 2922, 3288, 3653,
+  ];
+  if (!validRetentionDays.includes(config.observability.logRetentionDays)) {
+    throw new Error(
+      `Invalid observability.logRetentionDays: ${config.observability.logRetentionDays}. ` +
+      `CloudWatch Logs accepts only: ${validRetentionDays.join(', ')}. ` +
+      `Set CDK_OBSERVABILITY_LOG_RETENTION_DAYS to one of those values.`
+    );
+  }
+
+  // A rate, not a percentage: 5 instead of 0.05 is a 100x cost error.
+  const rate = config.observability.xraySamplingRate;
+  if (rate < 0 || rate > 1) {
+    throw new Error(
+      `Invalid observability.xraySamplingRate: ${rate}. ` +
+      `Expected a rate between 0.0 and 1.0 (e.g. 0.05 for 5%), not a percentage. ` +
+      `X-Ray bills per trace recorded, so a value above 1.0 is rejected rather ` +
+      `than clamped.`
+    );
+  }
+
+  const percentFields: Array<[string, number]> = [
+    ['ecsCpuPercent', config.observability.ecsCpuPercent],
+    ['ecsMemoryPercent', config.observability.ecsMemoryPercent],
+    ['lambdaDurationPercentOfTimeout', config.observability.lambdaDurationPercentOfTimeout],
+  ];
+  for (const [name, value] of percentFields) {
+    if (value <= 0 || value > 100) {
+      throw new Error(
+        `Invalid observability.${name}: ${value}. Expected a percentage between 1 and 100.`
+      );
+    }
+  }
 }
 
 /**

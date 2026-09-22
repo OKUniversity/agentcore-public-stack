@@ -27,12 +27,11 @@ else:
     _startup_logger.warning(".env file not found at %s", env_path)
 
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 import logging
 
+from apis.inference_api.runtime_health import InvocationActivityMiddleware
 from apis.shared.middleware.agentcore_context import AgentCoreContextMiddleware
 
 # Set up logging
@@ -69,12 +68,6 @@ async def lifespan(app: FastAPI):
     if code_interpreter_id:
         logger.info(f"AgentCore Code Interpreter ID: {code_interpreter_id}")
     
-    # Log storage directories
-    upload_dir = os.getenv('UPLOAD_DIR', 'uploads')
-    output_dir_name = os.getenv('OUTPUT_DIR', 'output')
-    generated_images_dir_name = os.getenv('GENERATED_IMAGES_DIR', 'generated_images')
-    logger.info(f"Storage directories - Upload: {upload_dir}, Output: {output_dir_name}, Images: {generated_images_dir_name}")
-    
     # Log API URLs (if configured)
     frontend_url = os.getenv('FRONTEND_URL')
     if frontend_url:
@@ -85,16 +78,13 @@ async def lifespan(app: FastAPI):
     if cors_origins:
         logger.info(f"CORS Origins: {cors_origins}")
     
-    # Create output directories if they don't exist
-    base_dir = Path(__file__).parent.parent
-    output_dir = os.path.join(base_dir, "output")
-    uploads_dir = os.path.join(base_dir, "uploads")
-    generated_images_dir = os.path.join(base_dir, "generated_images")
+    # Pull the first turn's lazy imports and boto service-model loads forward
+    # to container start, off the request path. Daemon thread: /ping answers
+    # immediately and a request that arrives mid-warm-up waits on the import
+    # lock rather than redoing the work. See apis/inference_api/warmup.py.
+    from apis.inference_api.warmup import start_warmup_in_background
 
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(uploads_dir, exist_ok=True)
-    os.makedirs(generated_images_dir, exist_ok=True)
-    logger.info("Output directories ready")
+    start_warmup_in_background()
 
     yield  # Application is running
 
@@ -117,14 +107,31 @@ from apis.shared.security import register_aws_client_error_handler
 register_aws_client_error_handler(app)
 logger.info("Registered AWS ClientError handler")
 
-# Add GZip compression middleware for SSE streams
-# Compresses responses over 1KB, reducing bandwidth by 50-70%
+# Compress responses over 1KB. Despite what this block used to claim, it is
+# emphatically *not* "for SSE streams": Starlette excludes `text/event-stream`
+# from compression by content type, so on the one route this service exists to
+# serve — the `/invocations` SSE turn — it compresses nothing at all.
+#
+# What stock `GZipMiddleware` did do on that route is withhold
+# `http.response.start` until the first body chunk, because until then it can't
+# know whether it will need to set `Content-Encoding`. On an SSE turn the first
+# chunk is the model's first token, so the response headers were arriving behind
+# the agent's entire thinking time — measured locally at 2.0s of pure delay on a
+# turn that stalls 2.0s before its first event, with or without `Accept-Encoding:
+# gzip`. app-api's chat proxy reads this response's `content-type` before it can
+# open its own stream to the SPA, so that delay was propagating all the way to
+# the browser.
+#
+# `StreamSafeGZipMiddleware` keeps the compression and forwards an excluded
+# response's headers immediately; see its module docstring.
+from apis.shared.middleware.compression import StreamSafeGZipMiddleware
+
 app.add_middleware(
-    GZipMiddleware,
+    StreamSafeGZipMiddleware,
     minimum_size=1000,  # Only compress responses > 1KB
     compresslevel=6  # Balance between speed and compression ratio (1-9)
 )
-logger.info("Added GZip middleware for response compression")
+logger.info("Added gzip compression middleware (SSE and pre-encoded bodies excluded)")
 
 # Bridge AgentCore Runtime headers (WorkloadAccessToken, OAuth2CallbackUrl,
 # session ID) into BedrockAgentCoreContext so downstream code can look up
@@ -142,6 +149,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Tracks in-flight work so `GET /ping` can report `HealthyBusy` while a turn
+# is streaming and `Healthy` — with a frozen `time_of_last_update` — once the
+# container is idle, which is what arms AgentCore's idle reaper. Added last so
+# it is the outermost layer: the counter must span the whole response,
+# including GZip's framing of the SSE body, not just the handler call.
+app.add_middleware(InvocationActivityMiddleware)
+logger.info("Added AgentCore Runtime activity tracking middleware")
+
 # Import routers
 #from health.health import router as health_router
 from apis.inference_api.chat.routes import router as agentcore_router
@@ -153,26 +168,6 @@ app.include_router(voice_router)  # WebSocket voice streaming endpoint
 # Connector consent flows live on app-api now: the AgentCore Runtime data plane
 # only proxies /invocations and /ping, so user-facing /connectors/* paths can't
 # be reached through this service. See apis/app_api/connectors/routes.py.
-
-# Mount static file directories for serving generated content
-# These are created by tools (visualization, code interpreter, etc.)
-# Use parent directory (src/) as base
-base_dir = Path(__file__).parent.parent
-output_dir = os.path.join(base_dir, "output")
-uploads_dir = os.path.join(base_dir, "uploads")
-generated_images_dir = os.path.join(base_dir, "generated_images")
-
-if os.path.exists(output_dir):
-    app.mount("/output", StaticFiles(directory=output_dir), name="output")
-    logger.info(f"Mounted static files: /output -> {output_dir}")
-
-if os.path.exists(uploads_dir):
-    app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
-    logger.info(f"Mounted static files: /uploads -> {uploads_dir}")
-
-if os.path.exists(generated_images_dir):
-    app.mount("/generated_images", StaticFiles(directory=generated_images_dir), name="generated_images")
-    logger.info(f"Mounted static files: /generated_images -> {generated_images_dir}")
 
 if __name__ == "__main__":
     import uvicorn

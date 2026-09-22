@@ -11,7 +11,7 @@ import { signal } from '@angular/core';
 describe('ModelService', () => {
   let service: ModelService;
   let httpMock: HttpTestingController;
-  let mockUserSettings: { fetchSettings: ReturnType<typeof vi.fn> };
+  let mockUserSettings: { getSettings: ReturnType<typeof vi.fn> };
 
   const mockModels: ManagedModel[] = [
     { id: 'm1', modelId: 'claude-haiku', modelName: 'Claude Haiku', provider: 'bedrock', providerName: 'Anthropic', inputModalities: ['TEXT'], outputModalities: ['TEXT'], maxInputTokens: 200000, maxOutputTokens: 4096, allowedAppRoles: [], availableToRoles: [], enabled: true, inputPricePerMillionTokens: 0.25, outputPricePerMillionTokens: 1.25, knowledgeCutoffDate: null, supportsCaching: true, isDefault: false },
@@ -31,7 +31,7 @@ describe('ModelService', () => {
     });
 
     mockUserSettings = {
-      fetchSettings: vi.fn().mockResolvedValue({ defaultModelId: null }),
+      getSettings: vi.fn().mockResolvedValue({ defaultModelId: null }),
     };
 
     TestBed.configureTestingModule({
@@ -54,8 +54,80 @@ describe('ModelService', () => {
 
   afterEach(() => {
     httpMock.match(() => true);
+    // `restoreAllMocks` does not undo `stubGlobal` — without this the fake
+    // sessionStorage leaks into every later spec in the same worker.
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
     TestBed.resetTestingModule();
+  });
+
+  describe('retired inference-param overrides', () => {
+    // The drawer's Advanced form is gone (step 3 of
+    // docs/specs/customize-surface.md), but this store is sessionStorage — a tab
+    // open across the change still holds whatever the user last typed. Those
+    // values would keep riding every request with nothing in the UI to show or
+    // reset them.
+
+    async function setupWithStoredOverrides(stored: unknown) {
+      sessionStore = { inferenceParamOverrides: JSON.stringify(stored) };
+      vi.stubGlobal('sessionStorage', {
+        getItem: vi.fn((k: string) => sessionStore[k] ?? null),
+        setItem: vi.fn((k: string, v: string) => { sessionStore[k] = v; }),
+        removeItem: vi.fn((k: string) => { delete sessionStore[k]; }),
+      });
+      mockUserSettings = { getSettings: vi.fn().mockResolvedValue({ defaultModelId: null }) };
+      TestBed.configureTestingModule({
+        providers: [
+          provideHttpClient(),
+          provideHttpClientTesting(),
+          ModelService,
+          { provide: ConfigService, useValue: { appApiUrl: signal('http://localhost:8000') } },
+          { provide: UserSettingsService, useValue: mockUserSettings },
+        ],
+      });
+      service = TestBed.inject(ModelService);
+      httpMock = TestBed.inject(HttpTestingController);
+      await vi.waitFor(() => {
+        httpMock.expectOne('http://localhost:8000/models').flush(mockResponse);
+      });
+    }
+
+    it('drops sampling params that no longer have a control', async () => {
+      await setupWithStoredOverrides({
+        'claude-haiku': { temperature: 0.2, top_p: 0.9, max_tokens: 512 },
+      });
+      service.setSelectedModelById('claude-haiku');
+      expect(service.getInferenceParamOverrides()).toEqual({});
+    });
+
+    it('keeps effort, which the model picker still owns', async () => {
+      // `setEffort` writes through this same store, so a blanket purge would
+      // clear a control the user can still see and is still using.
+      await setupWithStoredOverrides({
+        'claude-haiku': { effort: 'high', temperature: 0.2 },
+        'claude-sonnet': { reasoning_effort: 'low' },
+      });
+      service.setSelectedModelById('claude-haiku');
+      expect(service.getInferenceParamOverrides()).toEqual({ effort: 'high' });
+      service.setSelectedModelById('claude-sonnet');
+      expect(service.getInferenceParamOverrides()).toEqual({ reasoning_effort: 'low' });
+    });
+
+    it('rewrites storage once rather than stripping on every read', async () => {
+      await setupWithStoredOverrides({
+        'claude-haiku': { effort: 'high', temperature: 0.2 },
+      });
+      expect(JSON.parse(sessionStore['inferenceParamOverrides'])).toEqual({
+        'claude-haiku': { effort: 'high' },
+      });
+    });
+
+    it('leaves a clean store untouched', async () => {
+      await setupWithStoredOverrides({ 'claude-haiku': { effort: 'medium' } });
+      expect(JSON.parse(sessionStore['inferenceParamOverrides'])).toEqual({
+        'claude-haiku': { effort: 'medium' },
+      });
+    });
   });
 
   describe('agent model lock', () => {
@@ -83,6 +155,97 @@ describe('ModelService', () => {
       service.lockToAgentModel('claude-haiku');
       service.clearAgentModelLock();
       expect(service.agentModelLocked()).toBe(false);
+    });
+  });
+
+  /**
+   * ⚠️ The lock races the model list, and losing that race fails silently.
+   *
+   * `lockToAgentModel` resolves the pinned id against `models()`, which arrives
+   * over HTTP. Lock first and `setSelectedModelById` finds nothing, returns
+   * false — a boolean every caller discards — and leaves the selection alone,
+   * while the lock flag still disables the picker. The result is a disabled
+   * picker showing the user's default model for an agent pinned to a different
+   * one: authoritative-looking and wrong.
+   *
+   * Nothing re-ran when the models landed, because callers' effects track the
+   * agent's model id, not the model list. Observed live in the Designer preview
+   * as "System Default" where the agent binds Claude Sonnet 5.
+   *
+   * Every other test in this file locks AFTER the flush, which is why none of
+   * them caught it.
+   */
+  describe('agent model lock applied before the model list loads', () => {
+    beforeEach(() => {
+      sessionStore = {};
+      vi.stubGlobal('sessionStorage', {
+        getItem: vi.fn((k: string) => sessionStore[k] ?? null),
+        setItem: vi.fn((k: string, v: string) => { sessionStore[k] = v; }),
+        removeItem: vi.fn((k: string) => { delete sessionStore[k]; }),
+      });
+
+      mockUserSettings = { getSettings: vi.fn().mockResolvedValue({ defaultModelId: null }) };
+
+      TestBed.configureTestingModule({
+        providers: [
+          provideHttpClient(),
+          provideHttpClientTesting(),
+          ModelService,
+          { provide: ConfigService, useValue: { appApiUrl: signal('http://localhost:8000') } },
+          { provide: UserSettingsService, useValue: mockUserSettings },
+        ],
+      });
+
+      service = TestBed.inject(ModelService);
+      httpMock = TestBed.inject(HttpTestingController);
+      // NOTE: the /models request is deliberately left in flight.
+    });
+
+    it('applies the pinned model once the list arrives', async () => {
+      service.lockToAgentModel('claude-haiku');
+
+      // Locked immediately (the picker disables), but unresolvable so far.
+      expect(service.agentModelLocked()).toBe(true);
+      expect(service.selectedModel().modelId).not.toBe('claude-haiku');
+
+      await vi.waitFor(() => {
+        httpMock.expectOne('http://localhost:8000/models').flush(mockResponse);
+      });
+      TestBed.tick();
+
+      expect(service.selectedModel().modelId).toBe('claude-haiku');
+      expect(service.agentModelLocked()).toBe(true);
+    });
+
+    it('does not resurrect a lock that was released before the list arrived', async () => {
+      service.lockToAgentModel('claude-haiku');
+      service.clearAgentModelLock();
+
+      // Spy AFTER the release so this observes only what the arriving model list
+      // triggers. Asserting on the resulting selection instead would be testing
+      // `loadModels`' default-selection ladder — which can legitimately land on
+      // the same model — rather than the lock guard we care about.
+      const select = vi.spyOn(service, 'setSelectedModelById');
+
+      await vi.waitFor(() => {
+        httpMock.expectOne('http://localhost:8000/models').flush(mockResponse);
+      });
+      TestBed.tick();
+
+      expect(service.agentModelLocked()).toBe(false);
+      expect(select).not.toHaveBeenCalled();
+    });
+
+    it('leaves an unavailable pinned model unselected rather than guessing', async () => {
+      service.lockToAgentModel('ghost-model');
+
+      await vi.waitFor(() => {
+        httpMock.expectOne('http://localhost:8000/models').flush(mockResponse);
+      });
+      TestBed.tick();
+
+      expect(service.agentModelLocked()).toBe(true);
+      expect(service.selectedModel().modelId).not.toBe('ghost-model');
     });
   });
 
@@ -123,7 +286,7 @@ describe('ModelService', () => {
       service['_selectedModel'].set(null);
       service['usingDefaultModel'].set(true);
       delete sessionStore['selectedModelId'];
-      mockUserSettings.fetchSettings.mockResolvedValueOnce({ defaultModelId: 'claude-haiku' });
+      mockUserSettings.getSettings.mockResolvedValueOnce({ defaultModelId: 'claude-haiku' });
 
       const promise = service.loadModels();
       await vi.waitFor(() => {
@@ -134,14 +297,14 @@ describe('ModelService', () => {
       // claude-haiku wins even though claude-sonnet has isDefault=true,
       // because the user's persisted preference is consulted first.
       expect(service.selectedModel().modelId).toBe('claude-haiku');
-      expect(mockUserSettings.fetchSettings).toHaveBeenCalled();
+      expect(mockUserSettings.getSettings).toHaveBeenCalled();
     });
 
     it('should fall back to admin default when user setting is null', async () => {
       service['_selectedModel'].set(null);
       service['usingDefaultModel'].set(true);
       delete sessionStore['selectedModelId'];
-      mockUserSettings.fetchSettings.mockResolvedValueOnce({ defaultModelId: null });
+      mockUserSettings.getSettings.mockResolvedValueOnce({ defaultModelId: null });
 
       const promise = service.loadModels();
       await vi.waitFor(() => {
@@ -156,7 +319,7 @@ describe('ModelService', () => {
       service['_selectedModel'].set(null);
       service['usingDefaultModel'].set(true);
       delete sessionStore['selectedModelId'];
-      mockUserSettings.fetchSettings.mockResolvedValueOnce({ defaultModelId: 'no-longer-here' });
+      mockUserSettings.getSettings.mockResolvedValueOnce({ defaultModelId: 'no-longer-here' });
 
       const promise = service.loadModels();
       await vi.waitFor(() => {

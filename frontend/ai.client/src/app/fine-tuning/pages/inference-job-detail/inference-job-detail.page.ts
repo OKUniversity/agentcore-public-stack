@@ -13,10 +13,12 @@ import { heroStopSolid } from '@ng-icons/heroicons/solid';
 import { FineTuningStateService } from '../../services/fine-tuning-state.service';
 import { StatusBadgeComponent } from '../../components/status-badge.component';
 import { TooltipDirective } from '../../../components/tooltip/tooltip.directive';
+import { parseIso } from '../../../utils/date';
+import { SpinnerComponent } from '../../../components/spinner/spinner.component';
 
 @Component({
   selector: 'app-inference-job-detail',
-  imports: [RouterLink, DatePipe, NgIcon, StatusBadgeComponent, TooltipDirective],
+  imports: [RouterLink, DatePipe, NgIcon, StatusBadgeComponent, TooltipDirective, SpinnerComponent],
   providers: [
     provideIcons({
       heroArrowLeft,
@@ -57,7 +59,7 @@ export class InferenceJobDetailPage implements OnInit {
     const job = this.state.currentInferenceJob();
     if (!job || !this.canStop(job.status)) return null;
     const start = job.transform_start_time ?? job.created_at;
-    const ms = this.now() - new Date(start).getTime();
+    const ms = this.now() - parseIso(start).getTime();
     const totalSeconds = Math.max(0, Math.floor(ms / 1000));
     return this.formatDuration(totalSeconds);
   });

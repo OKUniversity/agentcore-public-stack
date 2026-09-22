@@ -2,6 +2,7 @@ import { Component, ChangeDetectionStrategy, inject } from '@angular/core';
 import { DIALOG_DATA, DialogRef } from '@angular/cdk/dialog';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import { heroExclamationTriangle, heroXMark } from '@ng-icons/heroicons/outline';
+import { DialogDismissDirective } from '../dialog/dialog-dismiss.directive';
 
 /**
  * Data passed to the confirmation dialog.
@@ -55,7 +56,7 @@ export interface ConfirmationDialogData {
 @Component({
   selector: 'app-confirmation-dialog',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [NgIcon],
+  imports: [DialogDismissDirective, NgIcon],
   providers: [provideIcons({ heroExclamationTriangle, heroXMark })],
   host: {
     'class': 'block',
@@ -66,11 +67,12 @@ export interface ConfirmationDialogData {
     <div
       class="dialog-backdrop fixed inset-0 bg-gray-500/75 dark:bg-gray-900/80"
       aria-hidden="true"
-      (click)="onCancel()"
     ></div>
 
     <!-- Dialog Panel -->
-    <div class="fixed inset-0 z-10 flex min-h-full items-end justify-center p-4 sm:items-center sm:p-0">
+    <div class="fixed inset-0 z-10 flex min-h-full items-end justify-center p-4 sm:items-center sm:p-0"
+      appDialogDismiss
+      (dismissed)="onCancel()">
       <div
         class="dialog-panel relative transform overflow-hidden rounded-lg bg-white px-4 pt-5 pb-4 text-left shadow-xl sm:my-8 sm:w-full sm:max-w-lg sm:p-6 dark:bg-gray-800 dark:outline dark:-outline-offset-1 dark:outline-white/10"
         role="alertdialog"
@@ -83,7 +85,7 @@ export interface ConfirmationDialogData {
           <button
             type="button"
             (click)="onCancel()"
-            class="rounded-md bg-white text-gray-400 hover:text-gray-500 focus:outline-2 focus:outline-offset-2 focus:outline-indigo-600 dark:bg-gray-800 dark:hover:text-gray-300 dark:focus:outline-white"
+            class="rounded-md bg-white text-gray-400 hover:text-gray-500 focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 dark:bg-gray-800 dark:hover:text-gray-300 dark:focus:outline-white"
             aria-label="Close dialog"
           >
             <span class="sr-only">Close</span>
@@ -94,8 +96,8 @@ export interface ConfirmationDialogData {
         <!-- Icon + Content -->
         <div class="sm:flex sm:items-start">
           @if (data.destructive) {
-            <div class="mx-auto flex size-12 shrink-0 items-center justify-center rounded-full bg-red-100 sm:mx-0 sm:size-10 dark:bg-red-500/10">
-              <ng-icon name="heroExclamationTriangle" class="size-6 text-red-600 dark:text-red-400" aria-hidden="true" />
+            <div class="mx-auto flex size-12 shrink-0 items-center justify-center rounded-full bg-state-danger-100 sm:mx-0 sm:size-10 dark:bg-state-danger-500/10">
+              <ng-icon name="heroExclamationTriangle" class="size-6 text-state-danger-600 dark:text-state-danger-400" aria-hidden="true" />
             </div>
           }
           <div class="mt-3 text-center sm:mt-0 sm:text-left" [class.sm:ml-4]="data.destructive">
@@ -128,7 +130,7 @@ export interface ConfirmationDialogData {
           <button
             type="button"
             (click)="onCancel()"
-            class="mt-3 inline-flex w-full justify-center rounded-md bg-white px-3 py-2 text-sm/6 font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 sm:mt-0 sm:w-auto dark:bg-white/10 dark:text-white dark:shadow-none dark:ring-white/5 dark:hover:bg-white/20"
+            class="mt-3 inline-flex w-full justify-center rounded-2xl bg-white px-3 py-2 text-sm/6 font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 sm:mt-0 sm:w-auto dark:bg-white/10 dark:text-white dark:shadow-none dark:ring-white/5 dark:hover:bg-white/20"
           >
             {{ data.cancelText || 'Cancel' }}
           </button>
@@ -137,9 +139,8 @@ export interface ConfirmationDialogData {
     </div>
   `,
   styles: `
-    @import "tailwindcss";
+    @reference "../../../styles/theme.css";
 
-    @custom-variant dark (&:where(.dark, .dark *));
 
     /* Backdrop fade-in animation */
     .dialog-backdrop {
@@ -181,13 +182,13 @@ export class ConfirmationDialogComponent {
    * this is a destructive action or not.
    */
   protected get confirmButtonClass(): string {
-    const baseClasses = 'inline-flex w-full justify-center rounded-md px-3 py-2 text-sm/6 font-semibold text-white shadow-xs sm:ml-3 sm:w-auto';
+    const baseClasses = 'inline-flex w-full justify-center rounded-2xl px-3 py-2 text-sm/6 font-semibold text-white shadow-xs sm:ml-3 sm:w-auto';
 
     if (this.data.destructive) {
-      return `${baseClasses} bg-red-600 hover:bg-red-500 dark:bg-red-500 dark:shadow-none dark:hover:bg-red-400`;
+      return `${baseClasses} bg-state-danger-600 hover:bg-state-danger-500 dark:bg-state-danger-500 dark:shadow-none dark:hover:bg-state-danger-400`;
     }
 
-    return `${baseClasses} bg-primary-600 hover:bg-primary-500 dark:bg-primary-500 dark:shadow-none dark:hover:bg-primary-400`;
+    return `${baseClasses} bg-primary-accessible hover:brightness-95 dark:shadow-none`;
   }
 
   /**
@@ -206,3 +207,4 @@ export class ConfirmationDialogComponent {
     this.dialogRef.close(false);
   }
 }
+

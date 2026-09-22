@@ -99,8 +99,44 @@ export interface ContentBlock {
   document?: Record<string, unknown> | null;
   /** Reasoning content (if type is reasoningContent) - extended thinking from Claude 3.7+, GPT, etc. */
   reasoningContent?: ReasoningContentData | null;
+  /**
+   * How long the model spent on this reasoning block, in ms — the "Thought for
+   * 17s" readout on its header.
+   *
+   * Sits here rather than inside `reasoningContent` on purpose: that nested
+   * object is Bedrock's Converse shape, and a display-only number belongs
+   * outside it (the same reason `tool_group_summary` is kept off the content
+   * blocks — see CLAUDE.md).
+   *
+   * Live-only by construction. Only the stream parser sets it; `GET /messages`
+   * never does, so a reloaded conversation falls back to the plain "Thinking"
+   * header rather than showing a duration nobody measured. Same posture as the
+   * tool rail's durations.
+   */
+  reasoningDurationMs?: number;
   /** File attachment metadata (if type is fileAttachment) - for displaying file badges in user messages */
   fileAttachment?: FileAttachmentData | null;
+}
+
+/** Implicit signals (docs/specs/response-feedback.md §10): a closed enum, never summed with thumbs. */
+export type ImplicitSignalKind = 'copy' | 'continue';
+
+/** Reason codes a thumbs-down may carry — the six buckets of
+ * docs/specs/response-feedback.md §6. A closed enum, never free text. */
+export type FeedbackReason = 'wrong' | 'instructions' | 'length' | 'tool_failed' | 'outdated' | 'other';
+
+/**
+ * A user's thumb on an assistant message. Persisted content-free on the
+ * sessions-metadata table beside the message's cost row and merged onto
+ * `metadata.feedback` by `GET /sessions/{id}/messages`.
+ */
+export interface MessageFeedback {
+  /** +1 thumbs up, -1 thumbs down */
+  value: 1 | -1;
+  reason?: FeedbackReason;
+  /** Index of the user message sent as a retry-with-correction after this thumb. */
+  retryMessageId?: number;
+  updatedAt: string;
 }
 
 /**
@@ -120,6 +156,17 @@ export interface Message {
   metadata?: Record<string, unknown> | null;
   /** RAG citations from knowledge base retrieval (assistant messages only) */
   citations?: Citation[];
+  /**
+   * True for a follow-up the user sent **while this turn was still running**,
+   * which the backend injected at a tool boundary (see
+   * docs/specs/mid-turn-steering.md).
+   *
+   * It is a real user message and renders as one, but it is not the start of a
+   * turn — the turn it interrupted is still the turn in progress. Turn grouping
+   * in the message list keys off this so a steer does not split one response
+   * into two groups (and does not move the scroll reserve mid-stream).
+   */
+  steering?: boolean;
 }
 
 // ============================================================================

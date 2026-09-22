@@ -11,11 +11,11 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from apis.shared.timestamps import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -137,8 +137,8 @@ class OAuthProvider:
     # and an export target (e.g. a combined-scope Drive connector). Validated
     # in the admin route for the same reason as above.
     export_target_adapter_id: Optional[str] = None
-    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat() + "Z")
-    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat() + "Z")
+    created_at: str = field(default_factory=utc_now_iso)
+    updated_at: str = field(default_factory=utc_now_iso)
 
     @property
     def scopes_hash(self) -> str:
@@ -188,8 +188,8 @@ class OAuthProvider:
             custom_parameters=item.get("customParameters"),
             file_source_adapter_id=item.get("fileSourceAdapterId"),
             export_target_adapter_id=item.get("exportTargetAdapterId"),
-            created_at=item.get("createdAt", datetime.now(timezone.utc).isoformat() + "Z"),
-            updated_at=item.get("updatedAt", datetime.now(timezone.utc).isoformat() + "Z"),
+            created_at=item.get("createdAt", utc_now_iso()),
+            updated_at=item.get("updatedAt", utc_now_iso()),
         )
 
 
@@ -365,6 +365,18 @@ class OAuthRequiredEvent(BaseModel):
     consent popup at `authorizationUrl`, and on completion POSTs an
     interrupt response carrying `interruptId` back to `/invocations`. The
     backend resumes the same turn — no retype, no replay.
+
+    `interruptId` is omitted for the *pre-flight* flavor, emitted when an
+    OAuth-gated MCP server refused `tools/list` and the tool never made it
+    into the registry (see `ExternalMCPIntegration._recover_oauth_preflight`).
+    There is no paused turn to resume in that case — the turn ran to
+    completion without the tool — so the frontend must show the Connect
+    affordance without auto-resuming. Sending a synthetic id instead would
+    be worse than omitting it: the resume guard in
+    `inference_api/chat/routes.py` rejects unknown ids with a 400, so the
+    user would complete consent and then be shown an error. The SPA already
+    guards its resume call on `request.interruptId` being present, and
+    dedupes concurrent prompts by `providerId`.
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -372,7 +384,7 @@ class OAuthRequiredEvent(BaseModel):
     type: str = "oauth_required"
     provider_id: str = Field(..., alias="providerId")
     authorization_url: str = Field(..., alias="authorizationUrl")
-    interrupt_id: str = Field(..., alias="interruptId")
+    interrupt_id: Optional[str] = Field(None, alias="interruptId")
 
     def to_sse_format(self) -> str:
         import json

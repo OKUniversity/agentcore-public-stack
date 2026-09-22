@@ -1,0 +1,424 @@
+"""Agent Marketplace Phase 1 — the listing state machine and the sparse directory key.
+
+Pure functions over the ``listing`` block on an Agent record. No I/O: the repository
+layer (``listing_repository``) turns a validated target state into a DynamoDB write, and
+the service layer (``agent_designer.services.listing_service``) owns the authorization
+and disclosure rules. Keeping the machine pure is what makes every transition — legal
+and illegal — cheap to test.
+
+Two invariants live here, and both are load-bearing:
+
+1. **Publication is an explicit forward act** (spec D3). A record with no ``listing``
+   block has never been submitted, and no amount of ``visibility == "PUBLIC"`` creates
+   one. ``visibility`` is the access gate; ``listing.state`` is the publication state.
+   They are separate axes and this module never reads the former.
+2. **The directory index is written only while published** (spec Data model). ``gsi5_keys``
+   returns keys for exactly one state, so unpublication is enforced by physics rather
+   than by a filter someone can forget: no key, so the browse query cannot return it.
+
+   Version snapshots extend that physics one level. The keys are now written on the
+   published ``VERSION#`` row rather than on the Agent row, so the index cannot return
+   *draft content* either — not because a reader checks, but because the draft has no row
+   in the index. ``gsi5_keys`` is unchanged and still the single derivation; only its
+   caller moved (``version_repository.set_version_index``).
+"""
+
+from typing import Dict, Optional, Set, Tuple
+
+# ── Categories (spec D10) ────────────────────────────────────────────────────────────
+# Phase 1 validates ``listing.category`` against this constant set. Phase 2 replaces the
+# source with admin-managed ``AGENT_CATEGORIES`` records (the ``UserMenuLink`` precedent:
+# a fixed partition, per-item records with an explicit ``order``). The stored shape does
+# NOT change — ``listing.category`` is a category id string either way — so that swap is
+# a source change with no data migration.
+#
+# D10 is explicit that categories must not stay a build-time constant ("a category set
+# that requires a deploy to change will not be maintained"). This is a one-phase
+# expedient while nothing is user-visible, not the end state.
+DEFAULT_CATEGORIES: Tuple[str, ...] = (
+    "Administration",
+    "Teaching",
+    "Research",
+    "Student Support",
+    "IT & Operations",
+    "Communications",
+)
+
+# ── States (spec D2) ─────────────────────────────────────────────────────────────────
+LISTING_STATES: Tuple[str, ...] = (
+    "private",
+    "in_review",
+    "published",
+    "changes_requested",
+    "taken_down",
+    "withdrawal_requested",
+    "rejected",
+)
+
+# The transition table. ``None`` is the pre-state of a record that has never been
+# submitted (no ``listing`` block at all) — the D3 backfill default.
+#
+# Each edge and the actor that walks it:
+#
+#   None              → in_review          author submits for the first time
+#   private           → in_review          author submits
+#   changes_requested → in_review          author resubmits after addressing the note
+#   taken_down        → in_review          author resubmits after addressing the takedown
+#                                          (the takedown dialog promises exactly this)
+#   published         → in_review          author submits an UPDATE to a live listing
+#   in_review         → published          admin approves — or the author cancels an update,
+#                                          which returns the record to what was already serving
+#   in_review         → changes_requested  admin requests changes, with a reason — or the author
+#                                          cancels an update submitted while one was outstanding
+#   in_review         → rejected           admin declines it for the store, with a reason
+#   rejected          → in_review          author revises and submits again
+#   rejected          → private            author shelves a declined agent (so it can be deleted)
+#   published         → taken_down         admin delists, with a reason
+#   published         → changes_requested  admin requests changes on a live listing
+#   taken_down        → changes_requested  admin annotates an already-delisted listing
+#   in_review         → private            author withdraws a pending submission
+#   changes_requested → private            author withdraws one that was never live
+#   taken_down        → private            author shelves a delisted agent (so it can be
+#                                          deleted — see below)
+#   published         → withdrawal_requested author ASKS to pull a live listing
+#   changes_requested → withdrawal_requested author ASKS to pull one that is *still* live
+#   withdrawal_requested → changes_requested admin declines; it goes back where it came from
+#   withdrawal_requested → private          admin grants the withdrawal
+#   withdrawal_requested → published        admin declines; the listing stays live
+#   withdrawal_requested → taken_down       admin pulls it outright instead
+#
+# Deliberately absent: anything → published other than from in_review or
+# withdrawal_requested. Approval is the only door *into* the store, so a bug elsewhere
+# cannot publish by accident; declining a withdrawal is not a new publication, it is a
+# refusal to unpublish, and neither is cancelling an update — both return a record to a
+# version the store never stopped serving.
+#
+# ⚠️ ``published → private`` is deliberately GONE. An author could previously pull a live
+# listing unilaterally, with no admin ever seeing it — the D2 review queue makes
+# publication stop for a human, and unpublication should not be a side door around that.
+# Withdrawal is now a request an admin acts on (see §5.1 of the version-snapshots spec).
+# The edges an author still owns alone are the ones where nothing is on the shelf:
+# ``private → in_review``, withdrawing a *pending* submission
+# (``in_review``/``changes_requested`` → ``private``), and shelving one an admin has already
+# pulled (``taken_down → private``). None of them removes anything users can currently see.
+#
+# ⚠️ ``taken_down → private`` was absent, and its absence was load-bearing for nothing.
+# The stated reason was audit: the takedown record (``review_note``/``reviewed_by``/
+# ``reviewed_at``) lives on the listing block itself, so letting an author reach ``private``
+# lets them reach ``delete_assistant`` — which is refused for every state *except* ``private``
+# — and take the record with them.
+#
+# That protection never held. ``taken_down → in_review → private`` was always walkable by the
+# author alone (``submit_listing`` then ``withdraw_listing``: after a takedown
+# ``published_version`` is cleared, so ``is_on_shelf`` is False and the withdrawal resolves to
+# ``private`` immediately rather than to a request). The record was already erasable in three
+# author-only steps; all the missing edge bought was that the middle step posted a submission
+# to the D2 review queue that the author intended to withdraw a moment later. It taxed admins
+# to protect nothing.
+#
+# So the edge is added and the audit question is named honestly rather than half-defended: if
+# a takedown record must outlive the Agent, it needs a row that is not the Agent's own listing
+# block, and no arrangement of this table can supply that. What the delete guard actually
+# earns — and still earns — is that nothing *live or pending* is ever deleted out from under
+# the store: ``published``, ``withdrawal_requested`` and ``in_review`` all still refuse, so
+# unpublication stays an explicit act rather than a side effect of a delete.
+#
+# The edge is safe in the direction that matters. ``private`` is already an author target, and
+# ``is_on_shelf`` hardcodes ``taken_down`` to False, so this can never route to
+# ``withdrawal_requested`` and can never pull something off a shelf it is not on. Getting back
+# *into* the store is unchanged: ``private → in_review → published``, approval still the only
+# door.
+#
+# ⚠️ ``published → in_review`` is how an author ships an UPDATE, and its absence used to make
+# a published listing a dead end. Version snapshots mean an author's edits land on the draft
+# and reach nobody until a new version is approved, so the only way to get a fix in front of
+# users is to submit again — and from ``published`` there was no edge to submit along. The
+# author's alternatives were to request withdrawal (taking their own listing off the shelf to
+# fix a typo) or to wait for an admin to send it back with ``request_changes``. Neither is a
+# thing a working author should have to do, and the second one isn't even theirs to start.
+#
+# This is not a second door into the store. Submitting an update leaves ``published_version``
+# and its index key exactly where they are (``submit_listing``), so the previously approved
+# snapshot keeps serving; approval of the new one is still the only thing that changes what
+# users get. What it does open is the reverse edge — see ``author_cancel_target``.
+#
+# ⚠️ ``rejected`` is the answer to a submission that should not be in the store *at all*,
+# and it exists because the only two decisions before it were "approve" and "request
+# changes". An admin who thought a submission did not belong had to either publish it or
+# say "fix this" — which promises a review they do not intend to give, leaves the author
+# revising toward an approval that is not coming, and leaves the admin re-reading the same
+# submission every time it comes back.
+#
+# **The difference from ``changes_requested`` is intent, not mechanics, and that is
+# deliberate.** Both carry a required reason and both let the author come back
+# (``rejected → in_review``). What differs is what the author is told: "I want this, fix
+# X" versus "this is not a fit, here is why". Making the second one *terminal* was the
+# alternative and it is a much bigger hammer — it needs an appeal path, an admin escape
+# hatch, and a policy about who may grant one. None of that is worth building before
+# someone needs it, and an honest "no" that the author can answer is worth having now.
+#
+# It is not a door into the store and cannot become one: the only way back is
+# ``in_review``, so approval is still the single edge that publishes. ``rejected → private``
+# is the author shelving it, which is what makes it deletable — the same exit
+# ``taken_down`` has, for the same reason.
+#
+# ⚠️ It must also be in ``is_on_shelf``'s never-listed set. A rejected listing has no
+# ``published_version`` to clear (it was never published), so a stale pointer is not the
+# risk; the risk is the *other* direction — without it, a rejected agent that somehow
+# carried a pointer would read as on-the-shelf and route a withdrawal into an admin queue
+# for something no user can see.
+#
+# ⚠️ ``changes_requested`` covers two different listings — one that was never published, and
+# one that *was* and is still serving while the author revises it (``review_listing``
+# deliberately does not unpublish). Only the first may walk ``→ private`` alone; the second
+# has to go through a request, which is why this row carries both exits and
+# ``withdraw_listing`` picks between them with ``is_on_shelf`` rather than by state name.
+#
+# The reason that is safe — and it is the whole reason ``AgentListing.withdrawal_from``
+# exists — is that declining a withdrawal returns the listing to the state it came *from*,
+# not to a hardcoded ``published``. So ``in_review → changes_requested →
+# withdrawal_requested → published`` is not reachable: a listing that entered
+# ``withdrawal_requested`` from ``changes_requested`` can only go back to
+# ``changes_requested``. Approval remains the only door into the store, and
+# ``test_approval_is_the_only_door_into_the_store`` asserts exactly that.
+ALLOWED_TRANSITIONS: Dict[Optional[str], Set[str]] = {
+    None: {"in_review"},
+    "private": {"in_review"},
+    "in_review": {"published", "changes_requested", "private", "rejected"},
+    "changes_requested": {"in_review", "private", "withdrawal_requested"},
+    "published": {"in_review", "taken_down", "changes_requested", "withdrawal_requested"},
+    "taken_down": {"in_review", "changes_requested", "private"},
+    "withdrawal_requested": {"private", "published", "changes_requested", "taken_down"},
+    "rejected": {"in_review", "private"},
+}
+
+# States a submission can be made *from* while the listing is already on the shelf — and
+# therefore the states cancelling that submission can return it to.
+#
+# ``published`` is the ordinary update. ``changes_requested`` is the one that is easy to
+# forget: an admin who requests changes on a live listing deliberately does not unpublish it
+# (``review_listing``), so that author is also updating something users can currently see.
+UPDATE_ORIGIN_STATES: Set[str] = {"published", "changes_requested"}
+
+# States an author may drive. Everything else is the reviewer's (``require_admin``).
+#
+# ⚠️ This set was **dead** until the withdrawal work — declared and never read, so the
+# comment above was aspirational rather than enforced. ``assert_author_target`` now uses it,
+# because "an author cannot pull a live listing" deserves a real gate and not just an absent
+# edge in the table. Both checks run on the author path: the table says the move is legal at
+# all, this says the author is allowed to be the one making it.
+#
+# ⚠️ ``published`` and ``changes_requested`` stay out even though an author cancelling an
+# update lands on one of them. Widening this set would be the wrong fix by a mile: from
+# ``in_review`` the author would then be able to walk their *own first submission* to
+# ``published``. That act is narrow, has its own gate, and derives its target from the
+# recorded origin rather than accepting one — see ``author_cancel_target``.
+AUTHOR_TARGET_STATES: Set[str] = {"in_review", "private", "withdrawal_requested"}
+
+# Listing states whose Agent is live in the store.
+#
+# **Not the same question as ``state == "published"``, and the difference is the point of
+# ``withdrawal_requested``.** A pending withdrawal request leaves the listing serving: the
+# author has *asked* to pull it, an admin has not yet agreed, and dropping it off the shelf
+# the moment they asked would hand the author exactly the unilateral delisting this state
+# exists to prevent. So the store index stays written, and a declined request needs no
+# repair.
+LISTED_STATES: Set[str] = {"published", "withdrawal_requested"}
+
+# Listing states waiting on an admin decision — what the Review queue shows and what the
+# nav badge counts. §5.1 puts withdrawal requests in the *existing* queue rather than a
+# second surface, on the grounds that a queue an admin has to remember to check is a queue
+# that grows.
+PENDING_DECISION_STATES: Set[str] = {"in_review", "withdrawal_requested"}
+
+
+class ListingTransitionError(ValueError):
+    """An attempted listing state change that the machine does not allow."""
+
+    def __init__(self, current: Optional[str], target: str, message: Optional[str] = None):
+        self.current = current
+        self.target = target
+        super().__init__(message or self._default_message(current, target))
+
+    @staticmethod
+    def _default_message(current: Optional[str], target: str) -> str:
+        if target not in LISTING_STATES:
+            return (
+                f"Unknown listing state '{target}'. Expected one of: "
+                f"{', '.join(LISTING_STATES)}."
+            )
+        if current is None:
+            return (
+                f"This agent has never been submitted, so it cannot move to '{target}'. "
+                "Submit it for review first."
+            )
+        allowed = ALLOWED_TRANSITIONS.get(current, set())
+        allowed_text = ", ".join(sorted(allowed)) if allowed else "nothing"
+        return (
+            f"Cannot move a listing from '{current}' to '{target}'. "
+            f"From '{current}' the allowed next states are: {allowed_text}."
+        )
+
+
+def assert_transition(current: Optional[str], target: str) -> None:
+    """Raise ``ListingTransitionError`` unless ``current → target`` is a legal edge.
+
+    ``current`` is ``None`` for a record with no ``listing`` block (never submitted).
+    """
+    if target not in LISTING_STATES:
+        raise ListingTransitionError(current, target)
+    if current is not None and current not in LISTING_STATES:
+        # A state written by newer code that this deployment does not know. Refuse rather
+        # than guess — the record is the source of truth and a wrong guess could publish.
+        raise ListingTransitionError(
+            current,
+            target,
+            f"This agent's listing is in an unrecognized state '{current}'. "
+            "It may have been changed by a newer version; reload before retrying.",
+        )
+    if target not in ALLOWED_TRANSITIONS.get(current, set()):
+        raise ListingTransitionError(current, target)
+
+
+class ListingAuthorityError(ValueError):
+    """An author attempted a transition that belongs to a reviewer."""
+
+
+def assert_author_target(target: str) -> None:
+    """Raise unless ``target`` is a state an author may drive themselves.
+
+    Separate from ``assert_transition`` because they answer different questions, and
+    collapsing them would lose the useful error. The table says whether the move is legal at
+    all; this says whether the *author* gets to make it. ``published → private`` is now
+    illegal for everyone (it is not in the table), while ``withdrawal_requested → private``
+    is legal but an admin's alone.
+    """
+    if target not in AUTHOR_TARGET_STATES:
+        raise ListingAuthorityError(
+            f"Moving a listing to '{target}' is a reviewer's decision, not the author's."
+        )
+
+
+def author_cancel_target(submitted_from: Optional[str]) -> str:
+    """Where cancelling a pending *update* puts the listing back, or raise.
+
+    An author with a live listing who submits an update and then changes their mind is doing
+    something the ordinary withdraw path gets badly wrong: it reads "there is something on
+    the shelf" and turns their cancellation into a ``withdrawal_requested`` — a request to
+    pull the whole listing, sitting in an admin's queue, when all they wanted was to take
+    back an edit. So cancelling an update is its own act, and this is where its target comes
+    from.
+
+    **Returns the target rather than checking one.** The caller has no business choosing
+    here: the only safe answer is the state the submission came *from*, and a function that
+    validated a proposed target would let a caller propose ``published`` for a listing that
+    was in ``changes_requested`` — silently discarding an outstanding change request, and
+    publishing something no admin approved. That is the identical trap ``withdrawal_from``
+    exists to close on the withdrawal path (see ``ALLOWED_TRANSITIONS``), so it is closed the
+    same way: record the origin on the way in, and read it on the way out.
+
+    ``in_review → published`` is not a door into the store here for the same reason declining
+    a withdrawal isn't: the listing never left. ``submit_listing`` leaves ``published_version``
+    and its index key untouched, so this returns the record to what the store was already
+    serving. Approval remains the only edge that *changes* what users get.
+
+    ⚠️ Raising when ``submitted_from`` is absent is load-bearing, not defensive. Absent means
+    "this submission was not an update to a live listing" — a first submission, or one from
+    ``private``/``taken_down`` — and those cancel to ``private`` down the ordinary path. If
+    this ever answered a default instead, a first-time submission could walk itself into
+    ``published`` without a reviewer, which is the one thing the machine must never allow.
+    """
+    if submitted_from is None:
+        raise ListingAuthorityError(
+            "This submission is not an update to a live listing, so there is nothing to "
+            "return it to. Withdraw it instead."
+        )
+    if submitted_from not in UPDATE_ORIGIN_STATES:
+        raise ListingAuthorityError(
+            f"A submission from '{submitted_from}' is not an update to a live listing; "
+            "cancelling it cannot put it back there."
+        )
+    return submitted_from
+
+
+def is_published(state: Optional[str]) -> bool:
+    """Whether a listing state is exactly ``published``.
+
+    ⚠️ Usually **not** the question you want — see ``is_listed``. This is the narrow test
+    for "approved and not under any pending request", and the only callers that should use
+    it are ones deciding something about the approval itself.
+    """
+    return state == "published"
+
+
+def is_listed(state: Optional[str]) -> bool:
+    """Whether a listing state means "live in the store" (see ``LISTED_STATES``).
+
+    True for ``withdrawal_requested`` as well as ``published``, because a requested
+    withdrawal is not a granted one.
+
+    ⚠️ **State-only, and therefore incomplete for "is this on the shelf right now?"** — use
+    ``is_on_shelf`` for that. ``changes_requested`` is not in ``LISTED_STATES``, but a
+    *published* listing that an admin sends back for changes deliberately keeps serving its
+    approved version (``review_listing`` does not unpublish; a takedown is the operation
+    that pulls something down). Such a listing is in ``changes_requested`` **and** in the
+    store, so this predicate answers ``False`` about an Agent users can still see.
+
+    Kept as-is rather than widened because two callers genuinely want the state alone:
+    ``gsi5_keys``, which derives the index key at the moment of promotion, and the D13
+    "does an admin edit need a new version" test.
+    """
+    return state in LISTED_STATES
+
+
+def is_on_shelf(state: Optional[str], published_version: Optional[int]) -> bool:
+    """Whether this listing is in the store *right now* — the fact, not the state name.
+
+    ``published_version`` is the record of which snapshot carries the sparse index key, and
+    every path that takes an Agent off the shelf clears it in the same breath as the key
+    (``takedown_listing``, a granted withdrawal, a pre-publication withdraw). So the pointer
+    being set is the same statement as "a version of this is queryable in the store" — which
+    is the physics ``version_repository.set_version_index`` describes, asked as a question.
+
+    Prefer this over ``is_listed`` anywhere the answer changes what a *user* can do. The
+    case that forced it: an admin requesting changes on a live listing leaves it serving,
+    but moves it to ``changes_requested``. Asked by state alone, ``withdraw_listing`` then
+    reads that listing as not-live and sends the author straight to ``private`` — pulling a
+    listing users can currently see, with no admin ever deciding. That is exactly the
+    unilateral delisting ``withdrawal_requested`` exists to prevent, reached through the one
+    state nobody thought to check.
+
+    ``state`` is still consulted so a cleared-but-stale pointer cannot resurrect something:
+    ``private`` and ``taken_down`` are never on the shelf whatever the pointer says.
+    """
+    if state in ("private", "taken_down", "rejected", None):
+        return False
+    return published_version is not None
+
+
+def gsi5_keys(state: Optional[str], category: Optional[str], created_at: str) -> Optional[Dict[str, str]]:
+    """The sparse ``AgentDirectoryIndex`` (GSI5) key pair, or ``None`` when unlisted.
+
+    ``GSI5_PK = LISTED#{category}`` / ``GSI5_SK = CREATED#{created_at}``, written **only**
+    while the listing is live (``is_listed`` — ``published`` or ``withdrawal_requested``) —
+    the ``DueSyncIndex`` precedent on this same table.
+
+    Returning ``None`` is the caller's signal to REMOVE both attributes, not to skip the
+    write: leaving a stale key behind would keep a delisted agent queryable in the store,
+    which is the exact failure the sparse index exists to prevent.
+
+    ``created_at`` makes browse newest-first. A popularity sort would need a mutable sort
+    key (a hot-item rewrite per use) and is deferred, not approximated — the store front
+    is the manual ranking lever instead.
+    """
+    if not is_listed(state):
+        return None
+    if not category:
+        # Defensive: a listed agent with no category has no shelf to sit on. The service
+        # validates category at submit and at admin PATCH, so this is a can't-happen that
+        # we refuse to paper over with a "LISTED#None" partition.
+        raise ValueError("A listed agent must carry a category.")
+    return {
+        "GSI5_PK": f"LISTED#{category}",
+        "GSI5_SK": f"CREATED#{created_at}",
+    }

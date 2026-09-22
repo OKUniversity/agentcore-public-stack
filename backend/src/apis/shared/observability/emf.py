@@ -42,6 +42,8 @@ def emit_prompt_cache_metrics(
     model_id: Optional[str] = None,
     session_id: Optional[str] = None,
     cache_status: Optional[str] = None,
+    agent_switched: bool = False,
+    partial_miss: bool = False,
 ) -> None:
     """Emit one EMF record for a completed model call.
 
@@ -52,7 +54,24 @@ def emit_prompt_cache_metrics(
       ratio is the cache-efficiency dashboard line.
     - ``AvoidableMiss``: count of calls classified ``miss_avoidable`` — the
       alarm target (a prefix-stability regression shows up as a step change).
-    - ``WastedUsd``: dollars attributed to avoidable re-writes.
+    - ``PartialMiss``: count of calls classified ``partial_miss`` — a leading
+      segment hit while the rest of the prefix was re-written against a live
+      entry. Its own metric rather than a roll-in to ``AvoidableMiss`` so the
+      existing alarm keeps its meaning and the two failure shapes (cold prefix
+      vs. sliver-hit prefix) stay separable.
+    - ``PartialMissUsd``: the subset of ``WastedUsd`` that ``PartialMiss``
+      calls contributed.
+    - ``WastedUsd``: dollars attributed to re-writes of already-cached prefix
+      bytes — ``miss_avoidable`` **and** ``partial_miss``, since the dollars
+      are identical and the north-star waste metric wants them together.
+    - ``AgentSwitchMiss``: the subset of ``AvoidableMiss`` explained by the turn
+      running on a different Agent than the one before it — an ``@``-mention
+      (Marketplace D11) genuinely re-writes the prefix. Emitted as its own metric
+      rather than as a dimension on ``AvoidableMiss`` so the alarm target stays a
+      single fleet-wide sum: subtract it to get unexplained waste, which is the
+      number that should never step-change. `turnAgentId` rides along as a
+      property, not a dimension, so per-Agent detail is queryable without
+      multiplying metric streams.
 
     Best-effort: never raises.
     """
@@ -68,7 +87,10 @@ def emit_prompt_cache_metrics(
                             {"Name": "CacheReadTokens", "Unit": "Count"},
                             {"Name": "CacheWriteTokens", "Unit": "Count"},
                             {"Name": "AvoidableMiss", "Unit": "Count"},
+                            {"Name": "PartialMiss", "Unit": "Count"},
+                            {"Name": "AgentSwitchMiss", "Unit": "Count"},
                             {"Name": "WastedUsd", "Unit": "None"},
+                            {"Name": "PartialMissUsd", "Unit": "None"},
                         ],
                     }
                 ],
@@ -76,7 +98,10 @@ def emit_prompt_cache_metrics(
             "CacheReadTokens": int(cache_read_tokens or 0),
             "CacheWriteTokens": int(cache_write_tokens or 0),
             "AvoidableMiss": 1 if avoidable_miss else 0,
+            "PartialMiss": 1 if partial_miss else 0,
+            "AgentSwitchMiss": 1 if (avoidable_miss and agent_switched) else 0,
             "WastedUsd": round(float(wasted_usd or 0.0), 6),
+            "PartialMissUsd": round(float(wasted_usd or 0.0), 6) if partial_miss else 0.0,
         }
         if model_id:
             record["modelId"] = model_id
@@ -87,3 +112,101 @@ def emit_prompt_cache_metrics(
         _emf_logger.info(json.dumps(record, separators=(",", ":")))
     except Exception as e:  # noqa: BLE001 - metrics must never break a request
         logger.debug("EMF emission skipped: %s", e)
+
+
+def emit_emf_metrics(
+    namespace: str,
+    metrics: dict,
+    properties: Optional[dict] = None,
+    units: Optional[dict] = None,
+) -> None:
+    """Emit one EMF record into ``namespace``. Never raises.
+
+    The generic form of the two functions above, for callers whose namespace is not
+    the prompt-cache one. It lives here rather than being re-implemented per feature
+    because the parts that are easy to get wrong are not the JSON — they are the
+    dedicated non-propagating logger and the message-only formatter above. A record
+    written through the app's normal logger acquires an ``[INFO] name:`` prefix,
+    CloudWatch Logs silently declines to extract it, and the metric simply never
+    appears. Nothing errors; there is just no data, which is indistinguishable from
+    "the thing being measured never happened".
+
+    ``metrics`` maps metric name to numeric value; ``units`` optionally maps the
+    same names to a CloudWatch unit, defaulting to ``None`` (a bare number).
+    ``properties`` ride along as queryable log fields and are **not** dimensions —
+    dimensions multiply metric streams, and every caller here so far wants
+    fleet-wide aggregates with the detail available in Logs Insights.
+    """
+    try:
+        units = units or {}
+        record = {
+            "_aws": {
+                "Timestamp": int(time.time() * 1000),
+                "CloudWatchMetrics": [
+                    {
+                        "Namespace": namespace,
+                        "Dimensions": [[]],
+                        "Metrics": [
+                            {"Name": name, "Unit": units.get(name, "None")}
+                            for name in metrics
+                        ],
+                    }
+                ],
+            },
+        }
+        record.update({name: value for name, value in metrics.items()})
+        for key, value in (properties or {}).items():
+            if value is not None:
+                record[key] = value
+        _emf_logger.info(json.dumps(record, separators=(",", ":")))
+    except Exception as e:  # noqa: BLE001 - metrics must never break a caller
+        logger.debug("EMF emission skipped: %s", e)
+
+
+def emit_session_cache_rollup(
+    session_id: str,
+    partial_miss_usd: float,
+    partial_miss_count: int = 0,
+) -> None:
+    """Emit one session's *running* partial-miss waste after a rollup bump.
+
+    The per-call metrics above are fleet sums, which is the wrong shape for
+    "one conversation is quietly burning a user's month": $0.43 a turn never
+    steps a fleet-wide sum, and the incident that motivated this ran for five
+    days without tripping anything. This metric carries the session's
+    cumulative ``partialMissUsd`` so an alarm on ``Maximum`` answers "is any
+    single session over the line right now", without making ``sessionId`` a
+    dimension (unbounded cardinality) — it stays a queryable log property, so
+    the alarm says *that* a session crossed and Logs Insights says *which*.
+
+    The value is session-lifetime cumulative, not a trailing 24h window: an
+    alarm period of 24h therefore reads as "a session at/over the threshold
+    was active in the last day", which is the operational question. It
+    resolves on its own once the session goes quiet.
+
+    Callers should skip zero — a metric emitted on every call would be almost
+    entirely zeros, and ``Maximum`` over them tells no one anything.
+
+    Best-effort: never raises.
+    """
+    try:
+        record = {
+            "_aws": {
+                "Timestamp": int(time.time() * 1000),
+                "CloudWatchMetrics": [
+                    {
+                        "Namespace": _EMF_NAMESPACE,
+                        "Dimensions": [[]],
+                        "Metrics": [
+                            {"Name": "SessionPartialMissUsd", "Unit": "None"},
+                        ],
+                    }
+                ],
+            },
+            "SessionPartialMissUsd": round(float(partial_miss_usd or 0.0), 6),
+            "sessionId": session_id,
+            "sessionPartialMissCount": int(partial_miss_count or 0),
+        }
+        _emf_logger.info(json.dumps(record, separators=(",", ":")))
+    except Exception as e:  # noqa: BLE001 - metrics must never break a request
+        logger.debug("Session cache rollup EMF emission skipped: %s", e)

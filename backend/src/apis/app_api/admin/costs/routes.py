@@ -14,21 +14,29 @@ import csv
 import io
 import json
 
-from apis.shared.auth import User, require_admin
+from apis.shared.auth import User, require_admin_scope
 from .models import (
     TopUserCost,
+    TopSessionsResponse,
     SystemCostSummary,
     ModelUsageSummary,
     TierUsageSummary,
     CostTrend,
     AdminCostDashboard,
     SessionCostAnatomy,
+    SessionProfile,
+    UserSessionsResponse,
 )
 from .service import AdminCostService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/costs", tags=["admin-costs"])
+
+# Every route in this package is guarded by this one scope, so the
+# permission boundary is the package boundary. Enforced by
+# tests/architecture/test_admin_scope_coverage.py.
+require_costs_admin = require_admin_scope("admin.costs")
 
 
 # ========== Dependencies ==========
@@ -59,7 +67,7 @@ async def get_cost_dashboard(
         alias="includeTrends",
         description="Include daily trends for the period"
     ),
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_costs_admin),
     service: AdminCostService = Depends(get_cost_service)
 ):
     """
@@ -110,10 +118,74 @@ async def get_cost_dashboard(
         )
 
 
+@router.get("/top-sessions", response_model=TopSessionsResponse)
+async def get_top_sessions(
+    period: Optional[str] = Query(
+        None,
+        description="Period (YYYY-MM), defaults to current month",
+        pattern=r"^\d{4}-\d{2}$"
+    ),
+    limit: int = Query(25, ge=1, le=200, description="Maximum sessions to return"),
+    users_to_scan: int = Query(
+        50,
+        ge=1,
+        le=500,
+        alias="usersToScan",
+        description="How many of the period's top-cost users to fan out over"
+    ),
+    min_cost: Optional[float] = Query(
+        None,
+        alias="minCost",
+        ge=0,
+        description="Only include sessions whose lifetime cost is at least this"
+    ),
+    admin_user: User = Depends(require_costs_admin),
+    service: AdminCostService = Depends(get_cost_service)
+):
+    """
+    Get the most expensive conversations for a period, cost-sorted.
+
+    The support-side counterpart to the per-session quota notice: a runaway
+    conversation is visible here before the user calls about a spent quota
+    (#833 PR-5). Each row links to the session's cost anatomy
+    (`/costs/sessions/{id}/calls`), and carries the session's
+    `partialMissCount` / `partialMissUsd` so a *platform* problem is
+    distinguishable from a heavy user at a glance.
+
+    ⚠️ **`totalCost` is the session's lifetime cost, not its cost within
+    `period`.** `period` selects which sessions are listed (those active in
+    it) and which users are scanned; the dollars are the whole conversation,
+    which is the number that matters for a thread that spans months. The
+    response's `usersScanned` / `truncated` say how deep the scan went — a
+    session whose owner sits outside the scanned users is not listed.
+
+    Raises:
+        HTTPException:
+            - 401 if not authenticated
+            - 403 if user lacks admin role
+            - 500 if server error
+    """
+    logger.info("Admin requesting top sessions by cost")
+
+    try:
+        return await service.get_top_sessions(
+            period=period,
+            limit=limit,
+            users_to_scan=users_to_scan,
+            min_cost=min_cost,
+        )
+    except Exception as e:
+        logger.error(f"Error getting top sessions: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve top sessions"
+        )
+
+
 @router.get("/sessions/{session_id}/calls", response_model=SessionCostAnatomy)
 async def get_session_cost_anatomy(
     session_id: str,
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_costs_admin),
     service: AdminCostService = Depends(get_cost_service)
 ):
     """
@@ -121,13 +193,31 @@ async def get_session_cost_anatomy(
 
     Returns one row per model call — timestamp, input/cacheRead/cacheWrite/
     output tokens, cost, derived cacheStatus (first_write | hit |
-    miss_ttl_expired | miss_avoidable | uncached), and the prompt-cache
-    prefix fingerprint hashes (toolConfig / system prompt / history) — plus
-    session-level rollups (cache efficiency, avoidable-miss count, wastedUsd).
+    partial_miss | miss_ttl_expired | miss_avoidable | uncached), and the
+    prompt-cache prefix fingerprint hashes (toolConfig / system prompt /
+    history) — plus session-level rollups (cache efficiency, avoidable-miss
+    and partial-miss counts, wastedUsd).
 
     This is the forensic view for diagnosing avoidable prompt-cache
     re-writes: on a miss_avoidable row, diff its fingerprint hashes against
     the previous row's to see which prefix component changed.
+
+    ⚠️ **A `partial_miss` row costs like a miss even though it read from
+    cache.** It means a leading segment (typically tools + system) hit while
+    the rest of the prefix was re-written against a live entry — the shape
+    that spent 90% of one user's monthly quota while every row read `hit`.
+    Its dollars are in `wastedUsd`; `partialMissUsd` / `partialMissCount`
+    name the subset.
+
+    ⚠️ **Check `agentSwitched` before treating a miss as a regression.** An
+    `@`-mention hands one turn to a different Agent, which genuinely re-writes
+    the prefix — it presents exactly like the nondeterministic-ordering bug the
+    fingerprints exist to catch (`toolConfigHash` and `systemPromptHash` flipping
+    together), so the row says which it was, and `turnAgentId` says which Agent
+    ran it. The session rollup splits the same way: `agentSwitchMissCount` /
+    `agentSwitchUsd` are a *subset* of `avoidableMissCount` / `wastedUsd`, never
+    deducted from them. Subtract to get unexplained waste — that difference is
+    what a prefix-stability regression moves.
 
     Args:
         session_id: Session identifier (any user's session — admin scope)
@@ -164,6 +254,123 @@ async def get_session_cost_anatomy(
     return anatomy
 
 
+@router.get("/users/{user_id}/sessions", response_model=UserSessionsResponse)
+async def get_user_sessions(
+    user_id: str,
+    period: Optional[str] = Query(
+        None,
+        description="Period (YYYY-MM) to scope the list to; defaults to the current month",
+        pattern=r"^\d{4}-\d{2}$",
+    ),
+    all_time: bool = Query(
+        False,
+        alias="allTime",
+        description="List every conversation regardless of period (period is then ignored)",
+    ),
+    sort: str = Query(
+        "cost",
+        pattern=r"^(cost|recent|context|messages)$",
+        description="cost (desc), recent (lastMessageAt desc), context (desc), messages (desc)",
+    ),
+    limit: int = Query(100, ge=1, le=500, description="Maximum rows to return"),
+    admin_user: User = Depends(require_costs_admin),
+    service: AdminCostService = Depends(get_cost_service),
+):
+    """
+    One user's conversations, content-free, for the admin user page.
+
+    The drill-down that was missing between "top users by cost" and the
+    per-session cost anatomy: it starts from a *user* — the person support is
+    looking at because they hit their quota — and lists what they were doing
+    without reading any of it. Each row is counts, tokens, dollars, timestamps,
+    a model id, a tool count, an agent-binding flag and the diagnoses that
+    fired on the row's own numbers; nothing on it carries user text or
+    model-generated prose (no title, no summary).
+
+    ⚠️ **`costKnown=false` rows are unrecorded, not free.** 20% of session rows
+    fleet-wide have never had a cost aggregate written. They are listed, they
+    trail under cost-sort, and `unknownCostCount` says how many there are so a
+    total over this list is understood as a floor.
+
+    Period semantics match `/top-sessions`: `period` selects which sessions
+    are listed (active in it) and supplies the denominator for
+    `shareOfUserPeriod`; a row's `totalCost` is the conversation's **lifetime**
+    cost, because a runaway thread usually spans period boundaries.
+
+    Raises:
+        HTTPException:
+            - 401 if not authenticated
+            - 403 if user lacks the admin.costs scope
+            - 500 if server error
+    """
+    logger.info("Admin requesting a user's conversation list")
+
+    try:
+        return await service.get_user_sessions(
+            user_id=user_id,
+            period=None if all_time else period,
+            all_time=all_time,
+            sort=sort,
+            limit=limit,
+        )
+    except Exception as e:
+        logger.error(f"Error getting user sessions: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve user sessions"
+        )
+
+
+@router.get("/sessions/{session_id}/profile", response_model=SessionProfile)
+async def get_session_profile(
+    session_id: str,
+    admin_user: User = Depends(require_costs_admin),
+    service: AdminCostService = Depends(get_cost_service),
+):
+    """
+    The content-free diagnostic profile of one conversation.
+
+    Sits beside `/sessions/{id}/calls` (the cost anatomy) and answers the
+    question that view cannot: *what was the user doing?* Attachments (count
+    and bytes, never names), the context-token trajectory per model call with
+    the compaction threshold to read it against, the model mix, how often each
+    cached-prefix component changed, the tool census when recorded, and the
+    diagnoses that fired — each a named, computable classification with its
+    evidence and the fix a prior investigation landed on.
+
+    `dataCoverage` says which optional signals this session actually has; a
+    session written before a counter shipped reads "not tracked", never "0".
+
+    The whole payload is safe to paste into a model for a second opinion — it
+    is content-free by construction (`apis.shared.observability.content_policy`).
+
+    Raises:
+        HTTPException:
+            - 401 if not authenticated
+            - 403 if user lacks the admin.costs scope
+            - 404 if the session has no metadata row
+            - 500 if server error
+    """
+    logger.info("Admin requesting a session profile")
+
+    try:
+        profile = await service.get_session_profile(session_id)
+    except Exception as e:
+        logger.error(f"Error getting session profile: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve session profile"
+        )
+
+    if profile is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No session found for {session_id}"
+        )
+
+    return profile
+
+
 @router.get("/top-users", response_model=List[TopUserCost])
 async def get_top_users(
     period: Optional[str] = Query(
@@ -183,7 +390,7 @@ async def get_top_users(
         alias="tierId",
         description="Filter by quota tier (not yet implemented)"
     ),
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_costs_admin),
     service: AdminCostService = Depends(get_cost_service)
 ):
     """
@@ -240,7 +447,7 @@ async def get_system_summary(
         pattern=r"^(daily|monthly)$",
         description="Period type: 'daily' or 'monthly'"
     ),
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_costs_admin),
     service: AdminCostService = Depends(get_cost_service)
 ):
     """
@@ -290,7 +497,7 @@ async def get_usage_by_model(
         description="Period (YYYY-MM), defaults to current month",
         pattern=r"^\d{4}-\d{2}$"
     ),
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_costs_admin),
     service: AdminCostService = Depends(get_cost_service)
 ):
     """
@@ -333,7 +540,7 @@ async def get_usage_by_tier(
         description="Period (YYYY-MM), defaults to current month",
         pattern=r"^\d{4}-\d{2}$"
     ),
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_costs_admin),
     service: AdminCostService = Depends(get_cost_service)
 ):
     """
@@ -384,7 +591,7 @@ async def get_cost_trends(
         description="End date (YYYY-MM-DD)",
         pattern=r"^\d{4}-\d{2}-\d{2}$"
     ),
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_costs_admin),
     service: AdminCostService = Depends(get_cost_service)
 ):
     """
@@ -440,7 +647,7 @@ async def export_cost_data(
         pattern=r"^(csv|json)$",
         description="Export format: 'csv' or 'json'"
     ),
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_costs_admin),
     service: AdminCostService = Depends(get_cost_service)
 ):
     """

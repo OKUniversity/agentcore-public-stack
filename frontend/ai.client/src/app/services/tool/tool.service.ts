@@ -3,6 +3,8 @@ import { HttpClient } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
 import { ConfigService } from '../config.service';
 import { makeScopedToolId } from '../../shared/utils/scoped-tool-id';
+import { ToggleOptions } from '../toggle-options';
+
 /**
  * Tool category enum
  */
@@ -56,6 +58,12 @@ export interface Tool {
   userEnabled: boolean | null;
   isEnabled: boolean;
   /**
+   * OAuth provider this tool needs the user to connect before it will work,
+   * or null/absent when it needs no per-user consent. Mirrors the catalog's
+   * `requiresOauthProvider`.
+   */
+  requiresOauthProvider?: string | null;
+  /**
    * For MCP-server tools, the individual tools the server exposes. Empty for
    * non-MCP tools or servers whose tools are discovered live.
    */
@@ -70,6 +78,9 @@ export interface ToolsResponse {
   categories: string[];
   appRolesApplied: string[];
 }
+
+/** Re-exported so existing `tool.service` import sites keep working. */
+export type { ToggleOptions };
 
 /**
  * Request body for PUT /tools/preferences
@@ -98,6 +109,16 @@ export class ToolService {
   private _error = signal<string | null>(null);
   private _appRolesApplied = signal<string[]>([]);
   private _initialized = signal(false);
+
+  /**
+   * The load currently in flight, so a second caller *joins* it instead of
+   * being told "already loading" and continuing with an empty list. The
+   * constructor starts this load at bootstrap, which means a message sent a
+   * second or two after page load could otherwise be assembled from an empty
+   * tool list — and the next turn, with the real list, would rewrite the
+   * `toolConfig` half of the cacheable prefix.
+   */
+  private _inflight: Promise<void> | null = null;
 
   // Agent Designer: when the active conversation is bound to an Agent that binds
   // tools, the picker is locked to exactly that set — the backend governs the
@@ -235,8 +256,20 @@ export class ToolService {
    * Should be called on app init or after login.
    */
   async loadTools(): Promise<void> {
-    if (this._loading()) return;
+    // Join an in-flight load rather than returning early: callers await this to
+    // know the list is settled.
+    if (this._inflight) return this._inflight;
 
+    const inflight = this.fetchTools();
+    this._inflight = inflight;
+    try {
+      await inflight;
+    } finally {
+      this._inflight = null;
+    }
+  }
+
+  private async fetchTools(): Promise<void> {
     this._loading.set(true);
     this._error.set(null);
 
@@ -261,10 +294,17 @@ export class ToolService {
    * Toggle a tool's enabled state. For an MCP server with per-tool entries this
    * toggles the whole server (every tool), authoritatively overriding any prior
    * per-tool selection.
+   *
+   * `respectAgentLock` defaults to true, which is the conversation-scoped
+   * behaviour the composer drawer depends on. Global surfaces (Customize) pass
+   * `false`: an Agent lock is a fact about one conversation, and this service is
+   * a root singleton whose lock outlives the session view that set it (see
+   * `docs/specs/customize-surface.md` §"The agent-lock seam"). Honouring it off
+   * the conversation would make the user's own preference page silently inert.
    */
-  async toggleTool(toolId: string): Promise<void> {
+  async toggleTool(toolId: string, options?: ToggleOptions): Promise<void> {
     // Agent-locked: the toolset is dictated by the Agent; ignore toggles.
-    if (this._agentLockedToolIds() !== null) return;
+    if ((options?.respectAgentLock ?? true) && this._agentLockedToolIds() !== null) return;
     const tool = this._tools().find(t => t.toolId === toolId);
     if (!tool) return;
 
@@ -327,9 +367,9 @@ export class ToolService {
    * Toggle a single tool of an MCP server (per-tool enablement). The server's
    * `isEnabled` becomes "any tool enabled".
    */
-  async toggleServerTool(toolId: string, name: string): Promise<void> {
+  async toggleServerTool(toolId: string, name: string, options?: ToggleOptions): Promise<void> {
     // Agent-locked: the toolset is dictated by the Agent; ignore toggles.
-    if (this._agentLockedToolIds() !== null) return;
+    if ((options?.respectAgentLock ?? true) && this._agentLockedToolIds() !== null) return;
     const tool = this._tools().find(t => t.toolId === toolId);
     const sub = tool?.serverTools?.find(s => s.name === name);
     if (!tool || !sub) return;
@@ -442,6 +482,23 @@ export class ToolService {
    */
   getEnabledToolIds(): string[] {
     return this.enabledToolIds();
+  }
+
+  /**
+   * Resolve once the tool list has settled, starting the load if nothing has.
+   *
+   * The chat send path awaits this so a turn sent before the constructor's
+   * `/tools/` fetch returns still carries the same tools a later turn would.
+   * Identical `enabled_tools` on turn 1 and turn 2 is what keeps the cacheable
+   * `toolConfig` prefix stable across a session.
+   *
+   * Never rejects: a failed load leaves the list empty, which is the state the
+   * send path already tolerates. It is a no-op once loaded, and joins the
+   * in-flight request when one is already running.
+   */
+  async ensureLoaded(): Promise<void> {
+    if (this._initialized()) return;
+    await this.loadTools().catch(() => undefined);
   }
 
   /**

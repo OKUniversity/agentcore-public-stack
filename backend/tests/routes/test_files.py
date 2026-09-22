@@ -321,3 +321,51 @@ class TestGetQuota:
         client = unauthenticated_client(app)
         resp = client.get("/files/quota")
         assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /files/{upload_id}/download — the durable download link
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadFile:
+    """GET /files/{upload_id}/download endpoint tests.
+
+    This route exists because presigned S3 URLs expire in minutes, so any URL
+    written into a conversation (a download card, a link in an assistant
+    message) is dead when the thread is reopened. The route is the stable path;
+    the signature is minted per click.
+    """
+
+    def test_redirects_to_a_freshly_minted_presigned_url(
+        self, app, make_user, authenticated_client, mock_file_service
+    ):
+        client = authenticated_client(app, make_user())
+        mock_file_service.get_download_url.return_value = (
+            "https://bucket.s3.us-west-2.amazonaws.com/user-files/u/s/up1/plan.docx"
+            "?X-Amz-Signature=deadbeef"
+        )
+
+        resp = client.get("/files/up1/download", follow_redirects=False)
+
+        assert resp.status_code == 302
+        assert resp.headers["location"].endswith("X-Amz-Signature=deadbeef")
+        # Never cached: the Location carries a signature that expires.
+        assert resp.headers["cache-control"] == "no-store"
+
+    def test_returns_404_for_unowned_or_missing_file(
+        self, app, make_user, authenticated_client, mock_file_service
+    ):
+        client = authenticated_client(app, make_user())
+        mock_file_service.get_download_url.side_effect = ServiceFileNotFoundError(
+            "nope"
+        )
+
+        resp = client.get("/files/ghost/download", follow_redirects=False)
+
+        assert resp.status_code == 404
+
+    def test_returns_401_for_unauthenticated(self, app, unauthenticated_client):
+        client = unauthenticated_client(app)
+        resp = client.get("/files/up1/download", follow_redirects=False)
+        assert resp.status_code == 401

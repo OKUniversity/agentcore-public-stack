@@ -32,14 +32,17 @@ import {
   heroCircleStack,
   heroCheck,
   heroAdjustmentsHorizontal,
+  heroChevronDown,
 } from '@ng-icons/heroicons/outline';
 import { Dialog } from '@angular/cdk/dialog';
 import { PickerComponent } from '@ctrl/ngx-emoji-mart';
 import { CdkConnectedOverlay, CdkOverlayOrigin, ConnectedPosition } from '@angular/cdk/overlay';
 import { AgentService } from '../services/agent.service';
 import {
+  Agent,
   AgentBinding,
   BindableItem,
+  BindableServerTool,
   MemorySpaceBindingConfig,
   ModelParamSpec,
   SupportedParams,
@@ -48,12 +51,22 @@ import { SidenavService } from '../../services/sidenav/sidenav.service';
 import { ThemeService } from '../../components/topnav/components/theme-toggle/theme.service';
 import { ToastService } from '../../services/toast/toast.service';
 import { TooltipDirective } from '../../components/tooltip/tooltip.directive';
+import { splitToolDescription } from '../../shared/utils/tool-description';
 import { AgentPreviewComponent } from './components/agent-preview.component';
+import { AgentIconComponent } from '../components/agent-icon.component';
 import {
-  ShareAssistantDialogComponent,
-  ShareAssistantDialogData,
-} from '../../assistants/components/share-assistant-dialog.component';
+  AgentIconDialogComponent,
+  AgentIconDialogData,
+  AgentIconDialogResult,
+} from '../components/agent-icon-dialog.component';
+import {
+  ShareAgentDialogComponent,
+  ShareAgentDialogData,
+} from '../components/share-agent-dialog.component';
 import { KnowledgeBaseSectionComponent } from '../../knowledge-base/knowledge-base-section.component';
+import { ToolService } from '../../services/tool/tool.service';
+import { AGENT_TEMPLATE_DRAFT_KEY, TemplateDraft } from './agent-templates';
+import { reconcileToolRefs } from './tool-ref-reconcile';
 
 /** A model param rendered as an editable control (numeric or enum). */
 interface ParamView {
@@ -66,12 +79,38 @@ interface ParamView {
 /** Friendly labels for the canonical param keys the Designer commonly exposes. */
 const PARAM_LABELS: Record<string, string> = {
   temperature: 'Temperature',
-  max_tokens: 'Max tokens',
   top_p: 'Top P',
   top_k: 'Top K',
   reasoning_effort: 'Reasoning effort',
   effort: 'Reasoning effort',
 };
+
+/**
+ * Params the Designer never exposes to an agent author, whatever the admin
+ * record declares. Filtered out of `paramSpecs` — the single choke point
+ * feeding the editable *and* the locked lists — and stripped on hydrate so a
+ * value saved before this filter can't survive invisibly.
+ *
+ * `max_tokens` is here because it is a hard truncation, not a length
+ * preference: an author who sets it low to "keep answers short" gets replies
+ * severed mid-sentence, or a tool loop cut mid-`toolUse` block. Response
+ * length belongs in the instructions. It also re-opens the `max_tokens` <->
+ * thinking coupling (`thinking budget < max_tokens default`, enforced in
+ * `shared/models/models.py`) that the drawer's param form was carrying 700+
+ * lines of clamp/conflict machinery to serve before `dae2b20e` retired it.
+ *
+ * The admin ceiling is unaffected: `maxOutputTokens` and a locked `max_tokens`
+ * spec still govern the request at the runtime. This removes the author's
+ * knob, not the governance.
+ */
+const AUTHOR_HIDDEN_PARAMS: ReadonlySet<string> = new Set(['max_tokens']);
+
+/** One of a server's tools with its docstring split for display, as the chat picker does. */
+interface DisplayServerTool {
+  name: string;
+  summary: string;
+  detail: string;
+}
 
 /** A memory-space selection with its per-binding config (access + alwaysLoad). */
 interface MemorySelection {
@@ -103,6 +142,7 @@ interface MemorySelection {
     CdkConnectedOverlay,
     TooltipDirective,
     AgentPreviewComponent,
+    AgentIconComponent,
     KnowledgeBaseSectionComponent,
   ],
   providers: [
@@ -119,6 +159,7 @@ interface MemorySelection {
       heroCircleStack,
       heroCheck,
       heroAdjustmentsHorizontal,
+      heroChevronDown,
     }),
   ],
 })
@@ -132,6 +173,7 @@ export class AgentFormPage implements OnInit, OnDestroy {
   private toast = inject(ToastService);
   private dialog = inject(Dialog);
   private host = inject(ElementRef<HTMLElement>);
+  private toolService = inject(ToolService);
 
   form!: FormGroup;
   private formSub?: Subscription;
@@ -139,6 +181,15 @@ export class AgentFormPage implements OnInit, OnDestroy {
   readonly agentId = signal<string | null>(null);
   readonly saving = signal(false);
   readonly loadingAgent = signal(false);
+  /** The RBAC-filtered binding palettes are fetched on every entry (create + edit). */
+  readonly loadingPalettes = signal(true);
+  /**
+   * The page is still assembling. Both fetches feed sections of the same form
+   * (the palettes render the Model/Tools/Skills/Memory pickers; the record fills
+   * the persona + selections), so the editor stays behind a skeleton until both
+   * settle — otherwise the form paints empty and then visibly rewrites itself.
+   */
+  readonly loading = computed(() => this.loadingPalettes() || this.loadingAgent());
   readonly userPermission = signal<'owner' | 'editor' | 'viewer'>('owner');
   /**
    * Whether {@link userPermission} reflects a value loaded from the server.
@@ -149,8 +200,32 @@ export class AgentFormPage implements OnInit, OnDestroy {
   readonly isEmojiPickerOpen = signal(false);
   readonly isDarkMode = this.themeService.theme;
 
+  /**
+   * Prefill-from-template notices (Agent Template Prefill — Phase 2). When a template
+   * draft is applied in create mode, tool refs are reconciled against the live catalog;
+   * a deprecated-but-present ref is still applied but flagged here, and an unknown ref is
+   * dropped and reported here. Both are dismissible and purely informational.
+   */
+  readonly templateFlaggedNotice = signal<string | null>(null);
+  readonly templateDroppedNotice = signal<string | null>(null);
+  readonly hasTemplateNotice = computed(
+    () => this.templateFlaggedNotice() !== null || this.templateDroppedNotice() !== null,
+  );
+
   readonly mode = computed<'create' | 'edit'>(() => (this.agentId() ? 'edit' : 'create'));
   readonly isViewer = computed(() => this.userPermission() === 'viewer');
+
+  // ---- store icon (D5) --------------------------------------------------
+  /**
+   * The uploaded square icon, rendered by `app-agent-icon` — the agent's face on cards,
+   * in the store and in the share dialog. It sits in **Persona**, beside the emoji, not
+   * with publication: it is presentation of this record, and D13 lets an editor set it
+   * while publication stays owner-only. Publication itself lives in the share dialog.
+   */
+  readonly iconUrl = signal<string | undefined>(undefined);
+
+  /** Presentation, not behaviour (D13) — the same line `PUT /agents/{id}` draws. */
+  readonly canEditIcon = computed(() => this.userPermission() !== 'viewer');
 
   // Bindable palettes (RBAC-filtered) + current selections.
   readonly models = signal<BindableItem[]>([]);
@@ -163,6 +238,10 @@ export class AgentFormPage implements OnInit, OnDestroy {
    * selected model's `supportedParams`. Empty ⇒ omit `params` (today's default). */
   readonly modelParams = signal<Record<string, number | string>>({});
   readonly selectedToolRefs = signal<Set<string>>(new Set());
+  /** Which servers have their per-tool list open. Presentation only — never submitted. */
+  readonly expandedToolRefs = signal<Set<string>>(new Set());
+  /** Which sub-tools have their `Args:` reference detail open, keyed `serverRef::name`. */
+  readonly expandedToolDetails = signal<Set<string>>(new Set());
   readonly selectedSkillRefs = signal<Set<string>>(new Set());
   readonly memorySelections = signal<MemorySelection[]>([]);
 
@@ -173,7 +252,9 @@ export class AgentFormPage implements OnInit, OnDestroy {
   private readonly paramSpecs = computed<[string, ModelParamSpec][]>(() => {
     const supported = this.selectedModel()?.meta?.['supportedParams'] as SupportedParams | undefined;
     const params = supported?.params ?? {};
-    return Object.entries(params).filter(([, spec]) => spec.supported);
+    return Object.entries(params).filter(
+      ([key, spec]) => spec.supported && !AUTHOR_HIDDEN_PARAMS.has(key),
+    );
   });
   /** Editable enum params (a fixed `allowed` domain) → rendered as a select. */
   readonly enumParams = computed<ParamView[]>(() =>
@@ -211,8 +292,6 @@ export class AgentFormPage implements OnInit, OnDestroy {
   private readonly bindingsDirty = signal(false);
   readonly isDirty = computed(() => this.form?.dirty === true || this.bindingsDirty());
 
-  readonly previewModelLabel = computed<string | null>(() => this.selectedModel()?.label ?? null);
-
   readonly emojiPickerPositions: ConnectedPosition[] = [
     { originX: 'start', originY: 'bottom', overlayX: 'start', overlayY: 'top', offsetY: 8 },
     { originX: 'start', originY: 'top', overlayX: 'start', overlayY: 'bottom', offsetY: -8 },
@@ -241,7 +320,7 @@ export class AgentFormPage implements OnInit, OnDestroy {
     this.formSub = this.form.valueChanges.subscribe(() => this.syncFormToSignals());
 
     // Load the RBAC-filtered palettes in parallel; then hydrate an existing agent.
-    void this.loadPalettes();
+    const palettesLoaded = this.loadPalettes().finally(() => this.loadingPalettes.set(false));
 
     const id = this.route.snapshot.paramMap.get('id');
     this.agentId.set(id);
@@ -256,6 +335,10 @@ export class AgentFormPage implements OnInit, OnDestroy {
     } else {
       // Create mode: the user is implicitly the owner — no record to resolve.
       this.permissionResolved.set(true);
+      // A "Start from a template" click stashes the chosen draft in localStorage and
+      // routes here. Apply it once the binding palettes have settled so tool refs
+      // reconcile against a loaded catalog rather than being spuriously dropped.
+      void palettesLoaded.then(() => this.applyTemplateDraftIfPresent());
     }
   }
 
@@ -273,68 +356,186 @@ export class AgentFormPage implements OnInit, OnDestroy {
   }
 
   private async loadPalettes(): Promise<void> {
-    const [models, tools, skills, spaces] = await Promise.all([
-      this.agentService.loadBindable('model'),
-      this.agentService.loadBindable('tool'),
-      this.agentService.loadBindable('skill'),
-      this.agentService.loadBindable('memory_space'),
-    ]);
-    this.models.set(models);
-    this.tools.set(tools);
-    this.skills.set(skills);
-    this.spaces.set(spaces);
+    try {
+      const [models, tools, skills, spaces] = await Promise.all([
+        this.agentService.loadBindable('model'),
+        this.agentService.loadBindable('tool'),
+        this.agentService.loadBindable('skill'),
+        this.agentService.loadBindable('memory_space'),
+      ]);
+      this.models.set(models);
+      this.tools.set(tools);
+      this.skills.set(skills);
+      this.spaces.set(spaces);
+    } catch (err) {
+      // Don't let a palette failure strand the page on its skeleton — fall through
+      // to the form with empty pickers (the Model section renders its own empty state).
+      console.error('Error loading bindable palettes:', err);
+      this.toast.error('Could not load the available models, tools and skills.');
+    }
   }
 
   private async loadAgent(id: string): Promise<void> {
     try {
       const agent = await this.agentService.getAgent(id);
       this.userPermission.set(agent.userPermission ?? 'owner');
-      this.form.patchValue({
-        name: agent.name,
-        description: agent.description,
-        instructions: agent.instructions,
-        visibility: agent.visibility,
-        tags: agent.tags ?? [],
-        emoji: agent.emoji ?? '',
-      });
-      this.starters.clear();
-      (agent.starters ?? []).forEach((s) => this.starters.push(new FormControl(s, Validators.required)));
-
-      this.selectedModelId.set(agent.modelConfig?.modelId ?? null);
-      this.modelParams.set(
-        (agent.modelConfig?.params ?? {}) as Record<string, number | string>,
-      );
-
-      const toolRefs = new Set<string>();
-      const skillRefs = new Set<string>();
-      const memory: MemorySelection[] = [];
-      for (const b of agent.bindings ?? []) {
-        if (b.kind === 'tool') toolRefs.add(b.ref);
-        else if (b.kind === 'skill') skillRefs.add(b.ref);
-        else if (b.kind === 'memory_space') {
-          const cfg = (b.config ?? {}) as Partial<MemorySpaceBindingConfig>;
-          memory.push({
-            ref: b.ref,
-            label: this.spaceLabel(b.ref),
-            role: this.spaceRole(b.ref),
-            access: cfg.access === 'readwrite' ? 'readwrite' : 'read',
-            alwaysLoadIndex: (cfg.alwaysLoad ?? []).includes('MEMORY.md'),
-          });
-        }
-        // knowledge_base bindings are welded/synthesized and managed live by
-        // the knowledge-base section — no read-only display state to hydrate.
-      }
-      this.selectedToolRefs.set(toolRefs);
-      this.selectedSkillRefs.set(skillRefs);
-      this.memorySelections.set(memory);
+      this.iconUrl.set(agent.iconUrl);
+      this.applyAgentToForm(agent);
       // Freshly loaded state is clean — the preview matches the saved record.
-      this.syncFormToSignals();
       this.form.markAsPristine();
       this.bindingsDirty.set(false);
     } catch (err) {
       console.error('Error loading agent:', err);
       this.toast.error('Could not load this agent.');
     }
+  }
+
+  /**
+   * Agent Template Prefill — Phase 2 (create-mode entry path).
+   *
+   * The "Start from a template" picker writes the chosen {@link TemplateDraft} to
+   * `localStorage[AGENT_TEMPLATE_DRAFT_KEY]` and routes to this create form. Here we
+   * read it once, reconcile its tool bindings against the live tool catalog, feed the
+   * whole draft through the same {@link applyAgentToForm} path edit mode uses, and leave
+   * the form DIRTY so it reads as an unsaved draft the author must Save.
+   *
+   * One-shot: the key is cleared whatever the outcome, so a stale or malformed draft can
+   * never wedge every future "New Agent". Absent key ⇒ ordinary blank create.
+   */
+  private async applyTemplateDraftIfPresent(): Promise<void> {
+    const raw = localStorage.getItem(AGENT_TEMPLATE_DRAFT_KEY);
+    if (raw === null) return; // no template chosen — behave exactly as a blank create.
+    // Consume the key up front: this is a one-shot handoff, and clearing before we parse
+    // means even a malformed payload can't re-fire on the next visit.
+    localStorage.removeItem(AGENT_TEMPLATE_DRAFT_KEY);
+
+    let draft: TemplateDraft;
+    try {
+      draft = JSON.parse(raw) as TemplateDraft;
+    } catch {
+      this.toast.error('That template could not be read; starting from a blank agent.');
+      return;
+    }
+    if (!draft || typeof draft !== 'object') return;
+
+    // Reconcile requires the live tool catalog (toolId + status). It auto-loads at app
+    // start; ensure it's present so a deprecated ref is flagged, not mistaken for unknown.
+    if (!this.toolService.initialized()) {
+      await this.toolService.loadTools();
+    }
+    const catalog = this.toolService.tools();
+
+    // Only tool bindings are reconciled; skill / memory / KB bindings pass through as-is.
+    const bindings = draft.bindings ?? [];
+    const toolRefs = bindings.filter((b) => b.kind === 'tool').map((b) => b.ref);
+    const { apply, flagged, dropped } = reconcileToolRefs(toolRefs, catalog);
+    const applySet = new Set(apply);
+    const reconciledBindings = [
+      ...bindings.filter((b) => b.kind !== 'tool'),
+      ...bindings.filter((b) => b.kind === 'tool' && applySet.has(b.ref)),
+    ] as AgentBinding[];
+
+    // Feed the reconciled draft through the identical population path edit mode uses.
+    // `modelConfig.modelId === null` (platform default) ⇒ leave no model pinned.
+    this.applyAgentToForm({
+      name: draft.name,
+      description: draft.description,
+      instructions: draft.instructions,
+      tags: draft.tags,
+      starters: draft.starters,
+      emoji: draft.emoji,
+      modelConfig: draft.modelConfig?.modelId
+        ? { modelId: draft.modelConfig.modelId, params: draft.modelConfig.params }
+        : undefined,
+      bindings: reconciledBindings,
+    });
+
+    // A prefilled-but-unsaved template must read as a dirty draft. `patchValue` does not
+    // mark controls dirty, and `applyAgentToForm` deliberately leaves cleanliness alone,
+    // so mark both the form and the out-of-form binding signals dirty explicitly.
+    this.form.markAsDirty();
+    this.bindingsDirty.set(true);
+
+    // Surface reconcile outcomes as a dismissible, one-line-each notice.
+    if (flagged.length > 0) {
+      const detail = flagged.map((f) => `${f.ref} (${f.status})`).join(', ');
+      this.templateFlaggedNotice.set(
+        `${flagged.length} ${flagged.length === 1 ? 'tool is' : 'tools are'} deprecated but still added: ${detail}`,
+      );
+    }
+    if (dropped.length > 0) {
+      this.templateDroppedNotice.set(
+        `${dropped.length} ${dropped.length === 1 ? 'tool was' : 'tools were'} unavailable and dropped: ${dropped.join(', ')}`,
+      );
+    }
+  }
+
+  /** Dismiss the prefill-from-template notice. */
+  dismissTemplateNotice(): void {
+    this.templateFlaggedNotice.set(null);
+    this.templateDroppedNotice.set(null);
+  }
+
+  /**
+   * Map an agent-shaped object into form + selection state: the persona fields,
+   * starters, model + params, and the tool/skill/memory `bindings` decomposition,
+   * finishing by mirroring the form into the live-preview signals.
+   *
+   * Deliberately does NOT touch cleanliness (`markAsPristine` / `bindingsDirty`) or
+   * record-identity state (`userPermission` / `iconUrl`). `loadAgent` marks the form
+   * pristine *after* calling this because a freshly fetched record is clean; a later
+   * prefill-from-template path reuses this exact mapping but must leave the form DIRTY
+   * so the author is prompted to save. Takes `Partial<Agent>` so a template draft that
+   * carries only some fields hydrates through the identical path.
+   */
+  private applyAgentToForm(agent: Partial<Agent>): void {
+    this.form.patchValue({
+      name: agent.name,
+      description: agent.description,
+      // Marketplace Phase 3 gates `instructions` to owner/editor. Reaching this form
+      // means one of those, so the fallback is defensive, not an expected path — the
+      // field's own `required` validator surfaces it if the gate ever changes.
+      instructions: agent.instructions ?? '',
+      // A template draft carries no visibility (it's not a template concept) — leave the
+      // form's own default (PRIVATE) rather than blanking it. Edit mode always passes a
+      // concrete visibility, so this only matters for template prefill.
+      visibility: agent.visibility ?? this.form.get('visibility')?.value ?? 'PRIVATE',
+      tags: agent.tags ?? [],
+      emoji: agent.emoji ?? '',
+    });
+    this.starters.clear();
+    (agent.starters ?? []).forEach((s) => this.starters.push(new FormControl(s, Validators.required)));
+
+    this.selectedModelId.set(agent.modelConfig?.modelId ?? null);
+    this.modelParams.set(
+      stripHiddenParams(
+        (agent.modelConfig?.params ?? {}) as Record<string, number | string>,
+      ),
+    );
+
+    const toolRefs = new Set<string>();
+    const skillRefs = new Set<string>();
+    const memory: MemorySelection[] = [];
+    for (const b of agent.bindings ?? []) {
+      if (b.kind === 'tool') toolRefs.add(b.ref);
+      else if (b.kind === 'skill') skillRefs.add(b.ref);
+      else if (b.kind === 'memory_space') {
+        const cfg = (b.config ?? {}) as Partial<MemorySpaceBindingConfig>;
+        memory.push({
+          ref: b.ref,
+          label: this.spaceLabel(b.ref),
+          role: this.spaceRole(b.ref),
+          access: cfg.access === 'readwrite' ? 'readwrite' : 'read',
+          alwaysLoadIndex: (cfg.alwaysLoad ?? []).includes('MEMORY.md'),
+        });
+      }
+      // knowledge_base bindings are welded/synthesized and managed live by
+      // the knowledge-base section — no read-only display state to hydrate.
+    }
+    this.selectedToolRefs.set(toolRefs);
+    this.selectedSkillRefs.set(skillRefs);
+    this.memorySelections.set(memory);
+    this.syncFormToSignals();
   }
 
   private spaceLabel(ref: string): string {
@@ -432,14 +633,103 @@ export class AgentFormPage implements OnInit, OnDestroy {
     this.bindingsDirty.set(true);
   }
 
-  // ---- tools / skills (multi-select toggles) ---------------------------
+  // ---- tools (server toggle + per-tool scoping) -------------------------
+  /**
+   * `selectedToolRefs` holds `binding.ref` values verbatim, which may be a bare
+   * catalog id (the whole MCP server, and the only shape that existed before) or a
+   * scoped `serverId::toolName` selecting one of its tools. Everything below reads
+   * and writes that one set, so the refs the form submits are exactly what the
+   * backend validates — no parallel selection model to fall out of sync.
+   *
+   * The invariant: a server with *every* tool selected is stored as the bare ref, not
+   * as N scoped refs. That keeps an untouched agent byte-identical to what it had, and
+   * it is what `collect_tool_name_filters` means by whole-server anyway.
+   */
   toggleTool(ref: string): void {
-    this.selectedToolRefs.update((set) => toggle(set, ref));
+    this.selectedToolRefs.update((set) =>
+      this.isToolSelected(ref) ? withoutServer(set, ref) : toggle(set, ref),
+    );
     this.bindingsDirty.set(true);
   }
   isToolSelected(ref: string): boolean {
-    return this.selectedToolRefs().has(ref);
+    for (const selected of this.selectedToolRefs()) {
+      if (baseToolId(selected) === ref) return true;
+    }
+    return false;
   }
+
+  /** A selected server's tools, split for display like the chat tool picker's rows. */
+  serverTools(item: BindableItem): DisplayServerTool[] {
+    const subs = (item.meta?.['serverTools'] as BindableServerTool[] | undefined) ?? [];
+    return subs.map((sub) => ({ name: sub.name, ...splitToolDescription(sub.description ?? '') }));
+  }
+
+  /** Only an MCP server with a discovered tool list can be narrowed. */
+  canScopeTool(item: BindableItem): boolean {
+    return this.serverTools(item).length > 0;
+  }
+
+  isToolExpanded(ref: string): boolean {
+    return this.expandedToolRefs().has(ref);
+  }
+  toggleToolExpanded(ref: string): void {
+    this.expandedToolRefs.update((set) => toggle(set, ref));
+  }
+
+  isServerToolSelected(serverRef: string, name: string): boolean {
+    const refs = this.selectedToolRefs();
+    // The bare ref means every tool, including this one.
+    return refs.has(serverRef) || refs.has(scopedToolId(serverRef, name));
+  }
+
+  /**
+   * Turn one of a server's tools on or off, re-deriving the server's refs from the
+   * result: all on collapses to the bare ref, none on deselects the server entirely
+   * (an empty scoped set is not a thing the backend can store, and "selected but with
+   * nothing selected" is not a state worth inventing a third rendering for).
+   */
+  toggleServerTool(item: BindableItem, name: string): void {
+    const all = this.serverTools(item).map((sub) => sub.name);
+    const current = new Set(
+      all.filter((toolName) => this.isServerToolSelected(item.ref, toolName)),
+    );
+    if (current.has(name)) current.delete(name);
+    else current.add(name);
+
+    this.selectedToolRefs.update((set) => {
+      const next = withoutServer(set, item.ref);
+      if (current.size === 0) return next;
+      if (current.size === all.length) {
+        next.add(item.ref);
+        return next;
+      }
+      for (const toolName of all) {
+        if (current.has(toolName)) next.add(scopedToolId(item.ref, toolName));
+      }
+      return next;
+    });
+    this.bindingsDirty.set(true);
+  }
+
+  /** Every tool on (or the server not narrowed at all) — drives the "All" summary. */
+  isWholeServerSelected(item: BindableItem): boolean {
+    return this.selectedToolRefs().has(item.ref);
+  }
+
+  /** How many of a server's tools are on, for the chip's `5 of 44` count. */
+  selectedServerToolCount(item: BindableItem): number {
+    return this.serverTools(item).filter((sub) => this.isServerToolSelected(item.ref, sub.name))
+      .length;
+  }
+
+  isToolDetailExpanded(key: string): boolean {
+    return this.expandedToolDetails().has(key);
+  }
+  toggleToolDetail(key: string): void {
+    this.expandedToolDetails.update((set) => toggle(set, key));
+  }
+
+  // ---- skills (multi-select toggles) -----------------------------------
   toggleSkill(ref: string): void {
     this.selectedSkillRefs.update((set) => toggle(set, ref));
     this.bindingsDirty.set(true);
@@ -641,18 +931,72 @@ export class AgentFormPage implements OnInit, OnDestroy {
   openShareDialog(): void {
     const id = this.agentId();
     if (!id) return;
-    this.dialog.open(ShareAssistantDialogComponent, {
+    this.dialog.open(ShareAgentDialogComponent, {
       data: {
-        assistant: {
+        agent: {
           assistantId: id,
           name: this.form.get('name')?.value || 'Agent',
           visibility: this.form.get('visibility')?.value,
           userPermission: this.userPermission(),
+          emoji: this.form.get('emoji')?.value || undefined,
+          iconUrl: this.iconUrl(),
         },
-      } as unknown as ShareAssistantDialogData,
+      } satisfies ShareAgentDialogData,
       hasBackdrop: false,
     });
   }
+
+  // ---- store icon ------------------------------------------------------
+  /**
+   * Set, replace or remove the store icon (D5).
+   *
+   * The dialog writes the record itself and returns the new icon state; the page is
+   * patched from that rather than re-read, because the returned URL carries the new
+   * content digest and a replacement must repaint instead of showing the cached
+   * previous icon. `patchAgent` keeps the agents list in step behind us.
+   */
+  async onEditIcon(): Promise<void> {
+    const id = this.agentId();
+    if (!id) return;
+    const dialogRef = this.dialog.open<AgentIconDialogResult>(AgentIconDialogComponent, {
+      data: {
+        agentId: id,
+        agentName: this.form.get('name')?.value || 'Agent',
+        emoji: this.form.get('emoji')?.value || undefined,
+        iconUrl: this.iconUrl(),
+      } satisfies AgentIconDialogData,
+    });
+    const result = await firstValueFrom(dialogRef.closed);
+    if (result) {
+      this.iconUrl.set(result.iconUrl);
+      this.agentService.patchAgent(result.agentId, {
+        iconKey: result.iconKey,
+        iconUrl: result.iconUrl,
+      });
+    }
+  }
+}
+
+/** The delimiter in a scoped tool id, mirroring `apis/shared/tools/scoped_ids.py`. */
+const SCOPE_DELIMITER = '::';
+
+function scopedToolId(serverRef: string, name: string): string {
+  return `${serverRef}${SCOPE_DELIMITER}${name}`;
+}
+
+/** The catalog id a (possibly scoped) ref refers to. */
+function baseToolId(ref: string): string {
+  const at = ref.indexOf(SCOPE_DELIMITER);
+  return at === -1 ? ref : ref.slice(0, at);
+}
+
+/** Drop every ref belonging to one server — the bare id and any scoped ones. */
+function withoutServer(set: Set<string>, serverRef: string): Set<string> {
+  const next = new Set<string>();
+  for (const ref of set) {
+    if (baseToolId(ref) !== serverRef) next.add(ref);
+  }
+  return next;
 }
 
 function toggle(set: Set<string>, ref: string): Set<string> {
@@ -664,6 +1008,21 @@ function toggle(set: Set<string>, ref: string): Set<string> {
 
 function paramLabel(key: string): string {
   return PARAM_LABELS[key] ?? key.replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
+}
+
+/**
+ * Drop author params the Designer no longer exposes, so a value saved before
+ * the key was hidden is cleared on the next save rather than lingering as an
+ * invisible override the author can neither see nor edit.
+ */
+function stripHiddenParams(
+  params: Record<string, number | string>,
+): Record<string, number | string> {
+  const next: Record<string, number | string> = {};
+  for (const [key, value] of Object.entries(params)) {
+    if (!AUTHOR_HIDDEN_PARAMS.has(key)) next[key] = value;
+  }
+  return next;
 }
 
 /** Token counts step by 1; everything else (temperature, top_p, …) by 0.1. */

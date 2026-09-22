@@ -1,3 +1,11 @@
+<!-- Ambient announcement (spec §D1), floated above the composer rather than
+     stacked in flow: dismissing it must not move the composer under the
+     user's cursor. Sits above the quota tabs, which stay attached to the
+     input itself. -->
+@if (showAnnouncements()) {
+  <app-announcement-banner [placement]="announcementPlacement()" />
+}
+
 <!-- Cost quota warning indicator -->
 <app-quota-warning-banner />
 
@@ -28,6 +36,62 @@
       </div>
     }
 
+    <!--
+      Queued follow-ups. The user typed these while a response was still
+      streaming; they send one at a time as each turn finishes. Shown inside the
+      composer shell rather than in the message list because they have not
+      entered the conversation yet and can still be taken back.
+    -->
+    @if (queuedMessages().length > 0) {
+      <div class="border-b border-gray-200 dark:border-gray-700 px-4 py-2">
+        <!--
+          A queue held behind a consent / approval prompt looks stuck without
+          this line: the turn is not streaming, so nothing else on screen
+          explains why Enter did not send.
+        -->
+        @if (queueHeld()) {
+          <p class="mb-1.5 text-xs text-gray-500 dark:text-gray-400">
+            Waiting for your answer above — this goes to the agent when the turn resumes.
+          </p>
+        }
+        <ul class="flex flex-col gap-1.5" aria-live="polite">
+          @for (queued of queuedMessages(); track queued.id) {
+            <li class="flex items-start gap-2 rounded-lg bg-gray-100 px-3 py-2 dark:bg-white/5">
+              <!--
+                An armed entry is one the backend will hand to the agent at its
+                next step; an unarmed one waits for the turn to end. Different
+                promises, so different icons — and the arrow is the same one the
+                delivered message carries in the thread.
+              -->
+              <ng-icon
+                [name]="queued.armed ? 'heroArrowTurnDownRight' : 'heroClock'"
+                class="mt-0.5 size-4 shrink-0 text-gray-500 dark:text-gray-400"
+                aria-hidden="true"
+              />
+              <span class="min-w-0 flex-1 truncate text-sm text-gray-700 dark:text-gray-300">
+                @if (queueHeld()) {
+                  <span class="sr-only">Queued, goes to the agent once you answer the prompt above: </span>
+                } @else if (queued.armed) {
+                  <span class="sr-only">Queued, goes to the agent at its next step: </span>
+                } @else {
+                  <span class="sr-only">Queued, sends when the current response finishes: </span>
+                }
+                {{ queued.content }}
+              </span>
+              <button
+                type="button"
+                (click)="removeQueuedMessage($index)"
+                class="shrink-0 rounded-sm p-0.5 text-gray-500 transition-colors hover:bg-gray-200 hover:text-gray-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-gray-200"
+                [attr.aria-label]="'Remove queued message: ' + queued.content"
+              >
+                <ng-icon name="heroXMark" class="size-4" aria-hidden="true" />
+              </button>
+            </li>
+          }
+        </ul>
+      </div>
+    }
+
     <!-- File Attachments Area -->
     @if (showFileAttachments()) {
       <div class="border-b border-gray-200 dark:border-gray-700">
@@ -46,6 +110,36 @@
       </div>
     }
 
+    <!--
+      Agent `@`-mention menu (Marketplace D11). Positioned against this container rather
+      than the caret: a composer is anchored to the bottom of the viewport, so "above the
+      input" is where the menu can always open without being clipped.
+    -->
+    @if (isMentionMenuOpen()) {
+      <app-agent-mention-menu
+        [items]="mentionResults()"
+        [activeIndex]="mentionActiveIndex()"
+        [query]="mentionQuery()"
+        (picked)="onMentionPicked($event)"
+        (browseAll)="onMentionBrowseAll()"
+      />
+    }
+
+    <!--
+      `/` skill-command menu. Same anchoring as the `@` menu, and mutually exclusive with
+      it — `isSkillMenuVisible` already subtracts the case where both tokens would match,
+      so the two can never both claim the arrow keys.
+    -->
+    @if (isSkillMenuVisible()) {
+      <app-skill-command-menu
+        [items]="skillResults()"
+        [activeIndex]="skillActiveIndex()"
+        [query]="skillQuery()"
+        (picked)="onSkillPicked($event)"
+        (browseAll)="onSkillBrowseAll()"
+      />
+    }
+
     <!-- Main Input Area -->
     <div class="relative">
       <label for="user-message" class="sr-only">How can I help you today?</label>
@@ -57,12 +151,57 @@
         [value]="userInput()"
         (input)="onTextareaInput($event)"
         (keydown)="onKeyDown($event)"
+        (keyup)="onTextareaCaretMove($event)"
+        (click)="onTextareaCaretMove($event)"
         (focus)="onFocus()"
         (blur)="onBlur()"
-        placeholder="How can I help you today?"
-        class="block w-full resize-none bg-transparent px-6 py-4 text-base text-gray-900 placeholder:text-gray-500 dark:text-gray-100 dark:placeholder:text-gray-400 focus:outline-hidden overflow-y-auto"
+        [attr.placeholder]="placeholder()"
+        role="combobox"
+        aria-autocomplete="list"
+        [attr.aria-expanded]="isMentionMenuOpen() || isSkillMenuVisible()"
+        [attr.aria-controls]="
+          isMentionMenuOpen()
+            ? 'agent-mention-listbox'
+            : isSkillMenuVisible()
+              ? 'skill-command-listbox'
+              : null
+        "
+        [attr.aria-activedescendant]="
+          isMentionMenuOpen()
+            ? 'agent-mention-option-' + mentionActiveIndex()
+            : isSkillMenuVisible()
+              ? 'skill-command-option-' + skillActiveIndex()
+              : null
+        "
+        class="block w-full resize-none bg-transparent px-6 py-4 text-base text-gray-900 dark:text-gray-100 focus:outline-hidden overflow-y-auto"
+        [class]="
+          showHintOverlay()
+            ? 'placeholder:text-transparent'
+            : 'placeholder:text-gray-500 dark:placeholder:text-gray-400'
+        "
         style="min-height: 60px; max-height: 200px;"
       ></textarea>
+
+      <!--
+        Rotating discovery hints (see `composerHints` in the component).
+
+        Decoration, deliberately: `aria-hidden`, painted over a placeholder that
+        stays present and unchanging underneath — only its colour goes
+        transparent — so assistive tech reads one stable string while the pixels
+        cycle. `pointer-events-none` keeps a click on the hint landing in the
+        textarea. Padding and type scale must stay in step with the textarea's
+        or the line will not sit where the placeholder did.
+      -->
+      @for (hint of visibleHint(); track hint) {
+        <div
+          aria-hidden="true"
+          animate.enter="composer-hint-enter"
+          animate.leave="composer-hint-leave"
+          class="composer-hint pointer-events-none absolute inset-x-0 top-0 truncate px-6 py-4 text-base text-gray-500 dark:text-gray-400"
+        >
+          {{ hint }}
+        </div>
+      }
 
       <!-- Bottom Controls Bar -->
       <div class="flex items-center justify-between px-4 pb-3">
@@ -90,20 +229,6 @@
             </div>
           }
 
-          @if (showSettingsControl()) {
-            <!-- Settings Button -->
-            <button
-              type="button"
-              (click)="toggleSettings()"
-              class="flex size-10 items-center justify-center rounded-lg text-gray-500 dark:text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-white/5 dark:hover:text-gray-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-primary)]"
-              aria-label="Open settings"
-              appTooltip="Settings"
-              appTooltipPosition="top"
-            >
-              <ng-icon name="heroAdjustmentsHorizontal" class="size-5" aria-hidden="true" />
-            </button>
-          }
-
           @if (showVoiceControl()) {
           <!-- Voice Toggle Button -->
           <button
@@ -117,22 +242,19 @@
             @if (voiceStatus() === 'listening') {
               <!-- Pulsing dot indicator for listening -->
               <span class="relative flex size-3">
-                <span class="absolute inline-flex size-full animate-ping rounded-full bg-red-400 opacity-75"></span>
-                <span class="relative inline-flex size-3 rounded-full bg-red-500"></span>
+                <span class="absolute inline-flex size-full animate-ping rounded-full bg-state-danger-400 opacity-75"></span>
+                <span class="relative inline-flex size-3 rounded-full bg-state-danger-500"></span>
               </span>
             } @else if (voiceStatus() === 'speaking') {
               <!-- Wave bars for speaking -->
               <span class="flex items-center gap-0.5" aria-hidden="true">
-                <span class="h-3 w-0.5 animate-bounce rounded-full bg-green-500" style="animation-delay: 0ms;"></span>
-                <span class="h-4 w-0.5 animate-bounce rounded-full bg-green-500" style="animation-delay: 150ms;"></span>
-                <span class="h-3 w-0.5 animate-bounce rounded-full bg-green-500" style="animation-delay: 300ms;"></span>
+                <span class="h-3 w-0.5 animate-bounce rounded-full bg-state-success-500" style="animation-delay: 0ms;"></span>
+                <span class="h-4 w-0.5 animate-bounce rounded-full bg-state-success-500" style="animation-delay: 150ms;"></span>
+                <span class="h-3 w-0.5 animate-bounce rounded-full bg-state-success-500" style="animation-delay: 300ms;"></span>
               </span>
             } @else if (voiceStatus() === 'connecting') {
               <!-- Spinner for connecting -->
-              <svg class="size-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
-              </svg>
+              <app-spinner size="md" label="Connecting" />
             } @else {
               <!-- Mic icon for idle -->
               <ng-icon name="heroMicrophone" class="size-5" aria-hidden="true" />
@@ -140,24 +262,58 @@
           </button>
           }
 
-          <!-- Active Conversation Mode Chip -->
-          @if (systemPromptsService.activePrompt()) {
+          <!--
+            Mentioned-agent chip (D11). Says who is answering *this* message and gives
+            the only way back: the literal "@Name" in the text is what the user typed,
+            but the binding is this chip, so clearing it here is what un-mentions.
+          -->
+          @if (mentionedAgent(); as agent) {
             <div
-              class="flex items-center gap-1 rounded-full border border-primary-200 bg-primary-50 pl-2.5 pr-1 py-1 text-xs font-medium text-primary-700 dark:border-primary-700 dark:bg-primary-900/30 dark:text-primary-300"
+              class="flex items-center gap-1 rounded-full border border-state-success-200 bg-state-success-50 pl-2.5 pr-1 py-1 text-xs font-medium text-state-success-700 dark:border-state-success-700 dark:bg-state-success-900/30 dark:text-state-success-300"
               role="status"
-              [attr.aria-label]="'Active mode: ' + systemPromptsService.activePrompt()?.name"
+              [attr.aria-label]="'This message goes to ' + agent.name"
             >
-              <span class="max-w-28 truncate">{{ systemPromptsService.activePrompt()?.name }}</span>
+              <span class="max-w-32 truncate">{{ agent.name }} answers this one</span>
               <button
                 type="button"
-                (click)="dismissActivePrompt()"
-                class="flex size-4 shrink-0 items-center justify-center rounded-full text-primary-500 transition-colors hover:bg-primary-200 hover:text-primary-700 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary-500 dark:text-primary-400 dark:hover:bg-primary-700 dark:hover:text-primary-200"
-                aria-label="Clear conversation mode"
+                (click)="clearMention()"
+                class="flex size-4 shrink-0 items-center justify-center rounded-full text-state-success-500 transition-colors hover:bg-state-success-200 hover:text-state-success-700 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-state-success-500 dark:text-state-success-400 dark:hover:bg-state-success-700 dark:hover:text-state-success-200"
+                aria-label="Send this message to the assistant instead"
               >
                 <ng-icon name="heroXMark" class="size-3" aria-hidden="true" />
               </button>
             </div>
           }
+
+          <!--
+            Invoked-skill chips. Says which skills this message will run, and gives the way
+            back out. Unlike the mention chip these are not a separate binding — they are
+            a read of the `/slug` tokens in the text, so clearing one edits the text.
+
+            Neutral surface, brand blue only in the label. `bg-primary-50` looks like a
+            pale tint by its name but is not one: the primary scale is generated from
+            #0033a0 by lightness offset alone and keeps full chroma, so `primary-50`
+            resolves to rgb(118,179,255) — a saturated mid-blue that reads as a filled
+            blob behind small text. The `state-*` scales ARE real tints; `primary` is not.
+          -->
+          @for (command of invokedSkills(); track command.skillId) {
+            <div
+              class="flex items-center gap-1 rounded-full border border-gray-300 bg-white pl-2.5 pr-1 py-1 text-xs font-medium text-primary-accessible dark:border-gray-500 dark:bg-gray-700 dark:text-primary-50"
+              role="status"
+              [attr.aria-label]="'This message runs the ' + command.name + ' skill'"
+            >
+              <span class="max-w-40 truncate">{{ command.name }}</span>
+              <button
+                type="button"
+                (click)="clearSkillCommand(command)"
+                class="flex size-4 shrink-0 items-center justify-center rounded-full text-gray-500 transition-colors hover:bg-gray-200 hover:text-gray-700 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary-500 dark:text-gray-400 dark:hover:bg-gray-600 dark:hover:text-gray-200"
+                [attr.aria-label]="'Do not run the ' + command.name + ' skill'"
+              >
+                <ng-icon name="heroXMark" class="size-3" aria-hidden="true" />
+              </button>
+            </div>
+          }
+
         </div>
 
         <!-- Right Controls -->
@@ -168,10 +324,10 @@
           <!-- Submit/Stop Button -->
           <button
             type="button"
-            (click)="onSubmit()"
+            (click)="onPrimaryButtonClick()"
             [disabled]="!isLoading() && hasActivePendingUploads()"
             [class]="isLoading()
-              ? 'flex size-10 items-center justify-center rounded-full bg-red-500 text-white shadow-sm transition-all hover:bg-red-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-500'
+              ? 'flex size-10 items-center justify-center rounded-full bg-state-danger-500 text-white shadow-sm transition-all hover:bg-state-danger-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-state-danger-500'
               : 'flex size-10 items-center justify-center rounded-full bg-secondary-500 text-white shadow-sm transition-all hover:bg-secondary-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-secondary-500 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-secondary-500'"
             [attr.aria-label]="isLoading() ? 'Stop generation' : (hasActivePendingUploads() ? 'Upload in progress' : 'Submit message')"
           >
@@ -180,7 +336,7 @@
               <ng-icon name="heroStopSolid" class="size-5" aria-hidden="true" />
             } @else {
               <!-- Send Icon -->
-              <ng-icon name="heroPaperAirplaneSolid" class="size-5" aria-hidden="true" />
+              <ng-icon name="heroArrowUpSolid" class="size-5" aria-hidden="true" />
             }
           </button>
         </div>

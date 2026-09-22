@@ -143,32 +143,3 @@ st_tool_ids = st.lists(
     min_size=0,
     max_size=20,
 )
-
-
-# ---------------------------------------------------------------------------
-# st_sse_event_dict — dicts with string keys and JSON-serializable values
-# ---------------------------------------------------------------------------
-_json_primitives = st.one_of(
-    st.none(),
-    st.booleans(),
-    st.integers(min_value=-(2**31), max_value=2**31),
-    st.floats(allow_nan=False, allow_infinity=False),
-    st.text(max_size=50),
-)
-
-# Recursive strategy: primitives, lists of primitives, or nested dicts
-_json_values = st.recursive(
-    _json_primitives,
-    lambda children: st.one_of(
-        st.lists(children, max_size=5),
-        st.dictionaries(st.text(max_size=10), children, max_size=5),
-    ),
-    max_leaves=15,
-)
-
-st_sse_event_dict = st.dictionaries(
-    keys=st.text(min_size=1, max_size=20),
-    values=_json_values,
-    min_size=1,
-    max_size=8,
-)

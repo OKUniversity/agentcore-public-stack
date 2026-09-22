@@ -8,6 +8,7 @@
  */
 
 import { AppConfig, buildCorsOrigins } from '../../config';
+import { managedKbMetricNamespace } from '../managed-kb/managed-kb-role-construct';
 import { PlatformComputeRefs } from '../platform-compute-refs';
 
 /** All SSM-resolved values the App API construct needs. */
@@ -29,6 +30,7 @@ export interface AppApiSsmParams {
   usersTableArn: string;
   appRolesTableName: string;
   appRolesTableArn: string;
+  auditLogTableName: string;
   apiKeysTableName: string;
   apiKeysTableArn: string;
   oauthProvidersTableName: string;
@@ -53,8 +55,12 @@ export interface AppApiSsmParams {
   userSettingsTableArn: string;
   userMenuLinksTableName: string;
   userMenuLinksTableArn: string;
+  announcementsTableName: string;
+  announcementsTableArn: string;
   systemPromptsTableName: string;
   systemPromptsTableArn: string;
+  agentTemplatesTableName: string;
+  agentTemplatesTableArn: string;
   authProvidersTableName: string;
   authProvidersTableArn: string;
   authProviderSecretsArn: string;
@@ -77,6 +83,8 @@ export interface AppApiSsmParams {
   voiceTicketSigningSecretArn: string;
   // Inference
   inferenceApiRuntimeEndpointUrl: string;
+  /** AgentCore Runtime CloudWatch log group (spans + content log records) for eval sampling. */
+  agentCoreRuntimeLogGroupName: string;
   // File uploads
   userFilesBucketName: string;
   userFilesBucketArn: string;
@@ -113,6 +121,8 @@ export interface AppApiBackendOverrides {
   memoryId: string;
   /** AgentCore Runtime endpoint URL (from InferenceAgentCoreConstruct.runtimeEndpointUrl). */
   inferenceApiRuntimeEndpointUrl: string;
+  /** AgentCore Runtime log group name (from InferenceAgentCoreConstruct.runtimeLogGroupName). */
+  agentCoreRuntimeLogGroupName: string;
 }
 
 /** Resolve every value the App API construct needs.
@@ -145,6 +155,7 @@ export function resolveAppApiParams(
     usersTableArn: refs.usersTable.tableArn,
     appRolesTableName: refs.appRolesTable.tableName,
     appRolesTableArn: refs.appRolesTable.tableArn,
+    auditLogTableName: refs.auditLogTable.tableName,
     apiKeysTableName: refs.apiKeysTable.tableName,
     apiKeysTableArn: refs.apiKeysTable.tableArn,
     oauthProvidersTableName: refs.oauthProvidersTable.tableName,
@@ -169,8 +180,12 @@ export function resolveAppApiParams(
     userSettingsTableArn: refs.userSettingsTable.tableArn,
     userMenuLinksTableName: refs.userMenuLinksTable.tableName,
     userMenuLinksTableArn: refs.userMenuLinksTable.tableArn,
+    announcementsTableName: refs.announcementsTable.tableName,
+    announcementsTableArn: refs.announcementsTable.tableArn,
     systemPromptsTableName: refs.systemPromptsTable.tableName,
     systemPromptsTableArn: refs.systemPromptsTable.tableArn,
+    agentTemplatesTableName: refs.agentTemplatesTable.tableName,
+    agentTemplatesTableArn: refs.agentTemplatesTable.tableArn,
     authProvidersTableName: refs.authProvidersTable.tableName,
     authProvidersTableArn: refs.authProvidersTable.tableArn,
     authProviderSecretsArn: refs.authProviderSecretsSecret.secretArn,
@@ -193,6 +208,7 @@ export function resolveAppApiParams(
     voiceTicketSigningSecretArn: refs.voiceTicketSigningSecret.secretArn,
     // Inference
     inferenceApiRuntimeEndpointUrl: overrides.inferenceApiRuntimeEndpointUrl,
+    agentCoreRuntimeLogGroupName: overrides.agentCoreRuntimeLogGroupName,
     // File uploads
     userFilesBucketName: refs.fileUploadBucket.bucketName,
     userFilesBucketArn: refs.fileUploadBucket.bucketArn,
@@ -225,6 +241,37 @@ export function buildAppApiEnvironment(
   return {
     AWS_REGION: config.awsRegion,
     PROJECT_PREFIX: config.projectPrefix,
+    // Managed knowledge base byte caps (.kiro/specs/managed-kb-migration,
+    // Requirement 12.11). The cap must be enforced on EVERY byte-adding path, and
+    // interactive upload runs here — the migration worker has its own copy of
+    // these in kb-migration-construct.ts. Without them this service would fall
+    // back to the module defaults in byte_cap.py and silently ignore an operator's
+    // configured limits.
+    MANAGED_KB_PER_OWNER_DEFAULT_BYTES: String(config.managedKb.perOwnerDefaultBytes),
+    MANAGED_KB_PER_OWNER_ELEVATED_BYTES: String(config.managedKb.perOwnerElevatedBytes),
+    MANAGED_KB_PER_KB_CEILING_BYTES: String(config.managedKb.perKnowledgeBaseCeilingBytes),
+    // Gates the owner-facing upgrade offer (Requirement 23.1), which is served by
+    // THIS task — `apis/app_api/kb_upgrade/service.py` reads this exact variable.
+    //
+    // It is deliberately the same flag the dispatcher reads rather than a second
+    // one: offering an upgrade the worker cannot perform is a progress spinner
+    // with no engine behind it. One flag means the offer and the capability
+    // cannot disagree.
+    //
+    // Set explicitly to 'false' rather than omitted when off. The service reads
+    // it through an allow-list of affirmative spellings, so absent and 'false'
+    // behave identically — but an explicit value makes the shipped state visible
+    // in the task definition instead of having to be inferred from silence.
+    MANAGED_KB_MIGRATION_ENABLED: String(config.managedKb.migrationEnabled),
+    // Born-managed: when true, a newly finalized agent's knowledge base is
+    // provisioned on the managed backend from creation (skips the Upgrade step).
+    // The app-api reads this to enrol new agents; it depends on the migration
+    // worker running, so it only has effect alongside MANAGED_KB_MIGRATION_ENABLED.
+    // Explicit 'false' (not omitted) for the same visibility reason as above.
+    MANAGED_KB_NEW_DEFAULT: String(config.managedKb.newDefault),
+    // Kept in step with the IAM condition by deriving both from one helper; a
+    // mismatch would make every metric publish silently denied.
+    MANAGED_KB_METRIC_NAMESPACE: managedKbMetricNamespace(config),
     FRONTEND_URL: config.domainName ? `https://${config.domainName}` : 'http://localhost:4200',
     CORS_ORIGINS: buildCorsOrigins(config, config.appApi.additionalCorsOrigins).join(','),
     AGENTCORE_LOCAL_OAUTH_CALLBACK_URL: config.domainName
@@ -239,9 +286,15 @@ export function buildAppApiEnvironment(
     DYNAMODB_SYSTEM_ROLLUP_TABLE_NAME: params.systemCostRollupTableName,
     DYNAMODB_USERS_TABLE_NAME: params.usersTableName,
     DYNAMODB_APP_ROLES_TABLE_NAME: params.appRolesTableName,
+    DYNAMODB_AUDIT_LOG_TABLE_NAME: params.auditLogTableName,
     DYNAMODB_USER_FILES_TABLE_NAME: params.userFilesTableName,
     S3_USER_FILES_BUCKET_NAME: params.userFilesBucketName,
     FILE_UPLOAD_MAX_SIZE_BYTES: String(4194304),
+    // Decks route to the PowerPoint tools instead of Bedrock document blocks,
+    // so the inline-document ceiling that sets the 4MB general cap does not
+    // bound them. Keep in sync with PPTX_MAX_FILE_SIZE_BYTES in the SPA's
+    // file-upload.service.ts — the backend must never be the smaller of the two.
+    FILE_UPLOAD_MAX_SIZE_BYTES_PRESENTATION: String(26214400), // 25MB
     FILE_UPLOAD_MAX_FILES_PER_MESSAGE: String(5),
     FILE_UPLOAD_USER_QUOTA_BYTES: String(1073741824),
     S3_ASSISTANTS_DOCUMENTS_BUCKET_NAME: params.ragDocumentsBucketName,
@@ -260,7 +313,9 @@ export function buildAppApiEnvironment(
     AUTH_PROVIDER_SECRETS_ARN: params.authProviderSecretsArn,
     DYNAMODB_USER_SETTINGS_TABLE_NAME: params.userSettingsTableName,
     DYNAMODB_USER_MENU_LINKS_TABLE_NAME: params.userMenuLinksTableName,
+    DYNAMODB_ANNOUNCEMENTS_TABLE_NAME: params.announcementsTableName,
     DYNAMODB_SYSTEM_PROMPTS_TABLE_NAME: params.systemPromptsTableName,
+    DYNAMODB_AGENT_TEMPLATES_TABLE_NAME: params.agentTemplatesTableName,
     COGNITO_USER_POOL_ID: params.cognitoUserPoolId,
     COGNITO_APP_CLIENT_ID: params.cognitoAppClientId,
     COGNITO_ISSUER_URL: params.cognitoIssuerUrl,
@@ -293,6 +348,13 @@ export function buildAppApiEnvironment(
     // every read 502s (ResourceNotFoundException). inference-api already sets
     // the identical trio — app-api owns the CRUD surface, so it needs them too.
     MEMORY_SPACES_ENABLED: config.memorySpaces.enabled ? 'true' : 'false',
+    // Feedback eval sampling (response-feedback spec §11 PR-4): OPT-IN per
+    // environment — the admin batch sends down-thumbed conversations' spans to
+    // an AWS-managed evaluator. The runtime log group is where those spans and
+    // the content-bearing log records live (evaluations spike §1); it is wired
+    // regardless so turning the flag on is a one-variable change.
+    FEEDBACK_EVAL_SAMPLING_ENABLED: config.feedbackEvalSampling.enabled ? 'true' : 'false',
+    AGENTCORE_RUNTIME_LOG_GROUP: params.agentCoreRuntimeLogGroupName,
     DYNAMODB_MEMORY_SPACES_TABLE_NAME: params.memorySpacesTableName,
     S3_MEMORY_SPACES_BUCKET_NAME: params.memorySpacesBucketName,
     // Skills v2 (default ON with a kill switch per env). Skills live in the
@@ -304,6 +366,11 @@ export function buildAppApiEnvironment(
     // Gates only whether the routes 404; the assistant store it reads is always
     // present, so no extra table/bucket wiring is needed here.
     AGENTS_API_ENABLED: config.agents.enabled ? 'true' : 'false',
+    // Kill switch for the Agent Marketplace (listing lifecycle, publisher profiles,
+    // admin Review queue + Listings). App-api only — the marketplace adds no
+    // inference-api routes. It reads and writes the same assistants table the Agent
+    // surface already uses, so there is no extra wiring beyond the flag.
+    AGENT_MARKETPLACE_ENABLED: config.agentMarketplace.enabled ? 'true' : 'false',
     VOICE_TICKET_REPLAY_TABLE_NAME: params.voiceTicketReplayTableName,
     VOICE_TICKET_SIGNING_SECRET_ARN: params.voiceTicketSigningSecretArn,
   };

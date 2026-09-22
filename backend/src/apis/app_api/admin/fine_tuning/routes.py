@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 import logging
 
-from apis.shared.auth import User, require_admin
+from apis.shared.auth import User, require_admin_scope
 from apis.app_api.fine_tuning.repository import (
     FineTuningAccessRepository,
     get_fine_tuning_access_repository,
@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/fine-tuning", tags=["admin-fine-tuning"])
 
+# Every route in this package is guarded by this one scope, so the
+# permission boundary is the package boundary. Enforced by
+# tests/architecture/test_admin_scope_coverage.py.
+require_fine_tuning_admin = require_admin_scope("admin.fine_tuning")
+
 
 # ========== Dependencies ==========
 
@@ -56,7 +61,7 @@ def get_inf_repository() -> InferenceRepository:
 
 @router.get("/access", response_model=AccessListResponse)
 async def list_access(
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_fine_tuning_admin),
     repo: FineTuningAccessRepository = Depends(get_repository),
 ):
     """List all users with fine-tuning access (admin only)."""
@@ -76,7 +81,7 @@ async def list_access(
 @router.post("/access", response_model=FineTuningAccessGrant, status_code=status.HTTP_201_CREATED)
 async def grant_access(
     request: GrantAccessRequest,
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_fine_tuning_admin),
     repo: FineTuningAccessRepository = Depends(get_repository),
 ):
     """Grant fine-tuning access to a user by email (admin only)."""
@@ -86,7 +91,7 @@ async def grant_access(
         grant = repo.grant_access(
             email=request.email,
             granted_by=admin_user.email,
-            monthly_quota_hours=request.monthly_quota_hours,
+            monthly_quota_usd=request.monthly_quota_usd,
         )
         return FineTuningAccessGrant(**grant)
     except ValueError as e:
@@ -99,7 +104,7 @@ async def grant_access(
 @router.get("/access/{email}", response_model=FineTuningAccessGrant)
 async def get_access(
     email: str,
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_fine_tuning_admin),
     repo: FineTuningAccessRepository = Depends(get_repository),
 ):
     """Get fine-tuning access info for a specific user (admin only)."""
@@ -118,14 +123,14 @@ async def get_access(
 async def update_quota(
     email: str,
     request: UpdateQuotaRequest,
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_fine_tuning_admin),
     repo: FineTuningAccessRepository = Depends(get_repository),
 ):
-    """Update GPU-hour quota for a user (admin only)."""
+    """Update the monthly dollar quota for a user (admin only)."""
     logger.info("Admin updating fine-tuning quota")
 
     try:
-        result = repo.update_quota(email, request.monthly_quota_hours)
+        result = repo.update_quota(email, request.monthly_quota_usd)
         if result is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -142,7 +147,7 @@ async def update_quota(
 @router.delete("/access/{email}", status_code=status.HTTP_204_NO_CONTENT)
 async def revoke_access(
     email: str,
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_fine_tuning_admin),
     repo: FineTuningAccessRepository = Depends(get_repository),
 ):
     """Revoke fine-tuning access for a user (admin only)."""
@@ -167,7 +172,7 @@ async def revoke_access(
 @router.get("/jobs", response_model=JobListResponse)
 async def list_all_jobs(
     status_filter: Optional[str] = Query(None, alias="status"),
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_fine_tuning_admin),
     jobs_repo: FineTuningJobsRepository = Depends(get_jobs_repository),
 ):
     """List all fine-tuning jobs across all users (admin only)."""
@@ -211,7 +216,7 @@ async def list_all_jobs(
 @router.get("/inference-jobs", response_model=InferenceJobListResponse)
 async def list_all_inference_jobs(
     status_filter: Optional[str] = Query(None, alias="status"),
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_fine_tuning_admin),
     inf_repo: InferenceRepository = Depends(get_inf_repository),
 ):
     """List all inference jobs across all users (admin only)."""
@@ -229,6 +234,13 @@ async def list_all_inference_jobs(
 
 
 # ========== Cost Dashboard ==========
+
+# Terminal statuses AWS bills for, in the exact casing persisted on the job
+# record by the status maps in ``fine_tuning/routes.py``. The StatusIndex GSI
+# compares its partition key case-sensitively, so SageMaker's own "Completed"
+# spelling matches nothing here.
+BILLED_TERMINAL_STATUSES = ("COMPLETED", "FAILED", "STOPPED")
+
 
 def _date_range_for_period(period: str) -> tuple[str, str]:
     """Return (start_iso, end_iso) for a YYYY-MM period string."""
@@ -248,14 +260,22 @@ async def get_cost_dashboard(
         description="Billing period in YYYY-MM format. Defaults to current month.",
         regex=r"^\d{4}-\d{2}$",
     ),
-    admin_user: User = Depends(require_admin),
+    admin_user: User = Depends(require_fine_tuning_admin),
     jobs_repo: FineTuningJobsRepository = Depends(get_jobs_repository),
     inf_repo: InferenceRepository = Depends(get_inf_repository),
 ):
     """Get aggregated fine-tuning cost dashboard for a billing period.
 
-    Queries the StatusIndex GSI for Completed and Stopped jobs within
-    the requested month, then aggregates costs by user in application code.
+    Queries the StatusIndex GSI for every billed terminal status within the
+    requested month, then aggregates costs by user in application code.
+
+    Two things are easy to get wrong here. The GSI partition key is compared
+    case-sensitively, so the status values must be the ones actually stored
+    (``COMPLETED``/``FAILED``/``STOPPED`` — see the status maps in
+    ``fine_tuning/routes.py``), not SageMaker's own ``Completed``/``Stopped``
+    spelling. And FAILED belongs in the list: AWS bills a job that fails
+    partway through, so leaving it out understates real spend. The user-facing
+    quota counter already charges for failures; this dashboard matches it.
     """
     period = month or datetime.now(timezone.utc).strftime("%Y-%m")
     safe_period = period.replace("\n", "").replace("\r", "")
@@ -264,15 +284,19 @@ async def get_cost_dashboard(
     try:
         start_iso, end_iso = _date_range_for_period(period)
 
-        # Query training jobs (Completed + Stopped) via StatusIndex GSI
-        training_completed = jobs_repo.query_jobs_by_status_and_date("Completed", start_iso, end_iso)
-        training_stopped = jobs_repo.query_jobs_by_status_and_date("Stopped", start_iso, end_iso)
-        all_training = training_completed + training_stopped
+        # Query training jobs in every billed terminal status via StatusIndex GSI
+        all_training = [
+            job
+            for status_value in BILLED_TERMINAL_STATUSES
+            for job in jobs_repo.query_jobs_by_status_and_date(status_value, start_iso, end_iso)
+        ]
 
-        # Query inference jobs (Completed + Stopped) via StatusIndex GSI
-        inf_completed = inf_repo.query_jobs_by_status_and_date("Completed", start_iso, end_iso)
-        inf_stopped = inf_repo.query_jobs_by_status_and_date("Stopped", start_iso, end_iso)
-        all_inference = inf_completed + inf_stopped
+        # Query inference jobs in every billed terminal status via StatusIndex GSI
+        all_inference = [
+            job
+            for status_value in BILLED_TERMINAL_STATUSES
+            for job in inf_repo.query_jobs_by_status_and_date(status_value, start_iso, end_iso)
+        ]
 
         # Aggregate by user email
         user_data: dict[str, dict] = defaultdict(

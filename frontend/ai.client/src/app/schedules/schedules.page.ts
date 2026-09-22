@@ -12,6 +12,7 @@ import {
   ConfirmationDialogData,
 } from '../components/confirmation-dialog/confirmation-dialog.component';
 import { ToastService } from '../services/toast/toast.service';
+import { parseIso } from '../utils/date';
 
 const WEEKDAY_LABELS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
@@ -197,7 +198,7 @@ export class SchedulesPage implements OnInit {
   }
 
   private formatRelativeFuture(iso: string): string {
-    const then = new Date(iso).getTime();
+    const then = parseIso(iso).getTime();
     if (Number.isNaN(then)) return '—';
     const diffMins = Math.round((then - Date.now()) / 60_000);
     if (diffMins <= 0) return 'due now';
@@ -211,11 +212,11 @@ export class SchedulesPage implements OnInit {
     const base = 'inline-flex items-center gap-1.5 rounded-2xl px-2.5 py-0.5 text-xs/5 font-medium';
     switch (schedule.state) {
       case 'active':
-        return `${base} bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300`;
+        return `${base} bg-state-success-100 text-state-success-800 dark:bg-state-success-900/30 dark:text-state-success-300`;
       case 'paused':
         return `${base} bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300`;
       case 'paused_error':
-        return `${base} bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300`;
+        return `${base} bg-state-warning-100 text-state-warning-800 dark:bg-state-warning-900/30 dark:text-state-warning-300`;
       default:
         return `${base} bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300`;
     }
@@ -253,7 +254,7 @@ export class SchedulesPage implements OnInit {
   }
 
   private formatRelativePast(iso: string): string {
-    const then = new Date(iso).getTime();
+    const then = parseIso(iso).getTime();
     if (Number.isNaN(then)) return '';
     const diffMins = Math.floor((Date.now() - then) / 60_000);
     if (diffMins < 1) return 'just now';

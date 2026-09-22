@@ -38,6 +38,17 @@ class ModelProvider(str, Enum):
     # bearer token, not the Converse API with SigV4. Never auto-detected from
     # model_id — admins set it explicitly on the managed model.
     MANTLE = "mantle"
+    # The OpenAI **Responses** API on `bedrock-runtime.<region>.amazonaws.com`
+    # — the second OpenAI-compatible Bedrock surface. Same wire protocol and
+    # bearer-token auth as MANTLE, different host, IAM and model-id shape
+    # (cross-Region inference profiles: `us.` / `global.`).
+    #
+    # It exists for one reason: GPT-5.6 serves prompt caching ONLY over the
+    # Responses API. Routing the same model over Converse (which
+    # `bedrock-runtime` also supports) would drop into the BEDROCK path with
+    # no caching at all — ~10x the input cost on a long stable prefix.
+    # Never auto-detected from model_id; admins set it on the managed model.
+    BEDROCK_RESPONSES = "bedrock-responses"
 
 
 # Canonical param name -> provider-native key path (dot-separated for nested SDK fields).
@@ -235,6 +246,14 @@ class RetryConfig:
     sdk_initial_delay: float = 2.0      # Seconds before first retry, doubles each retry
     sdk_max_delay: float = 16.0         # Cap on exponential backoff
 
+    # Widen the SDK layer beyond ModelThrottledException to Bedrock's
+    # transient PRE-STREAM faults (ServiceUnavailableException,
+    # InternalServerException, ModelNotReadyException, ...). Without this,
+    # a 503 on the first attempt reaches the user as a conversational error
+    # with no retry at all — see BedrockTransientRetryStrategy. Default on;
+    # set RETRY_TRANSIENT_SERVICE_ERRORS=false for stock Strands behavior.
+    retry_transient_service_errors: bool = True
+
     @classmethod
     def from_env(cls) -> "RetryConfig":
         """Load configuration from environment variables.
@@ -247,6 +266,7 @@ class RetryConfig:
             RETRY_SDK_MAX_ATTEMPTS=4
             RETRY_SDK_INITIAL_DELAY=2.0
             RETRY_SDK_MAX_DELAY=16.0
+            RETRY_TRANSIENT_SERVICE_ERRORS=true
         """
         return cls(
             boto_max_attempts=int(os.environ.get(EnvVars.RETRY_BOTO_MAX_ATTEMPTS, str(Defaults.RETRY_BOTO_MAX_ATTEMPTS))),
@@ -256,7 +276,32 @@ class RetryConfig:
             sdk_max_attempts=int(os.environ.get(EnvVars.RETRY_SDK_MAX_ATTEMPTS, str(Defaults.RETRY_SDK_MAX_ATTEMPTS))),
             sdk_initial_delay=float(os.environ.get(EnvVars.RETRY_SDK_INITIAL_DELAY, str(Defaults.RETRY_SDK_INITIAL_DELAY))),
             sdk_max_delay=float(os.environ.get(EnvVars.RETRY_SDK_MAX_DELAY, str(Defaults.RETRY_SDK_MAX_DELAY))),
+            # Default-on kill switch: only the literal "false" disables it, so
+            # an unset var and a workflow that injects an empty string both
+            # keep the widened retry set.
+            retry_transient_service_errors=(
+                os.environ.get(EnvVars.RETRY_TRANSIENT_SERVICE_ERRORS, "").lower() != "false"
+            ),
         )
+
+
+# Bedrock's long cache TTL. Only "1h" is a change from the default; anything
+# else (unset, "5m", garbage) means "today's shape" — no ttl key on any point,
+# which is what keeps the static prefix bytes identical across the flip.
+LONG_CACHE_TTL = "1h"
+
+
+def static_prefix_cache_ttl() -> Optional[str]:
+    """The long TTL to put on the tools + system cachePoints, or ``None``.
+
+    Read from ``AGENTCORE_PROMPT_CACHE_STATIC_PREFIX_TTL`` at agent
+    construction (a cached agent keeps the arm it was built under). See
+    docs/specs/compaction-model-relative-thresholds.md §3.6 PR-5 for the
+    economics: 2x write premium on the static segments in exchange for
+    reading them, rather than re-writing them, on every 5–60 minute pause.
+    """
+    raw = os.environ.get(EnvVars.PROMPT_CACHE_STATIC_PREFIX_TTL, "").strip().lower()
+    return LONG_CACHE_TTL if raw == LONG_CACHE_TTL else None
 
 
 @dataclass
@@ -278,11 +323,16 @@ class ModelConfig:
     # Completions vs Responses). Only consulted on the MANTLE provider path,
     # where the factory uses it to pick OpenAIModel vs OpenAIResponsesModel.
     mantle_api_mode: MantleApiMode = MantleApiMode.CHAT_COMPLETIONS
-    # Bedrock Mantle: optional AWS region override for the inference endpoint.
+    # Optional AWS region override for an OpenAI-compatible Bedrock endpoint.
     # ``None`` -> the agent's AWS_REGION. Lets a model pin inference to the
     # region where it's hosted (e.g. openai.gpt-5.x in us-east-1) independent
-    # of where the app runs. Drives both the Mantle base URL and the region
-    # the bearer token is signed for (via bedrock_mantle_config).
+    # of where the app runs. Drives both the base URL and the region the
+    # bearer token is signed for, on BOTH OpenAI-compatible surfaces — Mantle
+    # (via bedrock_mantle_config) and bedrock-runtime Responses.
+    #
+    # The attribute name is historical: Mantle was the only such surface when
+    # it was added. The wire/persisted field is already the transport-neutral
+    # `region`, so only this Python name lags.
     mantle_region: Optional[str] = None
 
     def get_provider(self) -> ModelProvider:
@@ -311,19 +361,55 @@ class ModelConfig:
         # Default to configured provider
         return self.provider
 
-    def bedrock_cache_points_supported(self) -> bool:
-        """Whether explicit Bedrock cachePoints (tools/system) may be sent.
+    def long_ttl_static_prefix(self) -> bool:
+        """True when this model's tools + system cachePoints carry the 1h TTL.
 
-        Mirrors Strands' ``BedrockModel._cache_strategy`` predicate: Anthropic
-        models are the only Bedrock family with prompt-cache support. Auto
-        (message-level) caching no-ops safely on other models, but explicit
-        tools/system cachePoints would be sent verbatim and rejected with a
-        ValidationException — so both are gated here, alongside
-        ``caching_enabled``, on the Bedrock provider path.
+        The cost path uses it to bill the static segment's cache writes at
+        Bedrock's 1h premium (2x base) instead of the 5m one (1.25x) — the
+        correction that keeps the experiment arm's own cost rows honest.
+        """
+        return bool(self.caching_enabled and self.bedrock_cache_points_supported() and static_prefix_cache_ttl())
+
+    def bedrock_cache_points_supported(self) -> bool:
+        """Whether a hand-placed Bedrock system cachePoint may be sent.
+
+        Mirrors Strands' ``BedrockModel._cache_strategy`` predicate. What it is
+        load-bearing FOR is the system cachePoint that
+        ``AgentFactory.create_agent`` places — the one explicit point in this
+        codebase upstream will not filter for us. ``format_request`` copies
+        ``system_prompt_content`` verbatim (bedrock.py:376) and
+        ``_apply_system_cache_ttl`` only ever rewrites a TTL, never removes a
+        point, so a point placed on a model that cannot cache reaches Bedrock
+        and the call fails with **AccessDeniedException** — "You invoked an
+        unsupported model or your request did not allow prompt caching."
+        Measured live in us-west-2 (2026-09-11) on llama3-3-70b,
+        mistral-large-2407 and deepseek-r1; the identical request without the
+        point succeeds on all three.
+
+        It is also passed as ``tools_ttl``, where since strands-agents 1.55.0
+        it is belt-and-braces rather than load-bearing:
+        ``_build_tools_cache_point`` applies the same
+        ``_cache_strategy != "anthropic"`` test itself (bedrock.py:579), so
+        True and False emit byte-identical requests on a non-Anthropic model.
+        Kept as the single predicate both points read, so the two can never
+        disagree about which models get an explicit point.
+
+        ⚠️ This is deliberately NARROWER than "which Bedrock models support
+        prompt caching" — it tracks what *Strands* recognizes, not what
+        *Bedrock* accepts, and the two have already diverged. Nova Micro
+        accepts a system cachePoint and honors it (7,203 input tokens -> 2,
+        with 7,201 cache-written, same live probe) and this predicate denies
+        it. Widening it means widening past upstream's ``_cache_strategy``, so
+        re-measure with ``scripts/probe_bedrock_cache_point_support.py`` first
+        and widen the tools point in the same change.
         """
         model_lower = self.model_id.lower()
         return (
             self.caching_enabled
+            # Redundant with the family test below rather than an independent
+            # condition: get_provider() returns BEDROCK for any claude/anthropic
+            # id regardless of the configured provider. Kept as documentation of
+            # the surface this gates — the Converse path, not Mantle/Responses.
             and self.get_provider() == ModelProvider.BEDROCK
             and ("claude" in model_lower or "anthropic" in model_lower)
         )
@@ -351,7 +437,7 @@ class ModelConfig:
         # allows max 4; nothing else in this codebase adds one, see the
         # position test in tests/agents/main_agent/core/test_bedrock_cache_points.py):
         #
-        #   1. toolConfig tail   — cache_tools="default" (_build_tools_cache_point)
+        #   1. toolConfig tail   — CacheConfig(tools_ttl=True) (_build_tools_cache_point)
         #   2. system tail       — SystemContentBlock list built by
         #                          AgentFactory.create_agent (the deprecated
         #                          cache_prompt config key is NOT used)
@@ -361,8 +447,13 @@ class ModelConfig:
         #                          not touch the system/tools points.
         #
         # The tools+system points make a message-level lookup miss cost a
-        # cache READ of the stable prefix instead of a full re-write at
-        # $2.5/MTok (write premium). One proven miss mode is structural:
+        # cache READ of the stable prefix instead of a full re-write at the
+        # cache-write premium. There is no flat per-MTok figure for that
+        # premium: it is 1.25x the model's OWN base input rate, so price it
+        # against the model in play ($1.375/MTok on our default Haiku 4.5,
+        # $4.125 on Sonnet 4.6) — see the prompt-cache contract in CLAUDE.md,
+        # which is the single place that rule is maintained.
+        # One proven miss mode is structural:
         # Anthropic's cache lookback checks only ~20 content blocks behind
         # the breakpoint, so a wide parallel tool fan-out (e.g. 18 parallel
         # calls = ~38 new blocks) pushes the previous checkpoint out of range
@@ -371,10 +462,12 @@ class ModelConfig:
         # ~28k-token static prefix still reads from cache on those turns.
         #
         # For a model whose id Strands doesn't recognize as cache-capable,
-        # auto strategy logs a warning and no-ops — but cache_tools and a
-        # system cachePoint are sent unconditionally once configured, so both
-        # are gated on bedrock_cache_points_supported() (the same predicate
-        # Strands' auto mode uses). Requires strands-agents>=1.48.0: a
+        # auto strategy logs a warning and no-ops. The tools point is filtered
+        # by upstream on the same test as of 1.55.0, but a hand-placed SYSTEM
+        # point is passed through verbatim and Bedrock answers
+        # AccessDeniedException — so both read
+        # bedrock_cache_points_supported(), which is where that asymmetry and
+        # its live measurement are documented. Requires strands-agents>=1.48.0: a
         # cachePoint trailing a non-PDF `document` attachment is rejected by
         # Bedrock's Anthropic adapter with "ValidationException ...
         # content.N.type: Field required" (agent force-stop on any turn with a
@@ -384,11 +477,45 @@ class ModelConfig:
         # document is the first content block. Cache hits are user-visible in
         # the cost/context badge the moment this is on.
         # See: https://github.com/strands-agents/sdk-python/issues/1966
+        # tools_ttl replaces the model-level cache_tools key, deprecated in
+        # strands-agents 1.55.0 (_warn_on_deprecated_cache_tools). The emitted
+        # block is byte-identical either way, which matters because it is the
+        # tail of the cached prefix: with cache_config.ttl unset,
+        # _build_tools_cache_point resolves ttl to None for tools_ttl=True
+        # exactly as _build_deprecated_cache_tools_point did for
+        # cache_tools="default", so both emit {"cachePoint": {"type": "default"}}
+        # with no ttl key. False (not None) on the unsupported branch pins the
+        # off state explicitly rather than falling back through the deprecated
+        # key. Since cache_config.ttl stays unset, _apply_system_cache_ttl is
+        # also a no-op — it only rewrites a TTL-less cache point when one is
+        # configured.
+        #
+        # system_prompt_ttl keeps its 1.55 default of True, which appends a
+        # system cachePoint via _should_cache_system. That is inert on every
+        # path here: the guard is `not any("cachePoint" in block ...)`, and
+        # AgentFactory.create_agent already appends its own whenever
+        # bedrock_cache_points_supported() — the same predicate, so the two
+        # can't disagree. It stays on as the safety net for a system prompt
+        # that reaches Bedrock without going through that factory.
         if self.caching_enabled:
             from strands.models import CacheConfig
-            config["cache_config"] = CacheConfig(strategy="auto")
-            if self.bedrock_cache_points_supported():
-                config["cache_tools"] = "default"
+
+            # PR-5 (thresholds spec §3.6): an explicit "1h" on the two STATIC
+            # points only. system_prompt_ttl as a string is "honored as
+            # written" by _apply_system_cache_ttl, which rewrites the TTL on
+            # the hand-placed, TTL-less system point AgentFactory places;
+            # tools_ttl as a string sets the tools point's own TTL. The
+            # message-level auto point carries no ttl (cache_config.ttl stays
+            # unset) and so stays at 5m — tools(1h) → system(1h) → messages(5m)
+            # is the non-increasing order Bedrock requires. Off (the default)
+            # emits exactly today's bytes.
+            supported = self.bedrock_cache_points_supported()
+            long_ttl = static_prefix_cache_ttl() if supported else None
+            config["cache_config"] = CacheConfig(
+                strategy="auto",
+                system_prompt_ttl=long_ttl or True,
+                tools_ttl=(long_ttl or True) if supported else False,
+            )
 
         if self.retry_config:
             from botocore.config import Config as BotocoreConfig
@@ -465,6 +592,27 @@ class ModelConfig:
             config["params"] = params
         return config
 
+    def to_bedrock_responses_config(self) -> Dict[str, Any]:
+        """Convert to OpenAI Responses kwargs for the bedrock-runtime surface.
+
+        The Responses API's native param names are the same ones Mantle-Responses
+        uses — they belong to the API, not the transport — so the map is shared.
+        The builder supplies the client (base_url + per-request bearer token)
+        via ``client_args``; see ``apis.shared.models.bedrock_responses``.
+        """
+        params: Dict[str, Any] = {}
+        _apply_canonical_params(
+            params,
+            self.inference_params,
+            _MANTLE_RESPONSES_PARAM_MAP,
+            "bedrock-responses",
+            self.model_id,
+        )
+        config: Dict[str, Any] = {"model_id": self.model_id}
+        if params:
+            config["params"] = params
+        return config
+
     def to_gemini_config(self) -> Dict[str, Any]:
         """Convert to GeminiModel kwargs, translating canonical inference params."""
         params: Dict[str, Any] = {}
@@ -502,7 +650,8 @@ class ModelConfig:
         Args:
             model_id: Model ID (provider-specific format)
             caching_enabled: Whether to enable prompt caching (Bedrock only)
-            provider: Provider name ("bedrock", "openai", "gemini", or "mantle")
+            provider: Provider name ("bedrock", "openai", "gemini", "mantle",
+                or "bedrock-responses")
             inference_params: Canonical-name -> value map (temperature, top_p,
                 max_tokens, thinking, ...). Each provider's translation table
                 drops unsupported keys silently.

@@ -60,6 +60,12 @@ export interface PlatformComputeRefs {
   oauthUserTokensTable: dynamodb.ITable;
   oauthTokenEncryptionKey: kms.IKey;
   oauthClientSecretsSecret: secretsmanager.ISecret;
+  /**
+   * Confidential-client secret for the RFC 8693 token exchange.
+   * Undefined unless `config.tokenExchange` is configured — the secret is
+   * not created for deployments that do not use the feature.
+   */
+  tokenExchangeSecret?: secretsmanager.ISecret;
   authProvidersTable: dynamodb.ITable;
   authProviderSecretsSecret: secretsmanager.ISecret;
 
@@ -68,6 +74,7 @@ export interface PlatformComputeRefs {
   bffSessionsTable: dynamodb.ITable;
   usersTable: dynamodb.ITable;
   appRolesTable: dynamodb.ITable;
+  auditLogTable: dynamodb.ITable;
   apiKeysTable: dynamodb.ITable;
   userQuotasTable: dynamodb.ITable;
   quotaEventsTable: dynamodb.ITable;
@@ -77,7 +84,9 @@ export interface PlatformComputeRefs {
   managedModelsTable: dynamodb.ITable;
   userSettingsTable: dynamodb.ITable;
   userMenuLinksTable: dynamodb.ITable;
+  announcementsTable: dynamodb.ITable;
   systemPromptsTable: dynamodb.ITable;
+  agentTemplatesTable: dynamodb.ITable;
   sharedConversationsTable: dynamodb.ITable;
   sharedConversationsBucket: s3.IBucket;
   fileUploadBucket: s3.IBucket;
@@ -88,6 +97,14 @@ export interface PlatformComputeRefs {
   ragAssistantsTable: dynamodb.ITable;
   ragVectorBucketName: string;
   ragVectorIndexName: string;
+
+  // ── Managed knowledge bases
+  /**
+   * Bedrock managed-KB service role ARN. Threaded (not read from SSM)
+   * because PlatformStack publishes this parameter itself — see the
+   * first-deploy deadlock explained at the top of this file.
+   */
+  managedKbServiceRoleArn: string;
 
   // ── Artifacts
   artifactsContentBucket: s3.IBucket;
@@ -114,6 +131,15 @@ export interface PlatformComputeRefs {
   agentCoreCodeInterpreterId: string;
   agentCoreBrowserArn: string;
   agentCoreBrowserId: string;
+  /**
+   * S3 location of the Chromium MANAGED policy every browser session is
+   * started with (docs/specs/authenticated-web-assessment.md D6). Passed to
+   * `StartBrowserSession` rather than attached to the browser resource: the
+   * resource is immutable (no UpdateBrowser) and CfnBrowserCustom does not
+   * expose enterprisePolicies.
+   */
+  browserPolicyBucketName: string;
+  browserPolicyKey: string;
 
   // ── MCP sandbox edge
   mcpSandboxProxyOrigin: string;

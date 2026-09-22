@@ -13,22 +13,33 @@ import {
 import {
   QuotaWarningService,
   QuotaWarning,
+  QuotaSessionNotice,
   QuotaExceeded,
 } from '../../../services/quota/quota-warning.service';
 import { OAuthConsentService } from '../../../services/oauth-consent/oauth-consent.service';
 import { ToolApprovalService } from '../../../services/tool-approval/tool-approval.service';
+import { UserQuestionService } from '../../../services/user-question/user-question.service';
+import { BrowserLoginService } from '../../../services/browser-login/browser-login.service';
 import { CompactionSummaryService } from './compaction-summary.service';
+import { SteeringService } from './steering.service';
+import { buildSteeringMessage } from './steering';
 import { ArtifactStateService } from '../artifacts/artifact-state.service';
+import { FilePreviewStateService } from '../file-preview/file-preview-state.service';
+import { isPreviewableFilename } from '../file-preview/file-preview.model';
 import { McpAppStateService } from '../mcp-apps/mcp-app-state.service';
+import { ToolInsightService } from './tool-insight.service';
 import { SessionService } from '../session/session.service';
 import type {
   OAuthRequiredEvent,
   ToolApprovalRequiredEvent,
+  UserQuestionRequiredEvent,
+  BrowserLoginRequiredEvent,
   CompactionEvent,
   ArtifactEvent,
   UiResourceEvent,
   ToolInputPartialEvent,
   SessionTitleEvent,
+  ModelRetryEvent,
 } from '../../../shared/utils/stream-parser';
 import {
   processStreamEvent,
@@ -39,7 +50,7 @@ import {
   type StreamParserCallbacks,
   type ContentBlockBuilder,
   type MessageBuilder,
-  type ToolProgress,
+  type SteeringAppliedEvent,
   type ContentBlockDeltaEvent,
   type ContentBlockStartEvent,
   type ToolResultEventData,
@@ -54,9 +65,6 @@ enum StreamState {
   Completed = 'completed',
   Error = 'error',
 }
-
-// Re-export ToolProgress for backwards compatibility
-export type { ToolProgress };
 
 /**
  * Tools whose `content` input is a long document worth surfacing live (as a
@@ -92,8 +100,36 @@ interface ParserSessionState {
   /** Completed messages in the current turn (for multi-turn tool use) */
   completedMessages: WritableSignal<Message[]>;
 
-  /** Tool progress indicator state */
-  toolProgress: WritableSignal<ToolProgress>;
+  /**
+   * Mid-turn steering messages that must render AFTER the message currently
+   * being built (docs/specs/mid-turn-steering.md).
+   *
+   * A steer lands at a tool boundary, and on a `tool_use` stop reason the
+   * tool-calling assistant message is deliberately kept active so its results
+   * can attach — so at the moment the ack arrives, that message is still the
+   * *current* one. Appending the user's words straight to `completedMessages`
+   * would sort them ahead of the assistant turn they interrupted. They wait
+   * here instead and are folded in, in order, when that message finalizes.
+   */
+  steeringMessages: WritableSignal<Message[]>;
+
+  /**
+   * Epoch ms of the last event received on this stream. Stamped on EVERY
+   * event, including ones the state gate then drops — the point is liveness
+   * of the connection, not whether the payload was useful. Lets the UI tell a
+   * long stall apart from a hang, which is otherwise impossible from the
+   * client side (prod 5f34d2b0: two turns went ~95s with no output and the
+   * user abandoned both).
+   */
+  lastEventAt: WritableSignal<number>;
+
+  /**
+   * The most recent model-call retry this turn, or null. Set by the
+   * `model_retry` SSE event and cleared as soon as content arrives, so the
+   * loading indicator can explain the silence instead of leaving the user to
+   * read it as a hang.
+   */
+  modelRetry: WritableSignal<ModelRetryEvent | null>;
 
   /** Error state */
   error: WritableSignal<string | null>;
@@ -132,10 +168,15 @@ export class StreamParserService {
   private quotaWarningService = inject(QuotaWarningService);
   private oauthConsentService = inject(OAuthConsentService);
   private toolApprovalService = inject(ToolApprovalService);
+  private userQuestionService = inject(UserQuestionService);
+  private browserLoginService = inject(BrowserLoginService);
   private compactionSummary = inject(CompactionSummaryService);
+  private steering = inject(SteeringService);
   private artifactState = inject(ArtifactStateService);
+  private filePreview = inject(FilePreviewStateService);
   private mcpAppState = inject(McpAppStateService);
   private sessionService = inject(SessionService);
+  private toolInsight = inject(ToolInsightService);
 
   // =========================================================================
   // Per-Session State
@@ -150,7 +191,8 @@ export class StreamParserService {
   /** Stable per-session accessor signals (cached so callers can hold them). */
   private readonly allMessagesCache = new Map<string, Signal<Message[]>>();
   private readonly streamingMessageIdCache = new Map<string, Signal<string | null>>();
-  private readonly toolProgressCache = new Map<string, Signal<ToolProgress>>();
+  private readonly modelRetryCache = new Map<string, Signal<ModelRetryEvent | null>>();
+  private readonly lastEventAtCache = new Map<string, Signal<number>>();
   private readonly citationsCache = new Map<string, Signal<Citation[]>>();
   private readonly errorCache = new Map<string, Signal<string | null>>();
   private readonly isStreamCompleteCache = new Map<string, Signal<boolean>>();
@@ -176,9 +218,21 @@ export class StreamParserService {
     return this.cachedAccessor(this.streamingMessageIdCache, sessionId, (state) => state.streamingMessageId(), null);
   }
 
-  /** Tool progress indicator state for a session. */
-  toolProgressFor(sessionId: string): Signal<ToolProgress> {
-    return this.cachedAccessor(this.toolProgressCache, sessionId, (state) => state.toolProgress(), { visible: false });
+  /**
+   * The current model-call retry notice for a session, or null when the model
+   * is responding normally. Drives the "still working" copy on the loader.
+   */
+  modelRetryFor(sessionId: string): Signal<ModelRetryEvent | null> {
+    return this.cachedAccessor(this.modelRetryCache, sessionId, (state) => state.modelRetry(), null);
+  }
+
+  /**
+   * Epoch ms of the last event seen on a session's stream, or 0 before one
+   * starts. The UI compares it against the clock to decide when silence has
+   * gone on long enough to be worth explaining.
+   */
+  lastEventAtFor(sessionId: string): Signal<number> {
+    return this.cachedAccessor(this.lastEventAtCache, sessionId, (state) => state.lastEventAt(), 0);
   }
 
   /** Pending citations for a session's next assistant message. */
@@ -202,7 +256,15 @@ export class StreamParserService {
    */
   parseSSELine(sessionId: string, line: string): void {
     const state = this.states().get(sessionId);
-    if (!state || !this.shouldProcessEvent(state)) {
+    if (!state) {
+      return;
+    }
+
+    // Liveness first — see parseEventSourceMessage. A line the state gate
+    // below drops still proves the connection is alive.
+    state.lastEventAt.set(Date.now());
+
+    if (!this.shouldProcessEvent(state)) {
       return;
     }
 
@@ -233,6 +295,12 @@ export class StreamParserService {
     if (expectedStreamId && state.currentStreamId !== expectedStreamId) {
       return; // Stale event from a superseded stream for this session.
     }
+
+    // Stamp liveness before the validation and state gates below: a `ping` or
+    // an event this stream state drops is still proof the server is talking.
+    // Placed after the stale-stream guard so a superseded stream can't keep
+    // its replacement looking alive.
+    state.lastEventAt.set(Date.now());
 
     // Validate inputs
     if (!event || typeof event !== 'string') {
@@ -286,6 +354,14 @@ export class StreamParserService {
    * @param startingMessageCount - Current message count in the session (for ID computation)
    */
   reset(sessionId: string, startingMessageCount?: number): void {
+    // A fresh turn has called nothing yet, so a follow-up typed right now has
+    // no boundary to land on until it does. The composer's placeholder reads
+    // this; leaving the previous turn's flag set would promise mid-turn
+    // delivery on a turn that may be pure text.
+    this.steering.startTurn(sessionId);
+    // Start the elapsed clock here, not at the first runtime event: the wait
+    // the user is measuring begins when they hit send.
+    this.toolInsight.startTurn(sessionId);
     const state = this.createState(sessionId, startingMessageCount || 0);
     this.states.update((map) => {
       const next = new Map(map);
@@ -335,6 +411,7 @@ export class StreamParserService {
   private createState(sessionId: string, startingMessageCount: number): ParserSessionState {
     const currentMessageBuilder = signal<MessageBuilder | null>(null);
     const completedMessages = signal<Message[]>([]);
+    const steeringMessages = signal<Message[]>([]);
     const isStreamComplete = signal<boolean>(false);
 
     const state: ParserSessionState = {
@@ -344,7 +421,9 @@ export class StreamParserService {
       streamState: StreamState.Idle,
       currentMessageBuilder,
       completedMessages,
-      toolProgress: signal<ToolProgress>({ visible: false }),
+      steeringMessages,
+      modelRetry: signal<ModelRetryEvent | null>(null),
+      lastEventAt: signal<number>(Date.now()),
       error: signal<string | null>(null),
       isStreamComplete,
       metadata: signal<MetadataEvent | null>(null),
@@ -356,7 +435,11 @@ export class StreamParserService {
       allMessages: computed<Message[]>(() => {
         const completed = completedMessages();
         const current = state.currentMessage();
-        return current ? [...completed, current] : completed;
+        const steering = steeringMessages();
+        if (!current) {
+          return steering.length > 0 ? [...completed, ...steering] : completed;
+        }
+        return [...completed, current, ...steering];
       }),
       streamingMessageId: computed<string | null>(() => {
         const builder = currentMessageBuilder();
@@ -406,6 +489,48 @@ export class StreamParserService {
    * and re-hydrate from the server, so a background stream must not push
    * into them while another conversation is on screen.
    */
+  /**
+   * Surface a file the turn just produced in the docked preview pane.
+   *
+   * Parity with artifacts, which pop their panel from `onArtifact`. The
+   * office tools have no SSE event of their own — the download card is
+   * just a `file_download` inline visual inside the tool result — so the
+   * hook lives here instead. That is the right place for a second reason:
+   * `tool_result` only ever arrives mid-stream, so reopening an old
+   * conversation replays the card without reopening the pane, matching
+   * `seedFromHydration` on the artifact side.
+   *
+   * Viewed-session only, for the same reason as `onArtifact`: a
+   * conversation streaming in the background must never seize the rail.
+   *
+   * A turn that writes several files opens each in turn and the last one
+   * wins, which is also how the artifact panel behaves. Formats the pane
+   * cannot render (.xlsx today) are skipped, so the card is left to speak
+   * for itself rather than opening a pane that would only show an error.
+   */
+  private maybeOpenFilePreview(
+    state: ParserSessionState,
+    resultContent: ReadonlyArray<{ json?: unknown }>,
+  ): void {
+    if (!this.isViewedSession(state)) return;
+
+    for (const entry of resultContent) {
+      const json = entry.json as
+        | { ui_type?: string; payload?: { filename?: string; upload_id?: string } }
+        | undefined;
+      if (!json || json.ui_type !== 'file_download') continue;
+
+      const filename = json.payload?.filename;
+      const uploadId = json.payload?.upload_id;
+      // `upload_id` is the current contract; cards persisted before it
+      // carry only an expired presigned URL, and those never stream live.
+      if (!filename || !uploadId) continue;
+      if (!isPreviewableFilename(filename)) continue;
+
+      this.filePreview.open({ uploadId, filename });
+    }
+  }
+
   private isViewedSession(state: ParserSessionState): boolean {
     return this.chatStateService.viewedSessionId() === state.sessionId;
   }
@@ -428,15 +553,39 @@ export class StreamParserService {
       onContentBlockDelta: (data) => this.handleContentBlockDelta(state, data),
       onContentBlockStop: (data) => this.handleContentBlockStop(state, data),
 
-      onToolUse: (data) => this.handleToolUseProgress(state, data),
+      onToolUse: () => {
+        // This turn has tool boundaries, so a follow-up typed from here can
+        // land mid-turn. Drives the composer's placeholder wording.
+        this.steering.markToolUsed(state.sessionId);
+      },
       onToolResult: (data) => this.handleToolResult(state, data),
-      onToolProgress: (progress) => state.toolProgress.set(progress),
+
+      // Live narration. Not viewed-session-scoped: a background
+      // conversation's status stays with that conversation rather than
+      // leaking onto the one on screen (same reasoning as model_retry).
+      onAgentStatus: (data) => this.toolInsight.recordStatus(state.sessionId, data),
+
+      // A finished batch's model-generated summary. Arrives out of band with
+      // the content stream, keyed by tool-use id, so it can land after the
+      // rail that shows it has already rendered — the registry is a signal,
+      // so the rail re-renders when it does.
+      onToolGroupSummary: (data) =>
+        this.toolInsight.recordSummary(state.sessionId, data),
+
+      onModelRetry: (data: ModelRetryEvent) => {
+        // Not viewed-session-scoped on purpose: this signal is read per
+        // session id, so a background conversation's retry stays with that
+        // conversation instead of leaking into the one on screen.
+        state.modelRetry.set(data);
+      },
 
       onMetadata: (data) => this.handleMetadata(state, data),
       onReasoning: (data) => this.handleReasoning(state, data),
       onCitation: (data) => this.handleCitation(state, data),
 
       onQuotaWarning: (data) => this.quotaWarningService.setWarning(data as QuotaWarning),
+      onQuotaSessionNotice: (data) =>
+        this.quotaWarningService.setSessionNotice(data as QuotaSessionNotice),
       onQuotaExceeded: (data) => this.quotaWarningService.setQuotaExceeded(data as QuotaExceeded),
 
       onOAuthRequired: (data: OAuthRequiredEvent) => {
@@ -452,6 +601,20 @@ export class StreamParserService {
           lastAssistantId,
           state.sessionId,
         );
+      },
+
+      onSteeringApplied: (data: SteeringAppliedEvent) => {
+        // A follow-up the user typed mid-stream is now in conversation
+        // history. Two things follow, and they are independent:
+        //
+        //  1. The composer drops its queued copy (via SteeringService), so
+        //     the end-of-turn flush does not send it a second time. NOT
+        //     viewed-session-scoped — the entry belongs to the conversation
+        //     that armed it, and a background stream's ack must still clear
+        //     it or the user gets a duplicate when they come back.
+        //  2. It renders as a user message inside the still-streaming turn.
+        this.steering.recordApplied(data);
+        this.appendSteeringMessage(state, data);
       },
 
       onCompaction: (data: CompactionEvent) => {
@@ -483,13 +646,15 @@ export class StreamParserService {
       onUiResource: (data: UiResourceEvent) => {
         // Inline event (arrives right after its tool_result, mid-stream),
         // unlike the post-message_stop side channels above — just record
-        // it keyed by toolUseId. The tool-use renderer picks it up
-        // reactively and swaps in the MCP App frame. Viewed-session only:
-        // McpAppStateService is reset on route change, so recording for a
-        // background conversation would be wiped before it could render.
-        if (this.isViewedSession(state)) {
-          this.mcpAppState.recordLive(data);
-        }
+        // it under this stream's own session, keyed by toolUseId. The
+        // tool-use renderer picks it up reactively and swaps in the MCP App
+        // frame. Deliberately NOT viewed-session-scoped: McpAppStateService
+        // retains per conversation rather than resetting on route change, so
+        // a background conversation's App is there when the user navigates
+        // to it. Dropping it here would lose it for good — the inline event
+        // never re-streams and the persisted replay rides on a `GET
+        // /messages` that navigate-back skips.
+        this.mcpAppState.recordLive(state.sessionId, data);
       },
 
       onToolInputPartial: (data: ToolInputPartialEvent) => {
@@ -497,10 +662,13 @@ export class StreamParserService {
         // UI tool's args are still streaming (after early frame mount). Record
         // the latest healed prefix keyed by toolUseId; the frame relays it to
         // the App as `ui/notifications/tool-input-partial` for progressive
-        // rendering (e.g. Excalidraw's guided camera tour).
-        if (this.isViewedSession(state)) {
-          this.mcpAppState.recordPartialInput(data.toolUseId, data.arguments);
-        }
+        // rendering (e.g. Excalidraw's guided camera tour). Recorded under
+        // this stream's own session, same as the resource above.
+        this.mcpAppState.recordPartialInput(
+          state.sessionId,
+          data.toolUseId,
+          data.arguments,
+        );
       },
 
       onSessionTitle: (data: SessionTitleEvent) => {
@@ -526,6 +694,37 @@ export class StreamParserService {
           message: data.message,
           messageId: lastAssistantId,
           sessionId: state.sessionId,
+        });
+      },
+
+      onUserQuestionRequired: (data: UserQuestionRequiredEvent) => {
+        const lastAssistantId = this.findLastAssistantId(state);
+        this.userQuestionService.requestAnswers({
+          interruptId: data.interruptId,
+          toolUseId: data.toolUseId,
+          questions: data.questions,
+          messageId: lastAssistantId,
+          sessionId: state.sessionId,
+        });
+      },
+
+      onBrowserLoginRequired: (data: BrowserLoginRequiredEvent) => {
+        const lastAssistantId = this.findLastAssistantId(state);
+        // `data.sessionId` is the conversation the backend named; prefer the
+        // parser's own state so a late event from a previous conversation
+        // cannot point the viewer at the wrong thread.
+        this.browserLoginService.requestLogin({
+          interruptId: data.interruptId,
+          toolUseId: data.toolUseId,
+          sessionId: state.sessionId || data.sessionId,
+          browserSessionId: data.browserSessionId,
+          browserId: data.browserId,
+          viewport: data.viewport,
+          deadlineAt: data.deadlineAt,
+          targetUrl: data.targetUrl,
+          reason: data.reason,
+          sandboxOrigin: data.sandboxOrigin,
+          messageId: lastAssistantId,
         });
       },
 
@@ -568,6 +767,9 @@ export class StreamParserService {
 
     // Clear any previous errors
     state.error.set(null);
+
+    // Content is arriving, so whatever retry we were explaining is over.
+    state.modelRetry.set(null);
 
     // If there's an existing message, finalize it before starting a new one
     const currentBuilder = state.currentMessageBuilder();
@@ -615,6 +817,9 @@ export class StreamParserService {
 
     const blockType: 'text' | 'tool_use' = data.type === 'tool_use' ? 'tool_use' : 'text';
 
+    // Output is starting, so any thinking that preceded it is over.
+    this.closeReasoningSpan(state);
+
     state.currentMessageBuilder.update((builder) => {
       if (!builder) return builder;
 
@@ -634,17 +839,6 @@ export class StreamParserService {
 
       return { ...builder, contentBlocks: newBlocks };
     });
-
-    // Show tool progress for tool_use blocks
-    if (blockType === 'tool_use' && data.toolUse) {
-      state.toolProgress.set({
-        visible: true,
-        toolName: data.toolUse.name,
-        toolUseId: data.toolUse.toolUseId,
-        message: `Running ${data.toolUse.name}...`,
-        startTime: Date.now(),
-      });
-    }
   }
 
   private handleContentBlockDelta(state: ParserSessionState, data: ContentBlockDeltaEvent): void {
@@ -655,6 +849,10 @@ export class StreamParserService {
     }
 
     const inferredType = inferContentBlockType(data);
+
+    // The accurate end of thinking for a model that skips content_block_start
+    // for text (Claude does), which is the common case.
+    this.closeReasoningSpan(state);
 
     state.currentMessageBuilder.update((builder) => {
       if (!builder) return builder;
@@ -724,26 +922,11 @@ export class StreamParserService {
 
       block.isComplete = true;
 
-      if (block.type === 'tool_use') {
-        state.toolProgress.set({ visible: false });
-      }
-
       const newBlocks = new Map(builder.contentBlocks);
       newBlocks.set(data.contentBlockIndex, { ...block });
 
       return { ...builder, contentBlocks: newBlocks };
     });
-  }
-
-  private handleToolUseProgress(state: ParserSessionState, data: {
-    tool_use: { name: string; tool_use_id: string; input: string };
-  }): void {
-    state.toolProgress.update((progress) => ({
-      ...progress,
-      visible: true,
-      toolName: data.tool_use.name,
-      toolUseId: data.tool_use.tool_use_id,
-    }));
   }
 
   private handleToolResult(state: ParserSessionState, data: ToolResultEventData): void {
@@ -756,6 +939,13 @@ export class StreamParserService {
       this.setError(state, 'tool_result: received without active message');
       return;
     }
+
+    // Parsed before the block lookup, and the pane opened from it, so
+    // surfacing a file the turn produced does not depend on the block
+    // bookkeeping below finding its tool_use — an unmatched result still
+    // means the file exists.
+    const resultContent = parseToolResultContent(content);
+    this.maybeOpenFilePreview(state, resultContent);
 
     // Find the tool_use block
     let foundIndex: number | null = null;
@@ -772,8 +962,6 @@ export class StreamParserService {
     if (foundIndex === null) {
       return; // Tool use block not found
     }
-
-    const resultContent = parseToolResultContent(content);
 
     state.currentMessageBuilder.update((builder) => {
       if (!builder) return builder;
@@ -795,8 +983,6 @@ export class StreamParserService {
 
       return { ...builder, contentBlocks: newBlocks };
     });
-
-    state.toolProgress.set({ visible: false });
   }
 
   private handleMessageStop(state: ParserSessionState, data: { stopReason: string }): void {
@@ -807,6 +993,10 @@ export class StreamParserService {
     }
 
     this.chatStateService.setStopReason(state.sessionId, data.stopReason);
+
+    // Backstop for a cycle that reasoned and emitted nothing else — without it
+    // that block would keep the live "Thinking" header forever.
+    this.closeReasoningSpan(state);
 
     state.currentMessageBuilder.update((builder) => {
       if (!builder) return builder;
@@ -822,7 +1012,10 @@ export class StreamParserService {
   private handleDone(state: ParserSessionState): void {
     this.finalizeCurrentMessage(state);
     state.isStreamComplete.set(true);
-    state.toolProgress.set({ visible: false });
+    state.modelRetry.set(null);
+    // "Using list_courses" on a finished turn is a lie, not a stale nicety.
+    // Durations and summaries already recorded are untouched.
+    this.toolInsight.clearStatus(state.sessionId);
     state.streamState = StreamState.Completed;
 
     // Automatic cleanup after delay. Guarded on the stream ID so a session
@@ -911,6 +1104,47 @@ export class StreamParserService {
     }
   }
 
+  /**
+   * Stamp the end of an open reasoning span, if there is one.
+   *
+   * Called from every point where the model has demonstrably switched from
+   * thinking to producing output: a non-reasoning `content_block_start`, a
+   * non-reasoning `content_block_delta`, and `message_stop` as the backstop
+   * for a cycle that reasoned and then ended without emitting anything else.
+   *
+   * Idempotent and cheap: it reads the builder first and returns without
+   * touching the signal unless there is an open span to close. That matters
+   * because the delta path calls it on every token of the answer.
+   */
+  private closeReasoningSpan(state: ParserSessionState): void {
+    const builder = state.currentMessageBuilder();
+    if (!builder) return;
+
+    let openIndex = -1;
+    for (const [index, block] of builder.contentBlocks.entries()) {
+      if (
+        block.type === 'reasoningContent' &&
+        block.reasoningStartedAt !== undefined &&
+        block.reasoningEndedAt === undefined
+      ) {
+        openIndex = index;
+        break;
+      }
+    }
+    if (openIndex === -1) return;
+
+    const endedAt = Date.now();
+    state.currentMessageBuilder.update((current) => {
+      if (!current) return current;
+      const block = current.contentBlocks.get(openIndex);
+      if (!block || block.reasoningEndedAt !== undefined) return current;
+
+      const newBlocks = new Map(current.contentBlocks);
+      newBlocks.set(openIndex, { ...block, reasoningEndedAt: endedAt });
+      return { ...current, contentBlocks: newBlocks };
+    });
+  }
+
   private handleReasoning(state: ParserSessionState, data: { reasoningText?: string }): void {
     if (!data.reasoningText) {
       return;
@@ -947,6 +1181,10 @@ export class StreamParserService {
           inputChunks: [],
           reasoningChunks: [],
           isComplete: false,
+          // Opens the span the header's "Thought for 17s" reports. Closed by
+          // `closeReasoningSpan` at the first non-reasoning content, or at
+          // message_stop. See docs/specs/agent-state-feedback.md PR-1.
+          reasoningStartedAt: Date.now(),
         };
       }
 
@@ -982,7 +1220,7 @@ export class StreamParserService {
   private setError(state: ParserSessionState, message: string): void {
     state.error.set(message);
     state.isStreamComplete.set(true);
-    state.toolProgress.set({ visible: false });
+    this.toolInsight.clearStatus(state.sessionId);
     state.streamState = StreamState.Error;
   }
 
@@ -1117,6 +1355,13 @@ export class StreamParserService {
       };
     }
 
+    // Turn-level: how long the whole turn took, server-measured. Kept
+    // separate from `latency.endToEndLatency` because the persisted form of
+    // that field is the provider's API-call time, so the two disagree.
+    if (metadataEvent.turnDurationMs !== undefined) {
+      result['turnDurationMs'] = metadataEvent.turnDurationMs;
+    }
+
     if (metadataEvent.cost !== undefined) {
       result['cost'] = metadataEvent.cost;
     }
@@ -1135,7 +1380,7 @@ export class StreamParserService {
   private buildContentBlock(state: ParserSessionState, builder: ContentBlockBuilder): ContentBlock {
     // Handle reasoning content blocks
     if (builder.type === 'reasoningContent') {
-      return {
+      const block: ContentBlock = {
         type: 'reasoningContent',
         reasoningContent: {
           reasoningText: {
@@ -1143,6 +1388,21 @@ export class StreamParserService {
           },
         },
       } as ContentBlock;
+
+      // Only once the span is closed. A duration that ticked upward while the
+      // model was still thinking would be a stopwatch, not the summary the
+      // header is for — and the live state is already conveyed by the label.
+      if (
+        builder.reasoningStartedAt !== undefined &&
+        builder.reasoningEndedAt !== undefined
+      ) {
+        block.reasoningDurationMs = Math.max(
+          0,
+          builder.reasoningEndedAt - builder.reasoningStartedAt,
+        );
+      }
+
+      return block;
     }
 
     // Handle tool use blocks
@@ -1203,14 +1463,58 @@ export class StreamParserService {
     } as ContentBlock;
   }
 
+  /**
+   * Render a confirmed mid-turn steer as a user message in the live thread.
+   *
+   * Ordering is the whole job here. On a `tool_use` stop reason the
+   * tool-calling assistant message stays *current* so its results can attach,
+   * so at ack time appending to `completedMessages` would place the user's
+   * words before the assistant turn they interrupted. They go to
+   * `steeringMessages`, which `allMessages` renders after the current message
+   * and `finalizeCurrentMessage` folds in behind it.
+   *
+   * Idempotent by message id: a replayed ack (reconnect, duplicated frame)
+   * updates nothing rather than adding a second bubble.
+   */
+  private appendSteeringMessage(
+    state: ParserSessionState,
+    data: SteeringAppliedEvent,
+  ): void {
+    const message = buildSteeringMessage(state.sessionId, data.entryId, data.text);
+    const alreadyRendered =
+      state.steeringMessages().some((m) => m.id === message.id) ||
+      state.completedMessages().some((m) => m.id === message.id);
+    if (alreadyRendered) return;
+    state.steeringMessages.update((messages) => [...messages, message]);
+  }
+
   private finalizeCurrentMessage(state: ParserSessionState): void {
     const builder = state.currentMessageBuilder();
-    if (!builder) return;
+    if (!builder) {
+      // No message in flight, but a steer may still be waiting (it landed on a
+      // boundary after the last assistant message finalized). Commit it so the
+      // turn's final message list is the one that gets persisted to the map.
+      const orphaned = state.steeringMessages();
+      if (orphaned.length > 0) {
+        state.steeringMessages.set([]);
+        state.completedMessages.update((messages) => [...messages, ...orphaned]);
+      }
+      return;
+    }
 
     const message = this.buildMessage(state, builder);
 
-    if (message.content.length > 0) {
-      state.completedMessages.update((messages) => [...messages, message]);
+    // Fold any mid-turn steering that arrived while this message was the
+    // current one in behind it, in arrival order — the same order
+    // `allMessages` was already rendering them in, so the list does not jump
+    // when a finished message moves from `current` into `completed`.
+    const steering = state.steeringMessages();
+    if (message.content.length > 0 || steering.length > 0) {
+      const appended = message.content.length > 0 ? [message, ...steering] : steering;
+      state.completedMessages.update((messages) => [...messages, ...appended]);
+    }
+    if (steering.length > 0) {
+      state.steeringMessages.set([]);
     }
 
     if (builder.role === 'assistant') {

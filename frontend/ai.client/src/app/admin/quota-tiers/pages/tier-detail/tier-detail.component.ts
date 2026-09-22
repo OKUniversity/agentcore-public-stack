@@ -3,6 +3,7 @@ import { Router, ActivatedRoute } from '@angular/router';
 import { FormBuilder, FormGroup, FormControl, Validators, ReactiveFormsModule } from '@angular/forms';
 import { QuotaStateService } from '../../services/quota-state.service';
 import { QuotaTierCreate, ActionOnLimit, PeriodType } from '../../models/quota.models';
+import { SpinnerComponent } from '../../../../components/spinner/spinner.component';
 
 interface TierFormGroup {
   tierId: FormControl<string>;
@@ -12,13 +13,14 @@ interface TierFormGroup {
   dailyCostLimit: FormControl<number | null>;
   periodType: FormControl<PeriodType>;
   softLimitPercentage: FormControl<number>;
+  sessionNoticePercentage: FormControl<number>;
   actionOnLimit: FormControl<ActionOnLimit>;
   enabled: FormControl<boolean>;
 }
 
 @Component({
   selector: 'app-tier-detail',
-  imports: [ReactiveFormsModule],
+  imports: [ReactiveFormsModule, SpinnerComponent],
   templateUrl: './tier-detail.component.html',
   styleUrl: './tier-detail.component.css',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -44,6 +46,7 @@ export class TierDetailComponent implements OnInit {
     dailyCostLimit: this.fb.control<number | null>(null, { validators: [Validators.min(0)] }),
     periodType: this.fb.control<PeriodType>('monthly', { nonNullable: true, validators: [Validators.required] }),
     softLimitPercentage: this.fb.control(80, { nonNullable: true, validators: [Validators.required, Validators.min(0), Validators.max(100)] }),
+    sessionNoticePercentage: this.fb.control(25, { nonNullable: true, validators: [Validators.required, Validators.min(0), Validators.max(100)] }),
     actionOnLimit: this.fb.control<ActionOnLimit>('block', { nonNullable: true, validators: [Validators.required] }),
     enabled: this.fb.control(true, { nonNullable: true }),
   });
@@ -84,6 +87,7 @@ export class TierDetailComponent implements OnInit {
         dailyCostLimit: tier.dailyCostLimit || null,
         periodType: tier.periodType,
         softLimitPercentage: tier.softLimitPercentage,
+        sessionNoticePercentage: tier.sessionNoticePercentage ?? 25,
         actionOnLimit: tier.actionOnLimit,
         enabled: tier.enabled,
       });
@@ -119,6 +123,7 @@ export class TierDetailComponent implements OnInit {
         dailyCostLimit: rawFormData.dailyCostLimit || undefined,
         periodType: rawFormData.periodType!,
         softLimitPercentage: rawFormData.softLimitPercentage!,
+        sessionNoticePercentage: rawFormData.sessionNoticePercentage!,
         actionOnLimit: rawFormData.actionOnLimit!,
         enabled: rawFormData.enabled!,
       };
@@ -132,6 +137,7 @@ export class TierDetailComponent implements OnInit {
           dailyCostLimit: tierData.dailyCostLimit,
           periodType: tierData.periodType,
           softLimitPercentage: tierData.softLimitPercentage,
+          sessionNoticePercentage: tierData.sessionNoticePercentage,
           actionOnLimit: tierData.actionOnLimit,
           enabled: tierData.enabled,
         });

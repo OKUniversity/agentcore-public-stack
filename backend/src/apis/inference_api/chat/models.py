@@ -6,7 +6,9 @@ Contains Pydantic models for chat API requests and responses.
 import json
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
+
+from apis.shared.sessions.session_lease import STEER_QUEUE_MAX_CHARS
 
 # Hard upper bound on a user-supplied custom system prompt. Mirrors the
 # limit applied inside SystemPromptBuilder.from_user_prompt — surfacing
@@ -78,6 +80,27 @@ class AppContextUpdateEntry(BaseModel):
     structured_content: Optional[Dict[str, Any]] = None
 
 
+class CarriedSteerEntry(BaseModel):
+    """A queued follow-up carried into the turn this request starts.
+
+    Mid-turn steering's paused-turn path (docs/specs/mid-turn-steering.md).
+    A turn paused for OAuth consent or tool approval has no running loop to
+    steer, and the pause releases its lease — inbox and all — when the stream
+    closes. The follow-ups the user typed meanwhile are still in their
+    composer, so the resume request carries them here and the route seeds them
+    onto the resumed turn's lease, where the ordinary ``SteeringHook`` picks
+    them up at its first tool boundary.
+
+    ``id`` is the client-minted queue-entry id, unchanged from the one the
+    normal ``/sessions/{id}/steer`` path uses: it is what ``steering_applied``
+    names back, and what makes carrying an entry idempotent against the
+    composer's own end-of-turn flush.
+    """
+
+    id: str = Field(min_length=1, max_length=128)
+    text: str = Field(min_length=1, max_length=STEER_QUEUE_MAX_CHARS)
+
+
 class InvocationRequest(BaseModel):
     """Input for /invocations endpoint with multi-provider support"""
 
@@ -102,10 +125,59 @@ class InvocationRequest(BaseModel):
     # AgentCore Runtime returns 424 when it sees a non-empty 'assistant_id' field,
     # likely trying to resolve it as an AWS Bedrock Agent ID.
     rag_assistant_id: Optional[str] = None
+    # Marketplace D11: this turn was handed to the Agent by an `@`-mention in
+    # the composer, rather than the whole conversation being bound to it.
+    #
+    # ⚠️ **LEGACY as of 2026-09-14 — the current SPA never sends this.** A mention now
+    # means "talk to this Agent": on an empty thread it binds like a launch, and in a
+    # thread that already has messages the SPA opens a *new* conversation with the Agent
+    # instead of sending a borrowed turn. The one-turn borrow this flag requests failed
+    # silently — the next message lost the Agent's tools, skills and model with no signal
+    # to the user or the model — and prod said nobody used what it was protecting (247 of
+    # 247 mentions started their conversation). See D11 in docs/specs/agent-marketplace.md.
+    #
+    # Still honoured for clients that predate the change, with one correction:
+    # `binds_conversation` now BINDS such a mention when the thread is empty, so a stale
+    # tab lands in the same place a current one does. A mention into a thread that already
+    # has messages keeps the old borrow semantics — that path is unreachable from the
+    # current SPA, and changing it for old clients would annex their conversation.
+    #
+    # A borrowed turn skips the bind-once-per-session validation and skips writing
+    # `preferences.assistant_id`. Everything else — access check, RAG, binding resolution,
+    # memory injection — is identical to a bound turn, because the same Agent is running
+    # with the same governance.
+    #
+    # ⚠️ It is the *client's* claim about intent, never an access decision:
+    # `get_assistant_with_access_check` still gates the Agent itself, so the
+    # worst a forged flag can do is decline to persist a binding.
+    agent_mention: Optional[bool] = None
+    # Marketplace D2: this turn is a marketplace **reviewer** test-driving a submission
+    # before deciding on it. Two things change, and nothing else does.
+    #
+    # 1. The Agent resolves to the snapshot under review (`submittedVersion` while one is
+    #    pending, `publishedVersion` otherwise) rather than to the published-or-draft rule
+    #    every other caller gets. A reviewer who test-drove the author's live draft would
+    #    be testing something approval is not going to publish.
+    # 2. The PRIVATE access check is bypassed, because a PRIVATE Agent can be — and often
+    #    is — sitting in the review queue, and `get_assistant_with_access_check` refuses a
+    #    non-owner outright on one.
+    #
+    # ⚠️ Unlike `agent_mention`, this is NOT merely a claim about intent, so it cannot be
+    # treated like one: it widens access. The route re-checks `admin.marketplace` against
+    # the caller's own roles before honoring it, and a caller without the scope gets a 403
+    # rather than a quietly-ignored flag — a silently downgraded preview would run the
+    # wrong configuration and report it as the reviewed one.
+    review_preview: Optional[bool] = None
     # When set, the route resumes a paused agent turn instead of starting a
     # new one. `message` is ignored in that case — the original prompt is
     # already in the agent's interrupt context.
     interrupt_responses: Optional[List[InterruptResponseEntry]] = None
+    # Follow-ups the user queued while this session's turn was paused awaiting
+    # consent or approval. Seeded onto this turn's steering inbox after the
+    # lease is acquired, so the agent reads them at its next tool boundary
+    # instead of the user having to send them as a separate turn that abandons
+    # the pause. Ignored when mid-turn steering is disabled.
+    steering: Optional[List[CarriedSteerEntry]] = None
     # When true, this is a "Continue" after a max_tokens truncation. Like a
     # resume, `message` is ignored: instead of synthesizing a new user turn,
     # the agent re-enters the loop with an empty prompt so the model
@@ -124,6 +196,17 @@ class InvocationRequest(BaseModel):
     # — client input can narrow the set, never grant. An empty (or fully
     # inaccessible) list yields zero skills, so the turn is plain chat.
     enabled_skills: Optional[List[str]] = None
+    # Skills the user named with a `/` slash command in the composer, for this
+    # turn only. A strict subset of the turn's effective skills — it is
+    # intersected server-side exactly like ``enabled_skills``, so it can never
+    # widen the set and an id that is not already active is simply dropped.
+    #
+    # It changes nothing about what is *disclosed*: the same skills are in
+    # ``<available_skills>`` either way, so the cacheable prefix is untouched.
+    # All it adds is a short directive on the user message telling the model to
+    # activate the named skill before answering, which is what makes a slash
+    # command deterministic rather than a hint the model may ignore.
+    invoked_skills: Optional[List[str]] = None
     # User-selected custom system prompt ("conversation mode") for this
     # turn. The frontend forwards the active selection on every submit so
     # the inference path doesn't have to round-trip session metadata to
