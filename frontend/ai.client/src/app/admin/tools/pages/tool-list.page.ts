@@ -304,7 +304,13 @@ export function capabilityRefreshSummary(
                         <span class="truncate text-sm/6 font-medium text-gray-900 dark:text-white">
                           {{ tool.displayName }}
                         </span>
-                        @if (tool.enabledByDefault) {
+                        @if (tool.alwaysOn) {
+                          <span
+                            class="shrink-0 rounded-full bg-primary-100 px-1.5 py-0.5 text-[10px]/4 font-medium uppercase tracking-wide text-primary-800 dark:bg-primary-900/40 dark:text-primary-200"
+                          >
+                            Always on
+                          </span>
+                        } @else if (tool.enabledByDefault) {
                           <ng-icon
                             name="heroStarSolid"
                             class="size-4 shrink-0 text-star-500 dark:text-star-400"
@@ -429,7 +435,7 @@ export function capabilityRefreshSummary(
                             Default
                           </dt>
                           <dd class="mt-0.5 text-sm/6 text-gray-700 dark:text-gray-300">
-                            {{ tool.enabledByDefault ? 'On by default' : 'Off by default' }}
+                            {{ tool.alwaysOn ? 'Always on (users cannot disable)' : tool.enabledByDefault ? 'On by default' : 'Off by default' }}
                           </dd>
                         </div>
 

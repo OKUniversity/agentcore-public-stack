@@ -187,6 +187,34 @@ class TestPrefilterAndOffload:
         assert PREFILTER_RATIO == 0.5
 
 
+class TestSkillsExemption:
+    """A skill's instructions are followed verbatim — never swapped for a preview."""
+
+    def test_exempt_name_matches_the_strands_skills_tool(self):
+        # Pinned to the real plugin so a rename in a Strands upgrade fails here
+        # instead of silently re-enabling offload for skill instructions.
+        from strands import AgentSkills, Skill
+
+        plugin = AgentSkills(skills=[Skill(name="a-skill", description="d", instructions="i")])
+        assert plugin.skills.tool_name in tro.OFFLOAD_EXEMPT_TOOLS
+
+    def test_read_skill_file_is_not_exempt(self):
+        assert "read_skill_file" not in tro.OFFLOAD_EXEMPT_TOOLS
+
+    @pytest.mark.asyncio
+    async def test_oversized_skills_result_is_not_offloaded(self, offloader):
+        plugin, storage = offloader
+        counter = AsyncMock(return_value=5000)
+        instructions = "# Brand deck\n" + ("Always use the approved palette. " * 800)
+        ev = _event(instructions, tool_name="skills", count_tokens=counter)
+        before = ev.result
+        await plugin._handle_tool_result(ev)
+        counter.assert_not_called()
+        assert ev.result is before
+        assert ev.result["content"][0]["text"] == instructions
+        assert storage.objects == {}
+
+
 class TestChatAgentWiring:
     def test_chat_agent_adds_the_offloader_plugin(self, monkeypatch):
         from unittest.mock import MagicMock
@@ -243,3 +271,51 @@ class TestChatAgentWiring:
         monkeypatch.setattr(ChatAgent, "_create_hooks", lambda self: [], raising=False)
         agent._create_agent()
         assert captured["plugins"] is None
+
+
+class TestHookRegistration:
+    """The plugin is only useful if Strands actually calls it.
+
+    Every other test in this file invokes ``_handle_tool_result`` directly, so
+    all of them passed while the callback was never registered with an agent:
+    the mixin's undecorated override shadowed the base's ``@hook`` method by
+    name, ``_discovery._discover_methods`` resolved the name through the MRO,
+    found no ``_hook_event_types``, and dropped it. In prod that meant a
+    107k-token tool result reaching the prompt with the offloader loaded.
+    """
+
+    def test_hook_is_discoverable(self, offloader):
+        from strands.plugins._discovery import discover_hooks
+
+        plugin, _ = offloader
+        names = {h.__name__ for h in discover_hooks(plugin, "offload")}
+        assert "_handle_tool_result" in names, (
+            "the tool-result callback is not discoverable — an override without "
+            "@hook hides it and the offloader silently stops offloading"
+        )
+        # The eviction callback comes from the base untouched; if it ever goes
+        # missing too, discovery itself changed shape.
+        assert "_on_before_model_call" in names
+
+    def test_hook_is_bound_for_the_right_event(self, offloader):
+        from strands.hooks.events import AfterToolCallEvent
+        from strands.plugins._discovery import discover_hooks
+
+        plugin, _ = offloader
+        by_name = {h.__name__: h for h in discover_hooks(plugin, "offload")}
+        assert by_name["_handle_tool_result"]._hook_event_types == [AfterToolCallEvent]
+
+    @pytest.mark.asyncio
+    async def test_discovered_callback_still_offloads(self, offloader):
+        """The discovered bound method is the real path, not just a marker."""
+        from strands.plugins._discovery import discover_hooks
+
+        plugin, storage = offloader
+        callback = next(h for h in discover_hooks(plugin, "offload") if h.__name__ == "_handle_tool_result")
+
+        ev = _event("x" * 40_000, count_tokens=AsyncMock(return_value=10_000))
+        before = ev.result
+        await callback(ev)
+
+        assert ev.result is not before, "the discovered callback did not replace the oversized result"
+        assert storage.objects, "nothing was written to storage"

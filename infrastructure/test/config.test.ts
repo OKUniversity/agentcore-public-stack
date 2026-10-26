@@ -1,5 +1,5 @@
 import * as cdk from 'aws-cdk-lib';
-import { loadConfig, buildCorsOrigins, AppConfig,
+import { loadConfig, buildCorsOrigins, AppConfig, MEMORY_SENSITIVE_PATTERNS_MAX_CHARS,
   OBSERVABILITY_DEFAULT_AGENTCORE_ACTIVE_SESSION_THRESHOLD,
   OBSERVABILITY_DEFAULT_AGENTCORE_ERROR_THRESHOLD,
   OBSERVABILITY_DEFAULT_ALB_TARGET_5XX_THRESHOLD,
@@ -102,6 +102,7 @@ const OBSERVABILITY_ENV_KEYS = [
   'CDK_OBSERVABILITY_PROMPT_CACHE_SESSION_WASTED_USD_THRESHOLD',
   'CDK_OBSERVABILITY_BEDROCK_TPM_QUOTA_PERCENT',
   'CDK_OBSERVABILITY_BEDROCK_TPM_QUOTAS',
+  'CDK_OBSERVABILITY_RUNTIME_LOG_RETENTION_SWEEP_ENABLED',
 ] as const;
 
 function clearObservabilityEnv(): void {
@@ -626,6 +627,417 @@ describe('RAG Ingestion Configuration', () => {
   });
 
   // ============================================================
+  // Shared Projects feature flag — default ON with a kill switch
+  // (unset / empty GitHub Actions variable means on)
+  // ============================================================
+
+  describe('Shared Projects feature flag', () => {
+    test('defaults to enabled when CDK_PROJECTS_ENABLED is unset', () => {
+      delete process.env.CDK_PROJECTS_ENABLED;
+
+      expect(loadConfig(app).projects.enabled).toBe(true);
+    });
+
+    test('treats empty string (unset GitHub Actions variable) as enabled', () => {
+      process.env.CDK_PROJECTS_ENABLED = '';
+
+      expect(loadConfig(app).projects.enabled).toBe(true);
+    });
+
+    test('CDK_PROJECTS_ENABLED="false" turns it off', () => {
+      process.env.CDK_PROJECTS_ENABLED = ' False ';
+
+      expect(loadConfig(app).projects.enabled).toBe(false);
+    });
+
+    test('anything but "false" leaves it on', () => {
+      process.env.CDK_PROJECTS_ENABLED = 'no';
+
+      expect(loadConfig(app).projects.enabled).toBe(true);
+    });
+
+    test('cdk.json context projects.enabled=false disables when env is unset', () => {
+      delete process.env.CDK_PROJECTS_ENABLED;
+      app.node.setContext('projects', { enabled: false });
+
+      expect(loadConfig(app).projects.enabled).toBe(false);
+    });
+  });
+
+  // ============================================================
+  // TTFT probe — configuration, enabled by naming a probe user
+  // ============================================================
+
+  describe('TTFT probe configuration', () => {
+    afterEach(() => {
+      delete process.env.CDK_TTFT_PROBE_USER_ID;
+      delete process.env.CDK_TTFT_PROBE_MODEL_ID;
+    });
+
+    test('unset and "" (unset GitHub variable) leave it unconfigured', () => {
+      expect(loadConfig(app).ttftProbe).toEqual({ userId: '', modelId: '' });
+      process.env.CDK_TTFT_PROBE_USER_ID = '';
+      process.env.CDK_TTFT_PROBE_MODEL_ID = '';
+      expect(loadConfig(app).ttftProbe).toEqual({ userId: '', modelId: '' });
+    });
+
+    test('reads and trims the user and model', () => {
+      process.env.CDK_TTFT_PROBE_USER_ID = ' probe-sub ';
+      process.env.CDK_TTFT_PROBE_MODEL_ID = 'us.anthropic.claude-haiku-4-5 ';
+      expect(loadConfig(app).ttftProbe).toEqual({ userId: 'probe-sub', modelId: 'us.anthropic.claude-haiku-4-5' });
+    });
+  });
+
+  // ============================================================
+  // Folder sync and client turn timing — default ON with a kill switch
+  // ============================================================
+
+  describe('Folder sync feature flag', () => {
+    afterEach(() => {
+      delete process.env.CDK_FOLDER_SYNC_ENABLED;
+    });
+
+    test('defaults to enabled, and "" (unset GitHub variable) is enabled', () => {
+      delete process.env.CDK_FOLDER_SYNC_ENABLED;
+      expect(loadConfig(app).folderSync.enabled).toBe(true);
+      process.env.CDK_FOLDER_SYNC_ENABLED = '';
+      expect(loadConfig(app).folderSync.enabled).toBe(true);
+    });
+
+    test('only "false" turns it off', () => {
+      process.env.CDK_FOLDER_SYNC_ENABLED = 'False';
+      expect(loadConfig(app).folderSync.enabled).toBe(false);
+      process.env.CDK_FOLDER_SYNC_ENABLED = 'no';
+      expect(loadConfig(app).folderSync.enabled).toBe(true);
+    });
+  });
+
+  // ============================================================
+  // Source provenance verification — in development, so only "true" enables
+  // ============================================================
+
+  describe('Source provenance feature flag', () => {
+    afterEach(() => {
+      delete process.env.CDK_SOURCE_PROVENANCE_ENABLED;
+    });
+
+    test('defaults to disabled, and "" (unset GitHub variable) is disabled', () => {
+      delete process.env.CDK_SOURCE_PROVENANCE_ENABLED;
+      expect(loadConfig(app).sourceProvenance.enabled).toBe(false);
+      process.env.CDK_SOURCE_PROVENANCE_ENABLED = '';
+      expect(loadConfig(app).sourceProvenance.enabled).toBe(false);
+    });
+
+    test('only "true" enables it', () => {
+      process.env.CDK_SOURCE_PROVENANCE_ENABLED = 'True';
+      expect(loadConfig(app).sourceProvenance.enabled).toBe(true);
+      // Anything else a human might set is still off, because a half-built
+      // feature must not switch on for another deployment by accident.
+      for (const value of ['yes', '1', 'on', 'enabled', 'false']) {
+        process.env.CDK_SOURCE_PROVENANCE_ENABLED = value;
+        expect(loadConfig(app).sourceProvenance.enabled).toBe(false);
+      }
+    });
+  });
+
+  // ============================================================
+  // Structured extraction — in development, so only "true" enables
+  // ============================================================
+
+  describe('Document extract feature flag', () => {
+    afterEach(() => {
+      delete process.env.CDK_DOCUMENT_EXTRACT_ENABLED;
+      delete process.env.CDK_DOCUMENT_EXTRACT_MODEL_ID;
+    });
+
+    test('defaults to disabled, and "" (unset GitHub variable) is disabled', () => {
+      delete process.env.CDK_DOCUMENT_EXTRACT_ENABLED;
+      expect(loadConfig(app).documentExtract.enabled).toBe(false);
+      process.env.CDK_DOCUMENT_EXTRACT_ENABLED = '';
+      expect(loadConfig(app).documentExtract.enabled).toBe(false);
+    });
+
+    test('only "true" enables it', () => {
+      process.env.CDK_DOCUMENT_EXTRACT_ENABLED = 'True';
+      expect(loadConfig(app).documentExtract.enabled).toBe(true);
+      for (const value of ['yes', '1', 'on', 'enabled', 'false']) {
+        process.env.CDK_DOCUMENT_EXTRACT_ENABLED = value;
+        expect(loadConfig(app).documentExtract.enabled).toBe(false);
+      }
+    });
+
+    // The model id gets a case of its own because getting it wrong is silent.
+    // An id with no catalog row prices the extraction call to null: it costs
+    // $0, counts against no quota, and only the UnmeteredModelCall metric
+    // says so (structured-extraction.md §9).
+    test('the extraction model id defaults to a real Bedrock-native id', () => {
+      delete process.env.CDK_DOCUMENT_EXTRACT_MODEL_ID;
+      const modelId = loadConfig(app).documentExtract.modelId;
+      expect(modelId).toBe('us.anthropic.claude-haiku-4-5-20251001-v1:0');
+      // Structured outputs is per model AND per inference profile: the India
+      // profile is the one documented exclusion, and our own profiles are the
+      // only ones this stack ever sets.
+      expect(modelId.startsWith('in.')).toBe(false);
+      expect(modelId.startsWith('us.') || modelId.startsWith('global.')).toBe(true);
+    });
+
+    test('the model id is overridable per environment, and is trimmed', () => {
+      process.env.CDK_DOCUMENT_EXTRACT_MODEL_ID =
+        '  global.anthropic.claude-haiku-4-5-20251001-v1:0  ';
+      expect(loadConfig(app).documentExtract.modelId).toBe(
+        'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+      );
+    });
+
+    test('an unset GitHub variable ("") falls back to the default, not to empty', () => {
+      // The trap this exists for: `vars.X` forwards "" when unset, and
+      // `'' || default` is the default while `''.trim()` alone would have
+      // shipped an empty model id to the Runtime.
+      process.env.CDK_DOCUMENT_EXTRACT_MODEL_ID = '';
+      expect(loadConfig(app).documentExtract.modelId).toBe(
+        'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+      );
+    });
+
+    // Batch concurrency (structured-extraction.md §17.4). Left UNDEFINED
+    // unless a deployment sets it, so the Runtime's environment carries
+    // nothing for the default case and spends none of the V2 payload budget.
+    // The backend's own default is 4 and it clamps to 1..16.
+    test('concurrency is undefined unless a deployment sets it', () => {
+      delete process.env.CDK_DOCUMENT_EXTRACT_CONCURRENCY;
+      expect(loadConfig(app).documentExtract.concurrency).toBeUndefined();
+      process.env.CDK_DOCUMENT_EXTRACT_CONCURRENCY = '';
+      expect(loadConfig(app).documentExtract.concurrency).toBeUndefined();
+    });
+
+    test('a deployment can override the concurrency', () => {
+      process.env.CDK_DOCUMENT_EXTRACT_CONCURRENCY = '8';
+      expect(loadConfig(app).documentExtract.concurrency).toBe(8);
+    });
+
+    test('a non-numeric or non-positive concurrency is dropped, not forwarded', () => {
+      // The backend falls back anyway, and a bad string sitting in the
+      // Runtime's environment is harder to spot than an absent one.
+      for (const value of ['abc', '4.5', '0', '-2', 'true']) {
+        process.env.CDK_DOCUMENT_EXTRACT_CONCURRENCY = value;
+        expect(loadConfig(app).documentExtract.concurrency).toBeUndefined();
+      }
+    });
+  });
+
+  describe('Client turn timing feature flag', () => {
+    afterEach(() => {
+      delete process.env.CDK_CLIENT_TURN_TIMING_ENABLED;
+    });
+
+    test('defaults to enabled, and "" (unset GitHub variable) is enabled', () => {
+      delete process.env.CDK_CLIENT_TURN_TIMING_ENABLED;
+      expect(loadConfig(app).clientTurnTiming.enabled).toBe(true);
+      process.env.CDK_CLIENT_TURN_TIMING_ENABLED = '';
+      expect(loadConfig(app).clientTurnTiming.enabled).toBe(true);
+    });
+
+    test('only "false" turns it off', () => {
+      process.env.CDK_CLIENT_TURN_TIMING_ENABLED = 'False';
+      expect(loadConfig(app).clientTurnTiming.enabled).toBe(false);
+      process.env.CDK_CLIENT_TURN_TIMING_ENABLED = 'no';
+      expect(loadConfig(app).clientTurnTiming.enabled).toBe(true);
+    });
+  });
+
+  // ============================================================
+  // Session prewarm feature flag — opt-in while in development
+  // ============================================================
+
+  describe('Session prewarm feature flag', () => {
+    afterEach(() => {
+      delete process.env.CDK_SESSION_PREWARM_ENABLED;
+    });
+
+    test('defaults to disabled when CDK_SESSION_PREWARM_ENABLED is unset', () => {
+      delete process.env.CDK_SESSION_PREWARM_ENABLED;
+      expect(loadConfig(app).sessionPrewarm.enabled).toBe(false);
+    });
+
+    test('treats empty string (unset GitHub Actions variable) as disabled', () => {
+      process.env.CDK_SESSION_PREWARM_ENABLED = '';
+      expect(loadConfig(app).sessionPrewarm.enabled).toBe(false);
+    });
+
+    test('CDK_SESSION_PREWARM_ENABLED="true" turns it on', () => {
+      process.env.CDK_SESSION_PREWARM_ENABLED = ' TRUE ';
+      expect(loadConfig(app).sessionPrewarm.enabled).toBe(true);
+    });
+
+    test('anything but "true" leaves it off', () => {
+      process.env.CDK_SESSION_PREWARM_ENABLED = 'yes';
+      expect(loadConfig(app).sessionPrewarm.enabled).toBe(false);
+    });
+  });
+
+  // ============================================================
+  // Handoffs feature flag — opt-in while in development
+  // ============================================================
+
+  describe('Handoffs feature flag', () => {
+    afterEach(() => {
+      delete process.env.CDK_HANDOFFS_ENABLED;
+    });
+
+    test('defaults to disabled when CDK_HANDOFFS_ENABLED is unset', () => {
+      delete process.env.CDK_HANDOFFS_ENABLED;
+      expect(loadConfig(app).handoffs.enabled).toBe(false);
+    });
+
+    test('treats empty string (unset GitHub Actions variable) as disabled', () => {
+      process.env.CDK_HANDOFFS_ENABLED = '';
+      expect(loadConfig(app).handoffs.enabled).toBe(false);
+    });
+
+    test('CDK_HANDOFFS_ENABLED="true" turns it on', () => {
+      process.env.CDK_HANDOFFS_ENABLED = ' TRUE ';
+      expect(loadConfig(app).handoffs.enabled).toBe(true);
+    });
+
+    test('anything but "true" leaves it off', () => {
+      process.env.CDK_HANDOFFS_ENABLED = 'yes';
+      expect(loadConfig(app).handoffs.enabled).toBe(false);
+    });
+  });
+
+  // ============================================================
+  // Direct user grants feature flag — default ON with a kill switch
+  // ============================================================
+
+  describe('Direct user grants feature flag', () => {
+    afterEach(() => {
+      delete process.env.CDK_USER_GRANTS_ENABLED;
+    });
+
+    test('defaults to enabled when CDK_USER_GRANTS_ENABLED is unset', () => {
+      delete process.env.CDK_USER_GRANTS_ENABLED;
+
+      expect(loadConfig(app).userGrants.enabled).toBe(true);
+    });
+
+    test('treats empty string (unset GitHub Actions variable) as enabled', () => {
+      process.env.CDK_USER_GRANTS_ENABLED = '';
+
+      expect(loadConfig(app).userGrants.enabled).toBe(true);
+    });
+
+    test('CDK_USER_GRANTS_ENABLED="false" turns it off', () => {
+      process.env.CDK_USER_GRANTS_ENABLED = 'false';
+
+      expect(loadConfig(app).userGrants.enabled).toBe(false);
+    });
+
+    test('anything but "false" leaves it on', () => {
+      process.env.CDK_USER_GRANTS_ENABLED = 'no';
+
+      expect(loadConfig(app).userGrants.enabled).toBe(true);
+    });
+
+    test('cdk.json context userGrants.enabled=false disables when env is unset', () => {
+      delete process.env.CDK_USER_GRANTS_ENABLED;
+      app.node.setContext('userGrants', { enabled: false });
+
+      expect(loadConfig(app).userGrants.enabled).toBe(false);
+    });
+  });
+
+  // ============================================================
+  // Project-memory content lint (Shared Projects 2.7): configuration,
+  // defaulting to warn with no deployment patterns
+  // ============================================================
+
+  describe('Project-memory content lint', () => {
+    afterEach(() => {
+      delete process.env.CDK_MEMORY_LINT_MODE;
+      delete process.env.CDK_MEMORY_SENSITIVE_PATTERNS;
+    });
+
+    test('defaults to warn with no patterns, unset or empty (an unset GitHub variable)', () => {
+      delete process.env.CDK_MEMORY_LINT_MODE;
+      process.env.CDK_MEMORY_SENSITIVE_PATTERNS = '';
+
+      expect(loadConfig(app).memoryLint).toEqual({ mode: 'warn', sensitivePatterns: '' });
+    });
+
+    test('takes the mode and patterns from the environment', () => {
+      process.env.CDK_MEMORY_LINT_MODE = 'BLOCK';
+      process.env.CDK_MEMORY_SENSITIVE_PATTERNS = '[{"pattern": "\\\\bS\\\\d{8}\\\\b", "label": "a student ID"}]';
+
+      const { memoryLint } = loadConfig(app);
+      expect(memoryLint.mode).toBe('block');
+      expect(JSON.parse(memoryLint.sensitivePatterns)[0].label).toBe('a student ID');
+    });
+
+    test('a cdk.json context may give the list as JSON', () => {
+      app.node.setContext('memoryLint', { mode: 'off', sensitivePatterns: ['a', 'b'] });
+
+      expect(loadConfig(app).memoryLint).toEqual({ mode: 'off', sensitivePatterns: '["a","b"]' });
+    });
+
+    test('an unknown mode fails the synth', () => {
+      process.env.CDK_MEMORY_LINT_MODE = 'strict';
+
+      expect(() => loadConfig(app)).toThrow(/off, warn or block/);
+    });
+
+    test('a list that is not JSON, or not a list of patterns, fails the synth', () => {
+      process.env.CDK_MEMORY_SENSITIVE_PATTERNS = '["unterminated';
+      expect(() => loadConfig(app)).toThrow(/not valid JSON/);
+
+      process.env.CDK_MEMORY_SENSITIVE_PATTERNS = '[1, 2]';
+      expect(() => loadConfig(app)).toThrow(/JSON list of pattern strings/);
+    });
+
+    test('one pattern per line is accepted as written, and the size is bounded', () => {
+      process.env.CDK_MEMORY_SENSITIVE_PATTERNS = 'confidential\nS\\d{8}';
+      expect(loadConfig(app).memoryLint.sensitivePatterns).toBe('confidential\nS\\d{8}');
+
+      process.env.CDK_MEMORY_SENSITIVE_PATTERNS = 'x'.repeat(MEMORY_SENSITIVE_PATTERNS_MAX_CHARS + 1);
+      expect(() => loadConfig(app)).toThrow(/fits a Lambda environment/);
+    });
+  });
+
+  // ============================================================
+  // SPA CloudFront access logs — default ON with a kill switch
+  // (empty GitHub Actions variable must not disable)
+  // ============================================================
+
+  describe('SPA access logs flag', () => {
+    test('defaults to enabled when CDK_FRONTEND_ACCESS_LOGS_ENABLED is unset', () => {
+      delete process.env.CDK_FRONTEND_ACCESS_LOGS_ENABLED;
+
+      expect(loadConfig(app).frontend.accessLogsEnabled).toBe(true);
+    });
+
+    test('treats empty string (unset GitHub Actions variable) as enabled', () => {
+      process.env.CDK_FRONTEND_ACCESS_LOGS_ENABLED = '';
+
+      expect(loadConfig(app).frontend.accessLogsEnabled).toBe(true);
+    });
+
+    test('CDK_FRONTEND_ACCESS_LOGS_ENABLED="false" is the kill switch', () => {
+      process.env.CDK_FRONTEND_ACCESS_LOGS_ENABLED = 'false';
+
+      expect(loadConfig(app).frontend.accessLogsEnabled).toBe(false);
+    });
+
+    test('cdk.json context frontend.accessLogsEnabled=false disables when env is unset', () => {
+      delete process.env.CDK_FRONTEND_ACCESS_LOGS_ENABLED;
+      app.node.setContext('frontend', {
+        cloudFrontPriceClass: 'PriceClass_100',
+        accessLogsEnabled: false,
+      });
+
+      expect(loadConfig(app).frontend.accessLogsEnabled).toBe(false);
+    });
+  });
+
+  // ============================================================
   // Agents API (Agent Designer) feature flag — default ON with a kill switch
   // (complete feature; ships enabled for forkers, empty var must not disable)
   // ============================================================
@@ -660,6 +1072,45 @@ describe('RAG Ingestion Configuration', () => {
       app.node.setContext('agents', { enabled: false });
 
       expect(loadConfig(app).agents.enabled).toBe(false);
+    });
+  });
+
+  // ============================================================
+  // Composer dictation — default ON with a kill switch; languages default en-US
+  // ============================================================
+
+  describe('Dictation config', () => {
+    // Per-key deletion, not the suite's `process.env` snapshot restore — see
+    // the RAG_ENV_KEYS note at the top of this file.
+    afterEach(() => {
+      delete process.env.CDK_DICTATION_ENABLED;
+      delete process.env.CDK_DICTATION_LANGUAGES;
+    });
+
+    test('defaults to enabled, English only', () => {
+      delete process.env.CDK_DICTATION_ENABLED;
+      delete process.env.CDK_DICTATION_LANGUAGES;
+
+      expect(loadConfig(app).dictation).toEqual({ enabled: true, languages: 'en-US' });
+    });
+
+    test('empty strings (unset GitHub Actions variables) keep the defaults', () => {
+      process.env.CDK_DICTATION_ENABLED = '';
+      process.env.CDK_DICTATION_LANGUAGES = '';
+
+      expect(loadConfig(app).dictation).toEqual({ enabled: true, languages: 'en-US' });
+    });
+
+    test('CDK_DICTATION_ENABLED="false" is the kill switch', () => {
+      process.env.CDK_DICTATION_ENABLED = 'false';
+
+      expect(loadConfig(app).dictation.enabled).toBe(false);
+    });
+
+    test('CDK_DICTATION_LANGUAGES passes the list through', () => {
+      process.env.CDK_DICTATION_LANGUAGES = 'en-US,es-US';
+
+      expect(loadConfig(app).dictation.languages).toBe('en-US,es-US');
     });
   });
 
@@ -1806,6 +2257,18 @@ describe('Observability Configuration', () => {
       expect(loadConfig(app).observability.alarmTopicEnabled).toBe(true);
     });
 
+    // Privacy, not just cost: runtime log groups carry conversation text.
+    test('runtime log retention sweep defaults to ON, even for a forwarded empty var', () => {
+      expect(loadConfig(app).observability.runtimeLogRetentionSweepEnabled).toBe(true);
+      process.env.CDK_OBSERVABILITY_RUNTIME_LOG_RETENTION_SWEEP_ENABLED = '';
+      expect(loadConfig(app).observability.runtimeLogRetentionSweepEnabled).toBe(true);
+    });
+
+    test('runtime log retention sweep turns off on an explicit false', () => {
+      process.env.CDK_OBSERVABILITY_RUNTIME_LOG_RETENTION_SWEEP_ENABLED = 'false';
+      expect(loadConfig(app).observability.runtimeLogRetentionSweepEnabled).toBe(false);
+    });
+
     test('latency floors are streaming-aware, well above a normal agent turn', () => {
       const obs = loadConfig(app).observability;
       expect(obs.agentCoreLatencyMs).toBe(OBSERVABILITY_DEFAULT_P99_LATENCY_MS);
@@ -1974,6 +2437,7 @@ describe('Observability Configuration', () => {
       app.node.setContext('observability.xraySamplingReservoir', '21');
       app.node.setContext('observability.xrayInsightsNotifications', 'true');
       app.node.setContext('observability.agentCoreApplicationLogsEnabled', 'true');
+      app.node.setContext('observability.runtimeLogRetentionSweepEnabled', 'false');
       app.node.setContext('observability.promptCacheAvoidableMissThreshold', '22');
       app.node.setContext('observability.promptCacheWastedUsdThreshold', '2.5');
       app.node.setContext('observability.promptCacheSessionWastedUsdThreshold', '23');
@@ -1995,6 +2459,7 @@ describe('Observability Configuration', () => {
         xraySamplingReservoir: 21,
         xrayInsightsNotifications: true,
         agentCoreApplicationLogsEnabled: true,
+        runtimeLogRetentionSweepEnabled: false,
         promptCacheAvoidableMissThreshold: 22,
         promptCacheWastedUsdThreshold: 2.5,
         promptCacheSessionWastedUsdThreshold: 23,

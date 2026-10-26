@@ -30,7 +30,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Callable, Optional
 
 import boto3
 from botocore.exceptions import ClientError as BotoClientError
@@ -43,21 +43,31 @@ from apis.shared import quota as shared_quota
 from apis.shared.rbac.service import get_app_role_service
 from apis.shared.costs.calculator import CostCalculator
 from apis.shared.costs.pricing_config import create_pricing_snapshot
+from apis.shared.observability import fingerprint_canonical_json
 from apis.shared.sessions.metadata import store_message_metadata
 from apis.shared.sessions.models import (
     MessageMetadata,
     TokenUsage,
     ModelInfo,
     Attribution,
+    PricingSnapshot,
 )
 
 from apis.shared.models.bedrock_responses import build_bedrock_responses_model
+from apis.shared.models.retirement import resolve_effective_model, retired_model_message
 from apis.shared.models.mantle import (
     MantleApiMode,
     build_mantle_model,
     param_map_for,
 )
 
+from .bedrock_offload import (
+    RETRY_AFTER_SECONDS,
+    CapacityExceeded,
+    get_in_flight_cap,
+    iterate_stream_in_thread,
+    run_in_thread,
+)
 from .models import ConverseRequest, ConverseResponse
 
 logger = logging.getLogger(__name__)
@@ -140,8 +150,59 @@ async def _build_user_from_api_key(validated_key) -> User:
         roles=profile.roles or [],
     )
 
+def _prefix_fingerprints(request: ConverseRequest) -> dict:
+    """Prompt-cache prefix hashes for one api-converse request.
+
+    Same field names as the runtime's ``PrefixFingerprintHook``, so the admin
+    cost anatomy reads these rows like any other. Two more fields make the
+    predecessor match in ``_derive_cache_observability`` work for a stateless
+    caller, whose requests all share one ``api-converse-<key>`` pseudo-session:
+
+    - ``messagesHash``: this request's whole message list.
+    - ``extendsMessagesHashes``: the message lists of the earlier requests
+      this one's prompt starts with: a byte-identical re-send (all of
+      ``messages``) or the next turn of a client-held conversation (all but
+      the assistant reply and the new user message). Only a predecessor in
+      this list could have left a cache entry for this request to read.
+
+    The request carries no toolConfig, so ``toolConfigHash`` is the hash of an
+    empty tool list, as the runtime hook would compute for an agent with none.
+    """
+    params = _build_converse_params(request)
+    messages = params["messages"]
+    return {
+        "toolConfigHash": fingerprint_canonical_json([]),
+        "systemPromptHash": fingerprint_canonical_json(params.get("system", [])),
+        "historyHash": fingerprint_canonical_json(messages[:-1]),
+        "messageCount": len(messages),
+        "messagesHash": fingerprint_canonical_json(messages),
+        "extendsMessagesHashes": [
+            fingerprint_canonical_json(messages),
+            fingerprint_canonical_json(messages[:-2]),
+        ],
+    }
+
+
+def _pricing_snapshot_model(pricing: dict) -> Optional[PricingSnapshot]:
+    """Validate the pricing dict for ``ModelInfo``, or None if it doesn't fit.
+
+    ``wastedUsd`` reads the cache rates off this snapshot. A dict that does
+    not validate costs the row its snapshot, never the row itself.
+    """
+    try:
+        return PricingSnapshot.model_validate(pricing)
+    except Exception:
+        logger.warning("Pricing snapshot did not validate; recording cost without it")
+        return None
+
+
 async def _record_cost(
-    user_id: str, model_id: str, usage: dict, key_id: str, provider: str = "bedrock"
+    user_id: str,
+    model_id: str,
+    usage: dict,
+    key_id: str,
+    request: ConverseRequest,
+    provider: str = "bedrock",
 ) -> None:
     """Calculate and store cost metadata for an api-converse request.
 
@@ -170,6 +231,7 @@ async def _record_cost(
             modelId=model_id,
             modelName=model_id,
             provider=provider,
+            pricing_snapshot=_pricing_snapshot_model(pricing),
         )
 
         attribution = Attribution(
@@ -183,6 +245,7 @@ async def _record_cost(
             model_info=model_info,
             attribution=attribution,
             cost=total_cost,
+            prefixFingerprints=_prefix_fingerprints(request),
         )
 
         await store_message_metadata(
@@ -317,41 +380,72 @@ def _converse_event_to_sse(event: dict, state: dict) -> list[str]:
     return out
 
 
-async def _stream_converse(request: ConverseRequest, user_id: str, key_id: str) -> AsyncGenerator[str, None]:
-    """Call Bedrock converse_stream and yield SSE events."""
-    client = _get_bedrock_client()
+class _NoStreamReturned(Exception):
+    """``converse_stream`` answered without a ``stream`` key."""
+
+
+def _no_slot() -> None:
+    """Release callable for a path that holds no in-flight slot."""
+
+
+async def _stream_converse(
+    request: ConverseRequest,
+    user_id: str,
+    key_id: str,
+    release_slot: Callable[[], None] = _no_slot,
+) -> AsyncGenerator[str, None]:
+    """Call Bedrock converse_stream and yield SSE events.
+
+    The boto3 call and the iteration both run on the Bedrock worker pool
+    (``bedrock_offload``): a ``converse_stream`` blocks until Bedrock's
+    headers arrive, and every ``next()`` on its ``EventStream`` blocks on
+    the network between chunks. Run on the loop, either froze the whole
+    app-api task for the life of the call.
+
+    ``release_slot`` returns the in-flight slot the route acquired; it runs
+    in ``finally`` so a disconnect or a mid-stream error frees it too.
+    """
     params = _build_converse_params(request)
 
-    try:
-        response = client.converse_stream(**params)
-    except BotoClientError as exc:
-        error_code = exc.response["Error"]["Code"]
-        logger.error(f"Bedrock converse_stream ClientError ({error_code})", exc_info=True)
-        yield _sse("error", {"error": "Model invocation failed due to a service error."})
-        yield _sse("done", {})
-        return
-    except Exception:
-        logger.error("Bedrock converse_stream error", exc_info=True)
-        yield _sse("error", {"error": "Model invocation failed due to an internal error."})
-        yield _sse("done", {})
-        return
-
-    stream = response.get("stream")
-    if not stream:
-        yield _sse("error", {"error": "No stream returned from Bedrock"})
-        yield _sse("done", {})
-        return
+    def _open_stream():
+        # The client build runs here as well: a fresh boto3 client per
+        # request pays botocore's service-model load on first use.
+        response = _get_bedrock_client().converse_stream(**params)
+        stream = response.get("stream")
+        if not stream:
+            raise _NoStreamReturned()
+        return stream
 
     state: dict = {"in_reasoning": False, "usage": {}}
-    for event in stream:
-        for frame in _converse_event_to_sse(event, state):
-            yield frame
+    try:
+        try:
+            async for event in iterate_stream_in_thread(_open_stream):
+                for frame in _converse_event_to_sse(event, state):
+                    yield frame
+        except _NoStreamReturned:
+            yield _sse("error", {"error": "No stream returned from Bedrock"})
+            yield _sse("done", {})
+            return
+        except BotoClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            logger.error(f"Bedrock converse_stream ClientError ({error_code})", exc_info=True)
+            yield _sse("error", {"error": "Model invocation failed due to a service error."})
+            yield _sse("done", {})
+            return
+        except Exception:
+            logger.error("Bedrock converse_stream error", exc_info=True)
+            yield _sse("error", {"error": "Model invocation failed due to an internal error."})
+            yield _sse("done", {})
+            return
+    finally:
+        release_slot()
 
     yield _sse("done", {})
 
     if state["usage"]:
         await _record_cost(
             user_id=user_id, model_id=request.model_id, usage=state["usage"], key_id=key_id,
+            request=request,
         )
 
 
@@ -464,7 +558,7 @@ async def _stream_openai_surface(
     if state["usage"]:
         await _record_cost(
             user_id=user_id, model_id=request.model_id, usage=state["usage"],
-            key_id=key_id, provider=provider,
+            key_id=key_id, request=request, provider=provider,
         )
 
 
@@ -510,7 +604,7 @@ async def _openai_surface_converse(
     if usage:
         await _record_cost(
             user_id=user_id, model_id=request.model_id, usage=usage,
-            key_id=key_id, provider=provider,
+            key_id=key_id, request=request, provider=provider,
         )
 
     return ConverseResponse(
@@ -627,9 +721,22 @@ async def api_converse(
                 exc_info=True,
             )
 
+    # 2.65 Model retirement (docs/specs/model-retirement.md §7): a retired model
+    # runs as its successor — the response's ``model_id`` then names the model
+    # that actually answered — or, with no successor, is gone.
+    effective = await resolve_effective_model(request.model_id)
+    if effective is not None and effective.denied:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=retired_model_message(effective.retired),
+        )
+    if effective is not None and effective.redirected:
+        request.model_id = effective.model_id
+
     # 2.7 Model access check (RBAC)
     app_role_service = get_app_role_service()
-    if not await app_role_service.can_access_model(user, request.model_id):
+    access_kwargs = {"record": effective.record} if effective is not None else {}
+    if not await app_role_service.can_access_model(user, request.model_id, **access_kwargs):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Access denied to model: {request.model_id}",
@@ -654,6 +761,28 @@ async def api_converse(
         # to an uncached Chat Completions call.
         api_mode = MantleApiMode.RESPONSES
 
+    # 2.9 In-flight cap for the Bedrock Converse paths. Those run boto3 on a
+    # bounded worker pool (``bedrock_offload``), and a call the pool cannot
+    # take is refused here, as an HTTP 429 the caller's script can act on,
+    # rather than queued against the ALB's 60s idle timeout. The OpenAI
+    # surfaces ride Strands' async client and hold no worker thread, so they
+    # are not counted. Taken before the generator is built so the streaming
+    # path can refuse with a status code instead of an SSE error frame.
+    release_slot: Callable[[], None] = _no_slot
+    if not is_openai_surface:
+        try:
+            release_slot = get_in_flight_cap().acquire()
+        except CapacityExceeded:
+            logger.warning(
+                "api-converse in-flight cap reached; refusing request "
+                f"(user={validated_key.user_id}, key={validated_key.key_id})"
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Too many model calls in flight on this server. Please retry shortly.",
+                headers={"Retry-After": RETRY_AFTER_SECONDS},
+            )
+
     # 3. Streaming path
     if request.stream:
         if is_openai_surface:
@@ -664,6 +793,7 @@ async def api_converse(
         else:
             generator = _stream_converse(
                 request, user_id=validated_key.user_id, key_id=validated_key.key_id,
+                release_slot=release_slot,
             )
         return StreamingResponse(
             generator,
@@ -681,11 +811,14 @@ async def api_converse(
             provider=normalized_provider, api_mode=api_mode, region=mantle_region,
         )
 
-    client = _get_bedrock_client()
     params = _build_converse_params(request)
 
+    def _converse():
+        # Client build and the blocking call both run on the worker pool.
+        return _get_bedrock_client().converse(**params)
+
     try:
-        response = client.converse(**params)
+        response = await run_in_thread(_converse)
     except BotoClientError as exc:
         error_code = exc.response["Error"]["Code"]
         if error_code == "ThrottlingException":
@@ -707,6 +840,8 @@ async def api_converse(
     except Exception:
         logger.error("Unexpected error during Bedrock converse call", exc_info=True)
         raise HTTPException(status_code=502, detail="Model invocation failed due to an internal error.")
+    finally:
+        release_slot()
 
     # Parse response
     output = response.get("output", {})
@@ -725,6 +860,7 @@ async def api_converse(
             model_id=request.model_id,
             usage=usage,
             key_id=validated_key.key_id,
+            request=request,
         )
 
     return ConverseResponse(

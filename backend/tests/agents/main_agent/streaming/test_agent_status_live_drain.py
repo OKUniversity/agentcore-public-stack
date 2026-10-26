@@ -16,6 +16,7 @@ yielded yet at the moment each frame arrived.
 """
 
 import asyncio
+import contextvars
 import json
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -205,6 +206,98 @@ class TestFailSoft:
         assert any(f.startswith("event: done") for f, _ in frames)
 
 
+_TITLE_FRAME = 'event: session_title\ndata: {"type": "session_title", "title": "T"}\n\n'
+
+
+class _OneShotTitle:
+    """The routes' `_session_title_sse` contract: ready once, emitted once.
+
+    It becomes ready when the agent stream goes silent (the hook's first
+    record), which models a title that lands during a tool call or the
+    model's time-to-first-token.
+    """
+
+    def __init__(self, hook: _Hook) -> None:
+        self.ready = False
+        self.emitted = 0
+        record = hook.record
+
+        def _record(status: dict) -> None:
+            self.ready = True
+            record(status)
+
+        hook.record = _record
+
+    def __call__(self) -> Optional[str]:
+        if self.emitted or not self.ready:
+            return None
+        self.emitted += 1
+        return _TITLE_FRAME
+
+
+async def _collect_with_side_frame(agent, wrapper, poll) -> List[tuple]:
+    coordinator = StreamCoordinator()
+    seen: List[tuple] = []
+    async for sse in coordinator.stream_response(
+        agent=agent,
+        prompt="hi",
+        session_manager=_SessionManager(),
+        session_id="sess-1",
+        user_id="user-1",
+        main_agent_wrapper=wrapper,
+        poll_side_frame=poll,
+    ):
+        seen.append((sse, agent.spoke_again))
+    return seen
+
+
+class TestSideFrame:
+    """The first turn's `session_title` rides the same poll as the statuses."""
+
+    @pytest.mark.asyncio
+    async def test_a_ready_title_goes_out_during_the_silence(self, monkeypatch):
+        monkeypatch.delenv("AGENT_STATUS_LIVE_DRAIN_ENABLED", raising=False)
+        hook = _Hook()
+        agent = _StallingAgent(hook)
+        poll = _OneShotTitle(hook)
+
+        frames = await _collect_with_side_frame(agent, _Wrapper(hook), poll)
+
+        arrivals = [spoke for sse, spoke in frames if sse == _TITLE_FRAME]
+        assert arrivals == [False]
+        assert poll.emitted == 1
+
+    @pytest.mark.asyncio
+    async def test_it_is_polled_even_without_a_status_hook(self, monkeypatch):
+        """No hook means no statuses, not no title."""
+        monkeypatch.delenv("AGENT_STATUS_LIVE_DRAIN_ENABLED", raising=False)
+        agent = _StallingAgent(_Hook(), silence=0.25)
+        emitted: List[str] = []
+
+        def poll() -> Optional[str]:
+            if emitted:
+                return None
+            emitted.append(_TITLE_FRAME)
+            return _TITLE_FRAME
+
+        frames = await _collect_with_side_frame(agent, _Wrapper(None), poll)
+
+        assert [sse for sse, _ in frames].count(_TITLE_FRAME) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failing_poll_does_not_break_the_turn(self, monkeypatch):
+        monkeypatch.delenv("AGENT_STATUS_LIVE_DRAIN_ENABLED", raising=False)
+        hook = _Hook()
+        agent = _StallingAgent(hook, silence=0.05)
+
+        def poll() -> Optional[str]:
+            raise RuntimeError("title task exploded")
+
+        frames = await _collect_with_side_frame(agent, _Wrapper(hook), poll)
+
+        assert any(f.startswith("event: done") for f, _ in frames)
+
+
 class TestEarlyExit:
     @pytest.mark.asyncio
     async def test_a_cooperative_stop_mid_silence_ends_cleanly(self, monkeypatch):
@@ -236,3 +329,73 @@ class TestEarlyExit:
                 session_manager.cancelled = True
 
         assert any(f.startswith("event: done") for f in frames)
+
+
+_ACTIVE_SPAN: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_ACTIVE_SPAN", default=None
+)
+
+
+class _SpanHoldingAgent(_StallingAgent):
+    """Holds a context value open across its yields, the way Strands' spans do.
+
+    Strands wraps the invocation, each cycle and each model stream in
+    ``use_span``, which sets an OpenTelemetry ContextVar on entry and resets it
+    with the token on exit — with yields in between. The reset only succeeds in
+    the Context that made the token, and anything opened from the ambient
+    context during the silence (a Memory ``CreateEvent`` span) parents to
+    whatever is current then.
+    """
+
+    def __init__(self, hook: _Hook) -> None:
+        super().__init__(hook, silence=0.25)
+        self.seen_during_silence: Optional[str] = None
+        self.reset_error: Optional[BaseException] = None
+
+    def stream_async(self, prompt: Any) -> AsyncIterator[Dict[str, Any]]:
+        async def _gen() -> AsyncIterator[Dict[str, Any]]:
+            token = _ACTIVE_SPAN.set("execute_event_loop_cycle")
+            yield {"event": {"messageStart": {"role": "assistant"}}}
+
+            self._hook.record({"phase": "tool_start", "cycle": 1, "toolName": "t"})
+            await asyncio.sleep(self._silence)
+            self.seen_during_silence = _ACTIVE_SPAN.get()
+
+            self.spoke_again = True
+            yield {"event": {"messageStop": {"stopReason": "end_turn"}}}
+            try:
+                _ACTIVE_SPAN.reset(token)
+            except ValueError as exc:
+                self.reset_error = exc
+
+        return _gen()
+
+
+class TestContextAcrossSteps:
+    @pytest.mark.asyncio
+    async def test_a_value_set_before_a_yield_resets_after_it(self, monkeypatch):
+        """Each `__anext__` is its own task; they must share one Context.
+
+        A fresh context copy per step made every span Strands held across a
+        yield fail to detach ("was created in a different Context"), ~5 logged
+        errors per tool turn in the runtime.
+        """
+        monkeypatch.delenv("AGENT_STATUS_LIVE_DRAIN_ENABLED", raising=False)
+        hook = _Hook()
+        agent = _SpanHoldingAgent(hook)
+
+        frames = await _collect_with_arrival(agent, _Wrapper(hook))
+
+        assert _arrival_of_phase(frames, "tool_start") is False  # merge engaged
+        assert agent.reset_error is None
+
+    @pytest.mark.asyncio
+    async def test_the_ambient_value_survives_into_the_next_step(self, monkeypatch):
+        """Otherwise spans opened mid-turn parent to the request span."""
+        monkeypatch.delenv("AGENT_STATUS_LIVE_DRAIN_ENABLED", raising=False)
+        hook = _Hook()
+        agent = _SpanHoldingAgent(hook)
+
+        await _collect_with_arrival(agent, _Wrapper(hook))
+
+        assert agent.seen_during_silence == "execute_event_loop_cycle"

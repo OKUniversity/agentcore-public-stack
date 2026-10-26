@@ -4,9 +4,39 @@
  * Provides a complete, valid AppConfig and helpers to mock SSM
  * valueFromLookup context entries so stacks can be synthesized
  * without hitting AWS.
+ *
+ * ## Two ways a synth here differs from what a deployment gets
+ *
+ * Both were found by reading dev's live stack against a synth (2026-10-20),
+ * and both make a test's numbers smaller than reality, so they matter to any
+ * test that COUNTS something rather than asserting a shape:
+ *
+ * 1. **`Template.fromStack` never emits `AWS::CDK::Metadata`.** The CDK *CLI*
+ *    adds it to every deployed template (version reporting, on unless
+ *    `versionReporting: false`, which `cdk.json` does not set). So a resource
+ *    count taken from a unit test is **one lower than the deploy's**, always.
+ *    `platform-ceilings.test.ts` adds it back; anything else counting
+ *    resources should too.
+ * 2. **A config-gated block is absent until its value is present.** This
+ *    factory is deliberately an all-off baseline, which is neither the shipped
+ *    default (`loadConfig()`) nor anything a deployment runs, and a block that
+ *    only synthesizes when a value is set simply will not be there.
+ *    `tokenExchange` is the usual one: it is worth 3 env vars
+ *    (`runtime-env-var-limit.test.ts`: "without it this test counts 44 while
+ *    prod and dev deploy 47") and 1 resource (`platform-ceilings.test.ts`).
+ *    This has now been missed twice, in both of those files, by authors who
+ *    had read the other one's warning — so if your test measures against a
+ *    ceiling, start from the config a deployment actually has and work out
+ *    what is missing, rather than from this baseline and what you remember.
+ *
+ * A bare `new cdk.App()` also carries none of `cdk.json`'s CDK feature flags,
+ * which change what is synthesized; pass them when fidelity matters.
  */
 import * as cdk from 'aws-cdk-lib';
 import { AppConfig,
+  AGENTCORE_RUNTIME_PLATFORM_VERSION_DEFAULT,
+  API_CONVERSE_MAX_IN_FLIGHT_DEFAULT,
+  CONVERSATION_RETENTION_DAYS_DEFAULT,
   MANAGED_KB_DEFAULT_PER_OWNER_BYTES,
   MANAGED_KB_ELEVATED_PER_OWNER_BYTES,
   MANAGED_KB_PER_KB_CEILING_BYTES,
@@ -49,6 +79,9 @@ export function createMockConfig(overrides: Partial<AppConfig> = {}): AppConfig 
     vpcCidr: '10.0.0.0/16',
     corsOrigins: 'http://localhost:4200',
     appVersion: '1.0.0-test',
+    conversationRetentionDays: CONVERSATION_RETENTION_DAYS_DEFAULT,
+    conversationRetentionPrunesSessions: true,
+    conversationRetentionPruneArmed: false,
     frontend: {
       cloudFrontPriceClass: 'PriceClass_100',
     },
@@ -57,8 +90,9 @@ export function createMockConfig(overrides: Partial<AppConfig> = {}): AppConfig 
       memory: 512,
       desiredCount: 1,
       maxCapacity: 2,
+      apiConverseMaxInFlight: API_CONVERSE_MAX_IN_FLIGHT_DEFAULT,
     },
-    inferenceApi: {},
+    inferenceApi: { runtimePlatformVersion: AGENTCORE_RUNTIME_PLATFORM_VERSION_DEFAULT },
     // Observability mirrors the shipped OSS defaults rather than hardcoded
     // literals, so a change to a default is exercised by every existing test
     // instead of silently diverging from what a fork actually deploys.
@@ -99,6 +133,7 @@ export function createMockConfig(overrides: Partial<AppConfig> = {}): AppConfig 
       xraySamplingReservoir: OBSERVABILITY_DEFAULT_XRAY_SAMPLING_RESERVOIR,
       xrayInsightsNotifications: false,
       agentCoreApplicationLogsEnabled: false,
+      runtimeLogRetentionSweepEnabled: true,
     },
     ragIngestion: {
       lambdaMemorySize: 3008,
@@ -131,18 +166,85 @@ export function createMockConfig(overrides: Partial<AppConfig> = {}): AppConfig 
     scheduledRuns: {
       enabled: false,
     },
+    platformCosts: {
+      enabled: false,
+    },
     memorySpaces: {
+      enabled: false,
+    },
+    projects: {
+      enabled: false,
+    },
+    userGrants: {
+      enabled: false,
+    },
+    sessionPrewarm: {
+      enabled: false,
+    },
+    handoffs: {
+      enabled: false,
+    },
+    clientTurnTiming: {
+      enabled: false,
+    },
+    ttftProbe: {
+      userId: '',
+      modelId: '',
+    },
+    memoryLint: {
+      mode: 'warn',
+      sensitivePatterns: '',
+    },
+    conversationIndex: {
+      enabled: false,
+    },
+    conversationSearch: {
+      enabled: true,
+    },
+    platformSelfService: {
       enabled: false,
     },
     feedbackEvalSampling: { enabled: false },
     skills: {
       enabled: false,
     },
+    skillAuthoring: {
+      enabled: false,
+    },
+    wordTrackedChanges: {
+      enabled: false,
+    },
+    assistantKbFullContext: {
+      enabled: false,
+    },
+    largeDocumentAttachments: {
+      enabled: false,
+    },
+    attachmentKb: {
+      enabled: false,
+    },
+    folderAttachments: {
+      enabled: false,
+    },
+    folderSync: {
+      enabled: false,
+    },
+    sourceProvenance: {
+      enabled: false,
+    },
+    documentExtract: {
+      enabled: false,
+      modelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+    },
     agents: {
       enabled: false,
     },
     agentMarketplace: {
       enabled: false,
+    },
+    dictation: {
+      enabled: true,
+      languages: 'en-US',
     },
     fineTuning: {
       enabled: true,

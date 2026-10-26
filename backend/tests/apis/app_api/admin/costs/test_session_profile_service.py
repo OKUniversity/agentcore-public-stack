@@ -213,6 +213,27 @@ async def test_agent_cache_bypass_is_silent_when_every_family_is_promoted():
 
 
 @pytest.mark.asyncio
+async def test_prefix_split_larger_than_its_own_prompt_reads_as_not_tracked():
+    """`prefixTokens.tools` is a residual between two estimators and rows
+    written before the write-side guard can claim a static prefix bigger than
+    the whole prompt the provider billed — prod session 7f5f207f reported
+    tools=223,782 against a 55,783-token prompt. Nothing is backfilled, so the
+    read path drops those rather than render a number a reader would size a
+    tool budget from."""
+    records = [_call(0, read=10_000), _call(1, read=10_000)]
+    # 60,000 tokens of "static prefix" inside a 10,100-token prompt.
+    records[1]["prefixTokens"] = {"system": 12_000, "tools": 48_000}
+    records[1]["windowRemovedMessages"] = 4
+
+    p = await _service(_row(), records).get_session_profile("s1")
+
+    assert p.prefix_tokens is None
+    assert p.data_coverage.prefix_tokens is False
+    # Only the split is in doubt; the rest of the ledger still decodes.
+    assert p.window_removed_messages == 4
+
+
+@pytest.mark.asyncio
 async def test_the_whole_profile_serializes_without_content_bearing_keys():
     from apis.shared.observability.content_policy import content_bearing_paths
     files = [{"uploadId": "a", "mimeType": "application/pdf", "sizeBytes": 1}]
@@ -231,7 +252,10 @@ async def test_context_ledger_is_decoded_diffed_and_covered():
     # Rows carry the ledger from call 1 on: a stable prefix split, a window
     # count that rises before call 3 (a trim), and one compaction decision
     # with the summary's size at that moment.
-    records[1]["prefixTokens"] = {"system": 12_000, "tools": 48_000}
+    # Sized to fit inside the row's own billed prompt (ctx_in + read = 10,100):
+    # `prefixTokens` is reconciled against it on read, so a split that could not
+    # fit is dropped as not-tracked — see the test below.
+    records[1]["prefixTokens"] = {"system": 1_200, "tools": 4_800}
     records[1]["windowRemovedMessages"] = 0
     records[2]["windowRemovedMessages"] = 0
     records[3]["windowRemovedMessages"] = 8
@@ -239,7 +263,7 @@ async def test_context_ledger_is_decoded_diffed_and_covered():
 
     p = await _service(_row(), records).get_session_profile("s1")
 
-    assert p.prefix_tokens.system == 12_000 and p.prefix_tokens.tools == 48_000
+    assert p.prefix_tokens.system == 1_200 and p.prefix_tokens.tools == 4_800
     assert p.window_trim_calls == 1
     assert p.window_removed_messages == 8
     assert p.compaction_event_counts == {"applied": 1}

@@ -29,6 +29,7 @@ import { isPreviewableFilename } from '../file-preview/file-preview.model';
 import { McpAppStateService } from '../mcp-apps/mcp-app-state.service';
 import { ToolInsightService } from './tool-insight.service';
 import { SessionService } from '../session/session.service';
+import { AgentNoticeService } from '../agent-notice/agent-notice.service';
 import type {
   OAuthRequiredEvent,
   ToolApprovalRequiredEvent,
@@ -40,6 +41,7 @@ import type {
   ToolInputPartialEvent,
   SessionTitleEvent,
   ModelRetryEvent,
+  AgentNoticeEvent,
 } from '../../../shared/utils/stream-parser';
 import {
   processStreamEvent,
@@ -134,8 +136,22 @@ interface ParserSessionState {
   /** Error state */
   error: WritableSignal<string | null>;
 
-  /** Stream completion state */
+  /**
+   * Parser-side completion: true once `done` was handled OR the parser gave
+   * up on the stream (`setError`). Drives rendering only — a client parse
+   * error says nothing about whether the server's turn is still running.
+   */
   isStreamComplete: WritableSignal<boolean>;
+
+  /**
+   * True once the server sent this stream's `done` frame — the turn is over
+   * server-side, whatever the parser made of it. Recorded before the state
+   * gate, so a parser already in `Error` still learns the turn ended.
+   * Read by the Stop path: a Stop after this point must not mark the
+   * finished turn interrupted. Reset with the rest of the state on every
+   * new stream.
+   */
+  doneReceived: boolean;
 
   /** Metadata (usage, metrics) from the stream */
   metadata: WritableSignal<MetadataEvent | null>;
@@ -177,6 +193,7 @@ export class StreamParserService {
   private mcpAppState = inject(McpAppStateService);
   private sessionService = inject(SessionService);
   private toolInsight = inject(ToolInsightService);
+  private agentNotice = inject(AgentNoticeService);
 
   // =========================================================================
   // Per-Session State
@@ -195,7 +212,6 @@ export class StreamParserService {
   private readonly lastEventAtCache = new Map<string, Signal<number>>();
   private readonly citationsCache = new Map<string, Signal<Citation[]>>();
   private readonly errorCache = new Map<string, Signal<string | null>>();
-  private readonly isStreamCompleteCache = new Map<string, Signal<boolean>>();
 
   // =========================================================================
   // Public API
@@ -245,9 +261,16 @@ export class StreamParserService {
     return this.cachedAccessor(this.errorCache, sessionId, (state) => state.error(), null);
   }
 
-  /** Stream completion state for a session. */
-  isStreamCompleteFor(sessionId: string): Signal<boolean> {
-    return this.cachedAccessor(this.isStreamCompleteCache, sessionId, (state) => state.isStreamComplete(), false);
+  /**
+   * Whether a session's CURRENT stream has received the server's `done`.
+   *
+   * Scoped to the stream the parser was last reset for, so a new turn reads
+   * false until its own `done`. Deliberately not derived from
+   * `isStreamComplete`, which a client-side parse error also sets while the
+   * server turn keeps running — a Stop then is a real interruption.
+   */
+  hasReceivedDone(sessionId: string): boolean {
+    return this.states().get(sessionId)?.doneReceived ?? false;
   }
 
   /**
@@ -301,6 +324,12 @@ export class StreamParserService {
     // Placed after the stale-stream guard so a superseded stream can't keep
     // its replacement looking alive.
     state.lastEventAt.set(Date.now());
+
+    // Like liveness, the end of the server's turn is a transport fact the
+    // state gate below must not swallow (a parser in `Error` drops `done`).
+    if (event === 'done') {
+      state.doneReceived = true;
+    }
 
     // Validate inputs
     if (!event || typeof event !== 'string') {
@@ -426,6 +455,7 @@ export class StreamParserService {
       lastEventAt: signal<number>(Date.now()),
       error: signal<string | null>(null),
       isStreamComplete,
+      doneReceived: false,
       metadata: signal<MetadataEvent | null>(null),
       pendingCitations: signal<Citation[]>([]),
       currentMessage: computed<Message | null>(() => {
@@ -572,12 +602,22 @@ export class StreamParserService {
       onToolGroupSummary: (data) =>
         this.toolInsight.recordSummary(state.sessionId, data),
 
+      // Source-provenance verdicts for a `verify_sources` call. Scoped to the
+      // streaming session, not the viewed one: a background conversation's
+      // verdicts belong to that conversation.
+      onSourceProvenance: (data) =>
+        this.toolInsight.recordProvenance(state.sessionId, data),
+
       onModelRetry: (data: ModelRetryEvent) => {
         // Not viewed-session-scoped on purpose: this signal is read per
         // session id, so a background conversation's retry stays with that
         // conversation instead of leaking into the one on screen.
         state.modelRetry.set(data);
       },
+
+      // Keyed by this stream's session, like model_retry: a background
+      // task's notice stays with that task.
+      onAgentNotice: (data: AgentNoticeEvent) => this.agentNotice.set(state.sessionId, data),
 
       onMetadata: (data) => this.handleMetadata(state, data),
       onReasoning: (data) => this.handleReasoning(state, data),
@@ -601,6 +641,12 @@ export class StreamParserService {
           lastAssistantId,
           state.sessionId,
         );
+        // Only the interrupt-driven flavor pauses the turn. A pre-flight
+        // prompt (no interruptId) left a finished turn behind, so the
+        // conversation is not waiting on anything.
+        if (data.interruptId) {
+          this.chatStateService.markSessionAwaitingInput(state.sessionId, 'oauth');
+        }
       },
 
       onSteeringApplied: (data: SteeringAppliedEvent) => {
@@ -695,6 +741,7 @@ export class StreamParserService {
           messageId: lastAssistantId,
           sessionId: state.sessionId,
         });
+        this.chatStateService.markSessionAwaitingInput(state.sessionId, 'tool_approval');
       },
 
       onUserQuestionRequired: (data: UserQuestionRequiredEvent) => {
@@ -706,6 +753,7 @@ export class StreamParserService {
           messageId: lastAssistantId,
           sessionId: state.sessionId,
         });
+        this.chatStateService.markSessionAwaitingInput(state.sessionId, 'user_question');
       },
 
       onBrowserLoginRequired: (data: BrowserLoginRequiredEvent) => {
@@ -726,6 +774,7 @@ export class StreamParserService {
           sandboxOrigin: data.sandboxOrigin,
           messageId: lastAssistantId,
         });
+        this.chatStateService.markSessionAwaitingInput(state.sessionId, 'browser_login');
       },
 
       onError: (data) => this.handleError(state, data),
@@ -740,6 +789,9 @@ export class StreamParserService {
           streamError.metadata?.['error_kind'] === 'max_tokens';
         if (isMaxTokens) {
           this.chatStateService.setLastTurnContinuable(state.sessionId, true);
+        }
+        if (streamError.metadata?.['error_kind'] === 'resume_unavailable') {
+          this.chatStateService.markResumeUnavailable(state.sessionId);
         }
       },
 
@@ -933,6 +985,7 @@ export class StreamParserService {
     const toolUseId = data.tool_result.toolUseId;
     const content = data.tool_result.content || [];
     const status = data.tool_result.status || 'success';
+    const structuredContent = data.tool_result.structuredContent;
 
     const currentBuilder = state.currentMessageBuilder();
     if (!currentBuilder) {
@@ -974,6 +1027,9 @@ export class StreamParserService {
         result: {
           content: resultContent,
           status: status,
+          // Kept so an MCP App's "waiting for you" result is not read as a
+          // failure (`isAwaitingUserSubmission`).
+          ...(structuredContent !== undefined ? { structuredContent } : {}),
         },
         status: status === 'error' ? 'error' : 'complete',
       };
@@ -1012,6 +1068,7 @@ export class StreamParserService {
   private handleDone(state: ParserSessionState): void {
     this.finalizeCurrentMessage(state);
     state.isStreamComplete.set(true);
+    state.doneReceived = true;
     state.modelRetry.set(null);
     // "Using list_courses" on a finished turn is a lie, not a stale nicety.
     // Durations and summaries already recorded are untouched.
@@ -1100,7 +1157,12 @@ export class StreamParserService {
         usage.inputTokens +
         (usage.cacheReadInputTokens ?? 0) +
         (usage.cacheWriteInputTokens ?? 0);
-      this.chatStateService.setContext(state.sessionId, totalContext, data.contextWindow);
+      this.chatStateService.setContext(
+        state.sessionId,
+        totalContext,
+        data.contextWindow,
+        data.contextBreakdown ?? null,
+      );
     }
   }
 

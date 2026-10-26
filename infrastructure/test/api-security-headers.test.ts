@@ -81,6 +81,56 @@ describe('/api/* security response headers', () => {
     });
   });
 
+  /**
+   * The omission of `sandbox` is a DECISION, not an oversight, so it gets a
+   * test that states it rather than only an absence.
+   *
+   * app-api's `RESOURCE_SECURITY_HEADERS`
+   * (backend/src/apis/shared/skills/resource_types.py) sends
+   * `default-src 'none'; frame-ancestors 'none'; sandbox` on skill-resource
+   * downloads. The policy above carries `Override: true`, so behind
+   * CloudFront the `; sandbox` suffix never reaches the browser — verified by
+   * hand on dev, where `/api/skills/.../resources/LICENSE.txt` and
+   * `/api/memory/spaces` (a route that sets no CSP at all) return byte-
+   * identical CSP headers.
+   *
+   * That is intended. This policy covers EVERY `/api/*` response, including
+   * `Content-Disposition: attachment` bodies and the top-level OAuth login
+   * navigation the SPA performs via `window.location.href`. A bare `sandbox`
+   * forces an opaque origin across that whole surface, and buys nothing:
+   * `default-src 'none'` already blocks every script, so there is no script
+   * left for the opaque origin to contain. The backend header still matters
+   * on the paths that bypass CloudFront entirely — the ALB is
+   * internet-facing, and a localhost SPA talks to the dev backend directly —
+   * where it is the browser's only CSP.
+   *
+   * If you are here because you want `sandbox` at the edge: it must be
+   * `sandbox allow-downloads` at minimum, and the OAuth login redirect and
+   * every attachment route need verifying in a real browser first.
+   */
+  it('deliberately omits `sandbox` from the edge CSP', () => {
+    const policies = synth().findResources(
+      'AWS::CloudFront::ResponseHeadersPolicy',
+    );
+    const apiPolicy = Object.values(policies).find(
+      (p) =>
+        p.Properties?.ResponseHeadersPolicyConfig?.Name ===
+        'test-project-api-headers',
+    );
+    expect(apiPolicy).toBeDefined();
+
+    const csp =
+      apiPolicy!.Properties.ResponseHeadersPolicyConfig.SecurityHeadersConfig
+        .ContentSecurityPolicy;
+
+    expect(csp.ContentSecurityPolicy).not.toContain('sandbox');
+
+    // `Override: true` is what makes this policy a backstop rather than a
+    // default. Dropping it would let any app-api route, middleware or error
+    // handler define the CSP for the entire origin.
+    expect(csp.Override).toBe(true);
+  });
+
   it('attaches the policy to the /api/* cache behavior', () => {
     const template = synth();
     const distributions = template.findResources('AWS::CloudFront::Distribution');

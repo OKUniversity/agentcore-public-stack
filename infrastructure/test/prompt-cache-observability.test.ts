@@ -68,6 +68,7 @@ describe('PromptCacheObservabilityConstruct', () => {
       'PartialMissUsd',
       'WastedUsd',
       'SessionPartialMissUsd',
+      'UnmeteredModelCall',
     ]) {
       expect(body).toContain(metric);
     }
@@ -80,12 +81,19 @@ describe('PromptCacheObservabilityConstruct', () => {
     expect(body).toContain('sessionId');
   });
 
-  it('creates three alarms, all NOT_BREACHING on missing data (kill-switch tolerant)', () => {
-    t.resourceCountIs('AWS::CloudWatch::Alarm', 3);
+  it('creates four alarms, all NOT_BREACHING on missing data (kill-switch tolerant)', () => {
+    t.resourceCountIs('AWS::CloudWatch::Alarm', 4);
     const alarms = Object.values(t.findResources('AWS::CloudWatch::Alarm'));
     for (const alarm of alarms) {
       expect(alarm.Properties.TreatMissingData).toBe('notBreaching');
-      expect(alarm.Properties.Namespace).toBe('AgentCoreStack/PromptCache');
+      // A metric-math alarm carries its namespace on each input metric.
+      const namespaces = alarm.Properties.Namespace
+        ? [alarm.Properties.Namespace]
+        : (alarm.Properties.Metrics ?? [])
+            .filter((m: { MetricStat?: unknown }) => m.MetricStat)
+            .map((m: { MetricStat: { Metric: { Namespace: string } } }) => m.MetricStat.Metric.Namespace);
+      expect(namespaces.length).toBeGreaterThan(0);
+      for (const namespace of namespaces) expect(namespace).toBe('AgentCoreStack/PromptCache');
       // Routed to the platform alarm topic. This assertion previously read
       // `toBeUndefined()` with the note "Console-only: no SNS wiring yet
       // anywhere in the stack" — which was true of the whole stack, and is the
@@ -98,11 +106,24 @@ describe('PromptCacheObservabilityConstruct', () => {
     }
   });
 
-  it('alarms on AvoidableMiss (the nominated target) and WastedUsd', () => {
+  it('alarms on unexplained AvoidableMiss (the nominated target) and WastedUsd', () => {
+    // Net of the explained subsets: a model switch continues the conversation in
+    // place and an @-mention runs another Agent; both re-write the prefix on purpose.
+    const alarm = Object.values(t.findResources('AWS::CloudWatch::Alarm')).find(
+      a => a.Properties.AlarmName === `${MOCK_PREFIX}-prompt-cache-avoidable-miss`,
+    )!;
+    const metrics: { Id: string; Expression?: string; MetricStat?: { Metric: { MetricName: string }; Stat: string } }[] =
+      alarm.Properties.Metrics;
+    const expression = metrics.find(m => m.Expression)!;
+    expect(expression.Expression).toBe('FILL(avoidable, 0) - FILL(agentSwitch, 0) - FILL(modelSwitch, 0)');
+    const inputs = Object.fromEntries(
+      metrics.filter(m => m.MetricStat).map(m => [m.Id, m.MetricStat!.Metric.MetricName]),
+    );
+    expect(inputs).toEqual({ avoidable: 'AvoidableMiss', agentSwitch: 'AgentSwitchMiss', modelSwitch: 'ModelSwitchMiss' });
+    for (const m of metrics.filter(m => m.MetricStat)) expect(m.MetricStat!.Stat).toBe('Sum');
+
     t.hasResourceProperties('AWS::CloudWatch::Alarm', {
       AlarmName: `${MOCK_PREFIX}-prompt-cache-avoidable-miss`,
-      MetricName: 'AvoidableMiss',
-      Statistic: 'Sum',
       // The single default. Was `config.production ? 10 : 50`; the tighter
       // value became the one default because a prefix-stability regression is
       // a cost leak, and catching it earlier is cheaper for every fork.
@@ -135,6 +156,23 @@ describe('PromptCacheObservabilityConstruct', () => {
     });
   });
 
+  it('alarms on any unmetered model call, and says which model in the log query', () => {
+    // A call with no catalog pricing is free against quota. There is no
+    // acceptable rate of that, so the threshold is zero, not configurable.
+    t.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      AlarmName: `${MOCK_PREFIX}-unmetered-model-call`,
+      MetricName: 'UnmeteredModelCall',
+      Statistic: 'Sum',
+      Period: 3600,
+      Threshold: 0,
+      EvaluationPeriods: 1,
+      ComparisonOperator: 'GreaterThanThreshold',
+    });
+    const dashboards = t.findResources('AWS::CloudWatch::Dashboard');
+    const body = JSON.stringify(Object.values(dashboards)[0].Properties.DashboardBody);
+    expect(body).toContain('by modelId, surface, unmeteredReason');
+  });
+
   /**
    * Every threshold is a single configured value. An institution that wants a
    * looser dev environment sets a different value there — it does not get one
@@ -149,7 +187,7 @@ describe('PromptCacheObservabilityConstruct', () => {
       promptCacheSessionWastedUsdThreshold: 42,
     });
     custom.hasResourceProperties('AWS::CloudWatch::Alarm', {
-      MetricName: 'AvoidableMiss',
+      AlarmName: `${MOCK_PREFIX}-prompt-cache-avoidable-miss`,
       Threshold: 77,
     });
     custom.hasResourceProperties('AWS::CloudWatch::Alarm', {
@@ -178,7 +216,7 @@ describe('PromptCacheObservabilityConstruct', () => {
       runtimeLogGroupName: MOCK_RUNTIME_LOG_GROUP,
     });
     const noTopic = Template.fromStack(stack);
-    noTopic.resourceCountIs('AWS::CloudWatch::Alarm', 3);
+    noTopic.resourceCountIs('AWS::CloudWatch::Alarm', 4);
     for (const alarm of Object.values(noTopic.findResources('AWS::CloudWatch::Alarm'))) {
       expect((alarm as any).Properties.AlarmActions).toBeUndefined();
     }

@@ -422,14 +422,14 @@ import {
               {{ anatomyResource.value().avoidableMissCount }}
             </p>
             <!--
-              #756 — an @-mention re-writes the prefix on purpose and looks exactly
-              like the regression this page exists to find. The count stays whole (the
-              spend was real); the explained part is named underneath so the red number
-              above only means "unexplained".
+              #756 — an @-mention or a model switch re-writes the prefix on purpose and
+              looks exactly like the regression this page exists to find. The count stays
+              whole (the spend was real); the explained part is named underneath so the
+              red number above only means "unexplained".
             -->
-            @if (anatomyResource.value().agentSwitchMissCount > 0) {
+            @if (explainedMissNote(); as note) {
               <p class="mt-1 text-xs/5 text-gray-500 dark:text-gray-400">
-                {{ anatomyResource.value().agentSwitchMissCount }} from an agent switch ·
+                {{ note }} ·
                 <span class="font-medium">{{ unexplainedMisses() }} unexplained</span>
               </p>
             }
@@ -941,7 +941,20 @@ export class SessionCostAnatomyPage {
   readonly unexplainedMisses = computed(() => {
     const anatomy = this.anatomyResource.value();
     if (!anatomy) return 0;
-    return Math.max(0, anatomy.avoidableMissCount - anatomy.agentSwitchMissCount);
+    return Math.max(
+      0,
+      anatomy.avoidableMissCount - anatomy.agentSwitchMissCount - (anatomy.modelSwitchMissCount ?? 0),
+    );
+  });
+
+  /** "2 from an agent switch, 1 from a model switch", or null when nothing is explained. */
+  readonly explainedMissNote = computed<string | null>(() => {
+    const anatomy = this.anatomyResource.value();
+    if (!anatomy) return null;
+    const parts: string[] = [];
+    if (anatomy.agentSwitchMissCount > 0) parts.push(`${anatomy.agentSwitchMissCount} from an agent switch`);
+    if ((anatomy.modelSwitchMissCount ?? 0) > 0) parts.push(`${anatomy.modelSwitchMissCount} from a model switch`);
+    return parts.length ? parts.join(', ') : null;
   });
 
   private expandedRows = signal<ReadonlySet<number>>(new Set());
@@ -987,6 +1000,7 @@ export class SessionCostAnatomyPage {
         return `${base} bg-state-danger-100 text-state-danger-800 dark:bg-state-danger-900/30 dark:text-state-danger-300`;
       case 'partial_miss':
         return `${base} bg-category-accent-partial-miss-100 text-category-accent-partial-miss-800 dark:bg-category-accent-partial-miss-900/30 dark:text-category-accent-partial-miss-300`;
+      case 'estimated':
       case 'uncached':
       default:
         return `${base} bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300`;
@@ -1007,6 +1021,10 @@ export class SessionCostAnatomyPage {
         return 'Miss (Partial)';
       case 'uncached':
         return 'Uncached';
+      case 'estimated':
+        // Not a verdict: this call never reported usage, so there was nothing
+        // to classify. The row's `usageEstimated` names what each figure is.
+        return 'Not measured';
       default:
         return status;
     }

@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import type { ActivatedRouteSnapshot } from '@angular/router';
-import { isMinimalChromeRoute, MINIMAL_CHROME } from './route-chrome';
+import {
+  ADMIN_CHROME,
+  isAdminChromeRoute,
+  isMinimalChromeRoute,
+  MINIMAL_CHROME,
+  resolveRouteChrome,
+} from './route-chrome';
 
 /** Minimal stand-in for the bits of the snapshot the walk touches. */
 function node(
@@ -48,5 +54,58 @@ describe('isMinimalChromeRoute', () => {
   it('tolerates a route with no data at all', () => {
     const bare = { firstChild: null } as unknown as ActivatedRouteSnapshot;
     expect(isMinimalChromeRoute(bare)).toBe(false);
+  });
+});
+
+describe('isAdminChromeRoute', () => {
+  it('inherits the parent /admin flag onto a child that declares none', () => {
+    // This is the whole reason the walk keeps the deepest *declared* value
+    // rather than reading the leaf. `data` is declared once on the `/admin`
+    // route, and with the default paramsInheritanceStrategy ('emptyOnly')
+    // Angular does not copy it onto a child that has its own path and
+    // component — which every admin page does. A leaf-only read would see
+    // nothing on all ~30 of them.
+    const tree = node({}, node({ chrome: ADMIN_CHROME }, node({ scope: 'admin.costs' })));
+    expect(isAdminChromeRoute(tree)).toBe(true);
+  });
+
+  it('lets a leaf opt back out of an inherited flag', () => {
+    const tree = node({ chrome: ADMIN_CHROME }, node({ chrome: 'full' }));
+    expect(isAdminChromeRoute(tree)).toBe(false);
+  });
+
+  it('does not report admin chrome for a chat route', () => {
+    expect(isAdminChromeRoute(node({}, node({})))).toBe(false);
+  });
+
+  it('is false for a null root', () => {
+    expect(isAdminChromeRoute(null)).toBe(false);
+  });
+
+  it('keeps the two modes disjoint', () => {
+    // The shell asks both questions of the same snapshot; a tree must never
+    // answer yes to both, or the sidenav would render for a route that asked
+    // for a stripped shell.
+    const admin = node({ chrome: ADMIN_CHROME }, node({}));
+    const minimal = node({ chrome: MINIMAL_CHROME });
+
+    expect([isAdminChromeRoute(admin), isMinimalChromeRoute(admin)]).toEqual([true, false]);
+    expect([isAdminChromeRoute(minimal), isMinimalChromeRoute(minimal)]).toEqual([false, true]);
+  });
+});
+
+describe('resolveRouteChrome', () => {
+  it('returns null when nothing in the chain declares a chrome', () => {
+    expect(resolveRouteChrome(node({}, node({})))).toBeNull();
+  });
+
+  it('returns the deepest declared value', () => {
+    expect(resolveRouteChrome(node({ chrome: ADMIN_CHROME }, node({ chrome: MINIMAL_CHROME })))).toBe(
+      MINIMAL_CHROME,
+    );
+  });
+
+  it('ignores a non-string declaration', () => {
+    expect(resolveRouteChrome(node({ chrome: 1 }))).toBeNull();
   });
 });

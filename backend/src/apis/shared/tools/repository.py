@@ -363,6 +363,20 @@ class ToolCatalogRepository:
             if admin_user_id:
                 existing.updated_by = admin_user_id
 
+            # Re-run model validation over the PATCHED state before persisting.
+            #
+            # `setattr` above bypasses validators: `ToolDefinition` does not set
+            # `validate_assignment`, so a `mode="after"` model validator runs at
+            # construction and never again. Without this, a partial update could
+            # write a row the model itself considers invalid — concretely, a
+            # `PUT {"alwaysOn": true}` that does not also send `enabledByDefault`
+            # persisted `alwaysOn=True` alongside `enabledByDefault=False`, the
+            # incoherent pair `_normalize_always_on` exists to prevent. Reads
+            # normalised it on the way back out, so nothing misbehaved at
+            # runtime — but the stored row was wrong, and raw-item consumers
+            # (backfills, exports, analytics) do not go through the model.
+            existing = ToolDefinition.model_validate(existing.model_dump())
+
             # Save
             item = existing.to_dynamo_item()
             self._table.put_item(Item=item)

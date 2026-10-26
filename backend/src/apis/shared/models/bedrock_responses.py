@@ -151,6 +151,32 @@ def _warn_on_missing_inference_profile(model_id: str) -> None:
 # without re-running `scripts/probe_gpt56_cache_rates.py --mode both
 # --grow-history` and beating the implicit arm.
 #
+# ⛔ THE SECOND-BREAKPOINT IDEA ABOVE WAS TESTED AND LOSES. Measured on Kimi
+# K3 (2026-09-21, dev-ai, unique prefix per arm, 7.7k static prefix, 5 turns
+# with a tool-result blob appended each turn, US CRIS rates):
+#
+#                              read    write  uncached   5-turn $
+#   one breakpoint (ships)    30,740    7,685    11,610    0.08016
+#   + end-of-history bp       30,740   19,155       140    0.08962   +11.8%
+#
+# The second breakpoint re-WRITES the whole growing history every turn
+# (1,147 -> 2,294 -> 3,441 -> 4,588) and never reads it back — cache reads stay
+# pinned at the static prefix in both arms. Marking a boundary whose content
+# changes every turn just moves history from the $3.30 input rate to the $4.125
+# write rate: 1.25x worse, by construction rather than by accident.
+#
+# Two mechanics worth knowing before anyone tries a variant:
+#   - A breakpoint is REJECTED on an assistant `output_text` block —
+#     "prompt_cache_breakpoint must be attached to a content block that renders
+#     cacheable prompt content". It has to ride user/developer input content.
+#   - Lookup did not do longest-prefix matching. Turn N+1's history contains
+#     turn N's as a prefix, yet nothing from the earlier entry was read back.
+#
+# Not tested: a breakpoint PINNED at a fixed history offset for several turns
+# (stable content, so it could actually be read). That is the only variant of
+# this idea still open, and it caches a fixed early chunk while the tail keeps
+# growing uncached — so the ceiling on it is small.
+#
 # Opt-in: only the literal string "true" enables it.
 #
 # ⚠️ Deliberately NOT wired into the CDK Runtime construct.
@@ -159,6 +185,48 @@ def _warn_on_missing_inference_profile(model_id: str) -> None:
 # CloudFormation *changeset validation*, i.e. after synth, tsc, jest and green
 # CI (it broke the dev Platform Stack deploy on 2026-08-05).
 EXPLICIT_CACHE_ENABLED_ENV = "BEDROCK_RESPONSES_EXPLICIT_CACHE_ENABLED"
+
+# ── …but the measurement above is about GPT-5.6, and it does not generalize ──
+#
+# Models on this transport that REQUIRE explicit mode to cache at all. For
+# these the env flag above is irrelevant: without explicit controls they do not
+# merely fail to save, they bill a full cache WRITE every turn and never read
+# one back — strictly worse than not caching.
+#
+# Measured clean-room on 2026-09-21 (dev-ai, us-west-2, unique prefix per arm
+# so no arm could read another's entry; 10.5k stable prefix, 4 turns, priced at
+# US CRIS $3.30 / $0.33 / $4.125):
+#
+#                                        read    write  uncached     4-turn $
+#   kimi-k3  stock (no options)             0   42,008        28      0.17338
+#   kimi-k3  developer-message placement    0   42,024        28      0.17344
+#   kimi-k3  options, no breakpoint    23,040        0    19,008      0.07033
+#   kimi-k3  FULL explicit (opts+bp)  31,458   10,486       112      0.05401
+#   gpt-5.6-luna  stock (control)     31,263   10,421         8      0.05333
+#
+# Three things that read backwards from the GPT-5.6 result:
+#
+#   1. Kimi K3's model card says it "supports implicit (automatic) prompt
+#      caching" by default. On this endpoint that is a write every turn and a
+#      read never. The same 4 turns UNCACHED would be 42,036 tok * $3.30 =
+#      $0.1387 — so stock "caching" costs **25% MORE than no caching at all**,
+#      for the life of every session.
+#   2. `prompt_cache_options` is the deciding variable, not breakpoint
+#      placement: moving the prefix into a developer message changed nothing
+#      ($0.17344 vs $0.17338), while adding the options alone recovered most of
+#      the saving.
+#   3. Full explicit lands the model on the control's efficiency ($0.05401 vs
+#      $0.05333) — a **69% saving against stock**, which is the opposite sign
+#      to the 57% pessimization the env flag exists to prevent on GPT-5.6.
+#
+# So the decision has to be PER MODEL. This is a code-level tuple rather than a
+# second env var on purpose: `AWS::BedrockAgentCore::Runtime` caps
+# EnvironmentVariables at 50, `inference-agentcore-construct.ts` is AT that cap,
+# and a 51st entry fails changeset validation after synth, tsc, jest and green
+# CI — which is why the flag above was never wired into CDK either.
+#
+# Matched as a SUBSTRING so both `us.` and `global.` inference profiles hit.
+_EXPLICIT_CACHE_REQUIRED_MODELS = ("moonshotai.kimi-k3",)
 
 # Request-level cache controls. `ttl` is the string form of the same window
 # the cache-status classifier measures gaps against
@@ -172,16 +240,34 @@ EXPLICIT_CACHE_OPTIONS: Dict[str, str] = {"mode": "explicit", "ttl": EXPLICIT_CA
 _CACHE_BREAKPOINT = {"mode": "explicit"}
 
 
-def explicit_prompt_cache_enabled() -> bool:
-    """Whether to send explicit cache breakpoints on this transport.
+def explicit_prompt_cache_enabled(model_id: Optional[str] = None) -> bool:
+    """Whether to send explicit cache breakpoints for ``model_id``.
 
-    **Default OFF** — see the measurement above; explicit mode cost ~57% more
-    than the model's default implicit caching on a conversation with growing
-    history. Only the literal string ``"true"`` opts in.
+    Two independent ways to be on, because the right answer is model-specific:
+
+    - **Per model, always on.** ``model_id`` naming a member of
+      :data:`_EXPLICIT_CACHE_REQUIRED_MODELS` returns ``True`` regardless of
+      the env flag. Those models do not cache at all without explicit
+      controls — they bill a write every turn and never read one back, which
+      is measurably worse than not caching. The env flag must not be able to
+      turn that back off.
+    - **Globally, default OFF.** For everything else, only the literal string
+      ``"true"`` opts in — explicit mode cost ~57% more than default implicit
+      caching on GPT-5.6 with a growing history.
+
+    Args:
+        model_id: The inference profile id for this request. ``None`` (the
+            pre-2026-09-21 signature) consults the env flag only, which keeps
+            every existing caller behaving exactly as before.
+
+    Returns:
+        Whether to stamp explicit cache controls onto the request.
 
     Read per call (no module-level caching) so tests and live config changes
     behave predictably; the env read is negligible next to request assembly.
     """
+    if model_id and any(name in model_id for name in _EXPLICIT_CACHE_REQUIRED_MODELS):
+        return True
     return os.environ.get(EXPLICIT_CACHE_ENABLED_ENV, "").lower() == "true"
 
 
@@ -293,6 +379,9 @@ def _bedrock_responses_model_cls() -> type:
             # Set before super().__init__ so a base-class call into
             # _resolve_client_args() during construction still resolves.
             self._bedrock_region = bedrock_region
+            # Captured here rather than read back off the SDK's config so the
+            # per-model cache gate cannot break on an SDK config-shape change.
+            self._bedrock_model_id = str(kwargs.get("model_id") or "")
             super().__init__(**kwargs)
 
         def _resolve_client_args(self) -> Dict[str, Any]:
@@ -327,7 +416,7 @@ def _bedrock_responses_model_cls() -> type:
             so both forms have to work.
             """
             request = super()._format_request(messages, tool_specs, system_prompt, *args, **kwargs)
-            if not explicit_prompt_cache_enabled():
+            if not explicit_prompt_cache_enabled(self._bedrock_model_id):
                 return request
             return apply_explicit_prompt_cache(
                 request, system_prompt=system_prompt, tool_specs=tool_specs

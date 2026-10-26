@@ -26,6 +26,7 @@ import pytest
 
 from apis.shared.models.bedrock_responses import (
     EXPLICIT_CACHE_ENABLED_ENV,
+    EXPLICIT_CACHE_OPTIONS,
     EXPLICIT_CACHE_TTL,
     apply_explicit_prompt_cache,
     build_bedrock_responses_model,
@@ -279,6 +280,82 @@ class TestOptInFlag:
             for block in item["content"]
             if isinstance(block, dict)
         )
+
+
+class TestPerModelRequirement:
+    """Kimi K3 needs explicit mode ALWAYS — the env flag must not reach it.
+
+    Its model card advertises implicit caching by default. Measured clean-room
+    on 2026-09-21 (dev-ai, us-west-2, unique prefix per arm, 10.5k prefix, 4
+    turns) that default is a cache WRITE every turn and a read never:
+
+        stock            read 0       write 42,008   ->  $0.17338
+        full explicit    read 31,458  write 10,486   ->  $0.05401
+        uncached equivalent 42,036 tok * $3.30/MTok  ->  $0.13872
+
+    So stock costs 25% MORE than not caching at all, and explicit saves 69%.
+    That is the opposite sign to the GPT-5.6 result the env flag encodes, which
+    is why the decision is per model and why `false` must not switch it off.
+    """
+
+    KIMI = "us.moonshotai.kimi-k3"
+
+    @pytest.mark.parametrize("model_id", [KIMI, "global.moonshotai.kimi-k3"])
+    def test_enabled_for_both_inference_profiles(self, monkeypatch, model_id):
+        # Substring match, so `us.` and `global.` both hit without a second entry.
+        monkeypatch.delenv(EXPLICIT_CACHE_ENABLED_ENV, raising=False)
+
+        assert explicit_prompt_cache_enabled(model_id) is True
+
+    @pytest.mark.parametrize("value", ["", "false", "0", "no"])
+    def test_the_env_flag_cannot_turn_it_off(self, monkeypatch, value):
+        """A kill switch that kills the only thing making the model affordable
+        is not a kill switch, it is a 25%-over-uncached regression."""
+        monkeypatch.setenv(EXPLICIT_CACHE_ENABLED_ENV, value)
+
+        assert explicit_prompt_cache_enabled(self.KIMI) is True
+
+    def test_the_gpt_family_is_untouched_by_the_carve_out(self, monkeypatch):
+        """The whole point is that this does NOT generalize off Kimi."""
+        monkeypatch.delenv(EXPLICIT_CACHE_ENABLED_ENV, raising=False)
+
+        assert explicit_prompt_cache_enabled("us.openai.gpt-5.6-sol") is False
+        assert explicit_prompt_cache_enabled("us.openai.gpt-6-astra") is False
+
+    def test_no_model_id_keeps_the_legacy_env_only_behaviour(self, monkeypatch):
+        """Pre-2026-09-21 callers pass nothing; they must not change meaning."""
+        monkeypatch.delenv(EXPLICIT_CACHE_ENABLED_ENV, raising=False)
+        assert explicit_prompt_cache_enabled() is False
+
+        monkeypatch.setenv(EXPLICIT_CACHE_ENABLED_ENV, "true")
+        assert explicit_prompt_cache_enabled() is True
+
+    def test_kimi_gets_the_controls_with_the_flag_unset(self, monkeypatch):
+        """End to end through the real _format_request, in production config."""
+        monkeypatch.delenv(EXPLICIT_CACHE_ENABLED_ENV, raising=False)
+        model = build_bedrock_responses_model(self.KIMI, region="us-west-2")
+
+        request = _format(model)
+
+        # `prompt_cache_options` is the deciding variable — measured: moving the
+        # prefix into a developer message WITHOUT the options changed nothing
+        # ($0.17344 vs $0.17338 stock), while the options alone recovered most
+        # of the saving. The breakpoint is what closes the rest of the gap.
+        assert request["extra_body"]["prompt_cache_options"] == EXPLICIT_CACHE_OPTIONS
+        assert "prompt_cache_key" in request
+        assert "instructions" not in request
+        developer = request["input"][0]
+        assert developer["role"] == "developer"
+        assert developer["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+
+    def test_a_sibling_moonshot_model_is_not_swept_in(self, monkeypatch):
+        """Only k3 was measured. k2.5 and k2-thinking were never probed here,
+        and an unmeasured model inheriting this would be exactly the guess the
+        rest of this file exists to prevent."""
+        monkeypatch.delenv(EXPLICIT_CACHE_ENABLED_ENV, raising=False)
+
+        assert explicit_prompt_cache_enabled("us.moonshotai.kimi-k2.5") is False
+        assert explicit_prompt_cache_enabled("us.moonshot.kimi-k2-thinking") is False
 
 
 class TestOtherTransportsUnaffected:

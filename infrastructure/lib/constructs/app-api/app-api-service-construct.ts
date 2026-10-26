@@ -91,6 +91,10 @@ export class AppApiServiceConstruct extends Construct {
   public readonly ecsService: ecs.FargateService;
   /** Exposed so alarms bind to the real target-group dimensions. */
   public readonly targetGroup: elbv2.ApplicationTargetGroup;
+  /** Exposed so scheduled one-off tasks (the session retention pruner) run
+   * app-api's own code, environment and role. */
+  public readonly taskDefinition: ecs.FargateTaskDefinition;
+  public readonly securityGroup: ec2.SecurityGroup;
 
   constructor(scope: Construct, id: string, props: AppApiServiceConstructProps) {
     super(scope, id);
@@ -111,7 +115,7 @@ export class AppApiServiceConstruct extends Construct {
     const ecsCluster = props.refs.ecsCluster;
 
     // ── Security group ──
-    const ecsSecurityGroup = new ec2.SecurityGroup(this, 'AppEcsSecurityGroup', {
+    const ecsSecurityGroup = this.securityGroup = new ec2.SecurityGroup(this, 'AppEcsSecurityGroup', {
       vpc,
       securityGroupName: getResourceName(config, 'app-ecs-sg'),
       description: 'Security group for App API ECS Fargate tasks',
@@ -123,7 +127,7 @@ export class AppApiServiceConstruct extends Construct {
     );
 
     // ── Task definition ──
-    const taskDefinition = new ecs.FargateTaskDefinition(this, 'AppApiTaskDefinition', {
+    const taskDefinition = this.taskDefinition = new ecs.FargateTaskDefinition(this, 'AppApiTaskDefinition', {
       family: getResourceName(config, 'app-api-task'),
       cpu: config.appApi.cpu,
       memoryLimitMiB: config.appApi.memory,
@@ -203,6 +207,10 @@ export class AppApiServiceConstruct extends Construct {
     // Memory Spaces storage. Read by apis/shared/memory/* via these env vars.
     environment['S3_MEMORY_SPACES_BUCKET_NAME'] = props.refs.memorySpacesBucket.bucketName;
     environment['DYNAMODB_MEMORY_SPACES_TABLE_NAME'] = props.refs.memorySpacesTable.tableName;
+    // Memory maintenance (Shared Projects 2.6): the worker a run is handed to.
+    // Read by apis/shared/projects/memory_maintenance.py; the invoke grant is
+    // in app-api-iam-grants.ts.
+    environment['MEMORY_MAINTENANCE_FUNCTION_NAME'] = props.refs.memoryMaintenanceWorker.functionName;
 
     // Fine-tuning env vars. Names verified against
     // backend/src/apis/app_api/fine_tuning/* to match the exact env
@@ -302,6 +310,14 @@ export class AppApiServiceConstruct extends Construct {
       assignPublicIp: false,
       circuitBreaker: { enable: true, rollback: true },
       enableExecuteCommand: true,
+      // Fargate bills per TASK, and a task does not inherit the service's
+      // tags unless asked. Without this, `Project` (applied stack-wide by
+      // applyStandardTags) reaches the service but never the thing that
+      // actually costs money, so ECS Fargate is invisible to any
+      // tag-scoped cost query — 17% of prod's infrastructure bill
+      // (~$118/month) silently missing. Measured on the live dev service,
+      // which reported propagateTags: NONE.
+      propagateTags: ecs.PropagatedTagSource.SERVICE,
     });
 
     this.ecsService.attachToApplicationTargetGroup(targetGroup);

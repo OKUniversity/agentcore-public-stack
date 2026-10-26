@@ -58,7 +58,16 @@ logger = logging.getLogger(__name__)
 #: adding a vendor means dropping the pair in *and* listing it here and in the
 #: SPA's ``BUILTIN_MODEL_ICONS``. Validated on write so a typo is rejected at the
 #: admin form rather than rendering an invisible tile for every user.
-BUILTIN_MODEL_ICONS: tuple[str, ...] = ("amazon", "anthropic", "meta", "openai")
+BUILTIN_MODEL_ICONS: tuple[str, ...] = (
+    "amazon",
+    "anthropic",
+    "claude",
+    "google",
+    "kimi",
+    "meta",
+    "openai",
+    "qwen",
+)
 
 
 def is_builtin_icon_slug(slug: Optional[str]) -> bool:

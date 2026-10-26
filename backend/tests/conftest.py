@@ -24,6 +24,10 @@ os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 os.environ.setdefault("AWS_SESSION_TOKEN", "testing")
 os.environ.setdefault("AWS_SECURITY_TOKEN", "testing")
 
+# Memory-file saves count tokens with Bedrock CountTokens by default. An empty
+# model id turns that off (chars/4 estimate), so no test reaches Bedrock.
+os.environ.setdefault("MEMORY_TOKEN_COUNT_MODEL_ID", "")
+
 # Add backend/src to Python path for imports
 # This file is in backend/tests/, so we need to go up one level to backend/
 BACKEND_DIR = Path(__file__).parent.parent
@@ -127,6 +131,80 @@ def _clear_config_cache():
         yield
     finally:
         config_cache.get_config_cache().clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_cached_aws_clients():
+    """Drop every process-cached boto3 client and resource between tests.
+
+    The knowledge base's KB_Record reads and document-status lookups use
+    ``apis.shared.aws_clients`` handles, and they are reached from tests all over
+    the tree — many with their own ``mock_aws()`` or a ``patch("boto3.resource")``
+    rather than the per-directory ``aws`` fixtures that already reset this cache.
+    A handle cached under one test's mock (or one test's MagicMock) must never
+    answer the next test's call.
+    """
+    from apis.shared.aws_clients import reset_cached_clients
+
+    reset_cached_clients()
+    try:
+        yield
+    finally:
+        reset_cached_clients()
+
+
+@pytest.fixture(autouse=True)
+def _reset_directory():
+    """Drop the process-wide people directory between tests.
+
+    It holds a users-table repository bound to whatever table (and mock) was
+    current when it was first built, and every list of people in a project now
+    asks it for names. A directory built under one test's ``mock_aws()`` must not
+    answer the next test, whose mock is gone, with a real AWS call.
+    """
+    from apis.shared.directory import adapter
+
+    adapter._directory = None
+    try:
+        yield
+    finally:
+        adapter._directory = None
+
+
+class _InlineExecutor:
+    """Runs a submitted call at once, on the caller's thread."""
+
+    def submit(self, fn, *args, **kwargs):
+        fn(*args, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _memory_stats_inline():
+    """Count memory-file reads inline, inside the test that made them.
+
+    A project harness's ``memory_read`` hands its ``STATS#`` write to a
+    process-wide background thread (``apis.shared.memory.stats``) so the read
+    never waits on it. In a test that write ran whenever the thread got to it,
+    which could be after the test's ``mock_aws()`` had closed, so it reached
+    real AWS during whichever test came next on that worker and failed that
+    test's socket-guard teardown. The thread also caches its repository per
+    thread, bound to the first test's mock. Inline, the write happens under the
+    mock that set it up, and the repository cache starts empty each test.
+
+    A test that is about the background thread itself puts a real executor back
+    with ``monkeypatch.setattr(stats, "_executor", ...)``.
+    """
+    import threading
+
+    from apis.shared.memory import stats
+
+    saved = stats._executor, stats._local
+    stats._executor = _InlineExecutor()
+    stats._local = threading.local()
+    try:
+        yield
+    finally:
+        stats._executor, stats._local = saved
 
 
 @pytest.fixture(autouse=True)

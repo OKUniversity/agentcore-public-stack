@@ -1,10 +1,13 @@
 """Process-level feature flags resolved from environment variables.
 
 These gate optional product surfaces per environment. Each flag documents
-its own default: deferred features default off until explicitly turned on
-(the ``FINE_TUNING_ENABLED`` pattern), while shipping features default on
-with a kill switch (the ``KB_SYNC_ENABLED`` pattern). Each flag is read on
-every call (not cached at import) so that:
+its own default. **New and in-development features default off** until a
+deployment turns them on (only ``"true"`` enables; ``SESSION_PREWARM_ENABLED``
+is the current example). Finished features default on with a kill switch (the
+``KB_SYNC_ENABLED`` pattern), and moving a feature there is a deliberate change.
+The SPA has a matching compile-time switch per feature in
+``frontend/ai.client/src/environments`` (see CLAUDE.MD "Feature Flags").
+Each flag is read on every call (not cached at import) so that:
 
 * import-time callers (conditional router mounting) and per-request callers
   observe the same value, and
@@ -37,6 +40,157 @@ def skills_enabled() -> bool:
     See ``AppRoleService.resolve_user_permissions``.)
     """
     return os.environ.get("SKILLS_ENABLED", "").strip().lower() != "false"
+
+
+def skill_authoring_enabled() -> bool:
+    """Whether the agent may author the invoking user's own skills.
+
+    Covers the seven ``my_skill_*`` tools (``docs/specs/skill-creator.md`` D12),
+    built per request by ``_build_skill_authoring_tools`` in the inference API.
+    **Default ON with a kill switch**: unset or empty resolves to enabled; only
+    the literal ``"false"`` (case-insensitive) disables. A **feature switch**:
+    it widens what the agent can write on a user's behalf. CDK sets it on the
+    AgentCore Runtime only, and only when off (the default costs the Runtime's
+    environment budget nothing). There is no SPA switch: the tools reuse the
+    existing approval card.
+
+    It ANDs with :func:`skills_enabled` and with the ``my_skill_create`` tool id
+    being in the turn's tools, so on by default still grants nobody anything:
+    that catalog tool is seeded ``enabledByDefault: false`` and reaches a user
+    only through a role. Off, the tools are never built, so their specs never
+    reach ``toolConfig``.
+    """
+    return os.environ.get("SKILL_AUTHORING_ENABLED", "").strip().lower() != "false"
+
+
+def word_tracked_changes_enabled() -> bool:
+    """Whether Word tracked changes are read and written (``docs/specs/word-tracked-changes.md``).
+
+    On, a ``.docx`` with tracked changes reaches the model with each change
+    written out as ``[deleted: …]`` / ``[inserted: …]`` — as an inline
+    attachment, through ``document_read`` and the upload digest, and through
+    ``read_word_document`` — and the Word family gains ``redline_word_document``.
+    Off, each of those reads the file merged, as before, and the tool is never
+    built. **Default ON with a kill switch**: unset or empty resolves to
+    enabled; only the literal ``"false"`` (case-insensitive) disables. A
+    **feature switch** (it adds ``redline_word_document`` to ``toolConfig``).
+
+    CDK sets it on app-api always and on the AgentCore Runtime only while off.
+    Both must agree: app-api builds the upload digest, whose paragraph numbers
+    have to match what ``document_read`` returns on the Runtime. No SPA switch:
+    the redline comes back on the existing download card.
+    """
+    return os.environ.get("WORD_TRACKED_CHANGES_ENABLED", "").strip().lower() != "false"
+
+
+def assistant_kb_full_context_enabled() -> bool:
+    """Whether a small assistant knowledge base reaches the model whole
+    (``apis/shared/assistants/kb_full_context.py``).
+
+    On, an assistant turn whose knowledge base fits the token budget
+    (``ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS``, default 50,000) sends the full
+    text of every ``complete`` document at the end of the system prompt, and the
+    user message is not augmented with retrieved chunks (retrieval still runs,
+    for the citation cards). Off, every assistant turn retrieves exactly as
+    before. **Opt-in while the feature is in development**: only ``"true"``
+    (case-insensitive) enables it; unset, empty or anything else is off.
+
+    AgentCore Runtime only: CDK sets it there, and only while on. The text comes
+    from the documents bucket, which the Runtime role can always read
+    (``AssistantDocumentsRead``, shared with spreadsheet analysis). No SPA switch.
+    """
+    return os.environ.get("ASSISTANT_KB_FULL_CONTEXT_ENABLED", "").strip().lower() == "true"
+
+
+def large_document_attachments_enabled() -> bool:
+    """Whether documents over the inline limit are attached by reference
+    (``docs/specs/large-document-attachments.md``).
+
+    On, a reference-class upload (``is_reference_document``: a pdf, docx, txt,
+    md or html file over 4 MB and up to 50 MB) completes by enqueueing it for
+    the ``large-document-prepare`` Lambda, which writes the ``_derived/``
+    sidecars ``document_read`` reads. Off, nothing is enqueued. **Default ON
+    with a kill switch**: unset or empty resolves to enabled; only the literal
+    ``"false"`` (case-insensitive) disables. A **feature switch**: it deploys a
+    queue and a Lambda, and widens what an upload may be.
+
+    app-api only. CDK sets it from ``CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED``,
+    together with the prepare queue's URL, which exists only while it is on.
+    Without that URL (a local app-api) an upload is never queued; the miss is
+    logged in ``_enqueue_preparation``.
+    The Runtime needs no copy: ``document_read`` branches on the file row's
+    ``preparation``, not on a switch, so files already prepared stay readable
+    after the flag is turned off.
+    """
+    return os.environ.get("LARGE_DOCUMENT_ATTACHMENTS_ENABLED", "").strip().lower() != "false"
+
+
+def attachment_kb_enabled() -> bool:
+    """Whether prepared large documents are indexed into the shared
+    ``attachments`` managed knowledge base (large-document spec §4E, Tier 2).
+
+    On, the large-document pipeline ingests each prepared reference-class
+    original by its S3 location, removes it when the file is deleted, evicts it
+    after ``ATTACHMENT_KB_RETENTION_DAYS`` of inactivity, and app-api re-queues a
+    conversation's evicted documents when the conversation is opened. Off,
+    nothing is indexed and every index message is acknowledged untouched.
+    **Opt-in while the feature is in development**: only ``"true"``
+    (case-insensitive) enables it.
+
+    Set by CDK from ``CDK_ATTACHMENT_KB_ENABLED`` on the large-document Lambda,
+    app-api and the Runtime, and only together with
+    ``LARGE_DOCUMENT_ATTACHMENTS_ENABLED`` (the config refuses one without the
+    other). On the Runtime it adds ``document_read``'s ``query`` argument (§4F):
+    one tool-spec change per deployment, never per session. App-api serves the
+    SPA's *Indexing…* / *Searchable* chip from it
+    (``GET /files/{id}/search-status``).
+    """
+    return os.environ.get("ATTACHMENT_KB_ENABLED", "").strip().lower() == "true"
+
+
+def folder_attachments_enabled() -> bool:
+    """Whether a conversation can attach a Google Drive folder
+    (``docs/specs/drive-folder-attachments.md``).
+
+    On, app-api mounts ``POST/GET/DELETE /sessions/{id}/folders`` and runs the
+    expansion task that lists the folder and imports each readable file as a
+    session file delivered by reference, whatever its size. Off, the routes
+    404 and nothing is expanded. **Default ON with a kill switch**: unset or
+    empty resolves to enabled; only the literal ``"false"`` (case-insensitive)
+    disables. A **feature switch**: it widens what a user can bring into a
+    conversation.
+
+    Read on app-api (the routes) and on the AgentCore Runtime (a turn's
+    ``folder_attachment_ids``: off, the field is ignored and no manifest is
+    rendered). CDK sets it from ``CDK_FOLDER_ATTACHMENTS_ENABLED`` on app-api
+    always and on the Runtime only while off. Its CDK default follows
+    ``CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED``, and synth refuses it on without
+    that: a folder file is read through the prepare Lambda's sidecars, so
+    without that pipeline there is nothing to read small files through.
+    """
+    return os.environ.get("FOLDER_ATTACHMENTS_ENABLED", "").strip().lower() != "false"
+
+
+def folder_sync_enabled() -> bool:
+    """Whether KB sync can keep a knowledge base in step with a Drive folder
+    (``drive_folder`` policies, ``docs/specs/assistant-kb-sync.md`` §11).
+
+    On, app-api accepts a ``drive_folder`` sync policy, and the kb-sync
+    dispatcher and worker run them: each run re-lists the folder, re-ingests
+    changed files, imports new ones and marks files gone from the folder. Off,
+    creating one is refused (400) and the dispatcher re-arms a due folder
+    policy one interval out without running it, so existing policies wait
+    rather than starve the sweep. **Default ON with a kill switch**: unset or
+    empty resolves to enabled; only the literal ``"false"`` (case-insensitive)
+    disables.
+
+    Read on app-api and on both kb-sync Lambdas; CDK sets it on all three from
+    ``CDK_FOLDER_SYNC_ENABLED``. The SPA's matching switch is
+    ``features.folderSync`` (the "Keep in sync with the folder" option on Save
+    as project). A **feature switch**: it widens what a schedule can fetch and
+    ingest on a user's behalf.
+    """
+    return os.environ.get("FOLDER_SYNC_ENABLED", "").strip().lower() != "false"
 
 
 def scheduled_runs_enabled() -> bool:
@@ -120,6 +274,28 @@ def attachment_tool_autoenable_enabled() -> bool:
     user's own attachment is the governing intent.
     """
     return os.environ.get("ATTACHMENT_TOOL_AUTOENABLE_ENABLED", "").strip().lower() != "false"
+
+
+def admin_always_on_tools_enabled() -> bool:
+    """Whether tools an admin flagged ``alwaysOn`` are unioned into every
+    turn's effective toolset for the users whose roles grant them — gated on
+    the caller's RBAC grant, so it enables, never grants. **Default ON with a
+    kill switch** (house style): unset or empty resolves to enabled; only the
+    literal ``"false"`` disables.
+
+    Default-on is safe because the feature is **inert without catalog data**:
+    with no tool flagged, the resolved set is empty and
+    ``_with_auto_enabled_tools`` returns the caller's own list object
+    unchanged (docs/specs/admin-always-on-tools.md §10). The switch exists for
+    the case where tools have already been flagged and something is wrong — it
+    reverts to the previous behaviour without an admin editing DynamoDB rows
+    under pressure.
+
+    Why: ``enabledByDefault`` is an initial condition, not a policy. The first
+    time a user toggles a tool off, their stored preference overrides it
+    forever — so a tool the organization depends on had no way to *stay* on.
+    """
+    return os.environ.get("ADMIN_ALWAYS_ON_TOOLS_ENABLED", "").strip().lower() != "false"
 
 
 def agents_enabled() -> bool:
@@ -474,6 +650,33 @@ def browser_takeover_enabled() -> bool:
     return os.environ.get("BROWSER_TAKEOVER_ENABLED", "").strip().lower() != "false"
 
 
+def browser_takeover_fit_enabled() -> bool:
+    """Whether a sign-in takeover resizes the browser window to fit the panel.
+
+    ``request_user_login`` sets the remote Chrome window to a sign-in size
+    (768 wide) before handing it over, so the docked panel shows the page at
+    1:1 instead of a 1280x800 window scaled to about half, and restores the
+    agent's 1280x800 once the user hands it back
+    (``docs/specs/authenticated-web-assessment.md``, "Sizing the handover").
+    **Default ON with a kill switch**: unset or empty resolves to enabled;
+    only the literal ``"false"`` (case-insensitive) disables.
+
+    This is a **rollout switch**, not a feature switch: the change is meant to
+    be invisible apart from the page being readable. While off the window is
+    left at the agent's size and the event's ``viewport`` is 1280x800, exactly
+    as before. Its known risk is the restore: if it failed the agent would go
+    on browsing at 768 wide (a tablet layout, narrower screenshots), which is
+    why the restore is logged.
+
+    Retires on the default condition: shipped in a production release, then at
+    least two weeks there with the switch never flipped, and a readout that no
+    ``browser: could not restore the agent window`` warning appeared.
+
+    Costs nothing against the model: the window size never reaches the prompt.
+    """
+    return os.environ.get("BROWSER_TAKEOVER_FIT_ENABLED", "").strip().lower() != "false"
+
+
 def response_feedback_enabled() -> bool:
     """Whether users can thumb an assistant message up or down.
 
@@ -530,5 +733,467 @@ def feedback_eval_sampling_enabled() -> bool:
     a scope. Flipping this flag is that decision. The read surfaces (the
     queue list, the profile's judged aggregates) are not gated — they show
     numbers only and tolerate the absence of any judged row.
+
+    ⚠️ Turning this on is not enough by itself. The inference-api image
+    redacts Strands' message content in telemetry
+    (``OTEL_SEMCONV_STABILITY_OPT_IN`` in ``Dockerfile.inference-api``), so
+    the judge would read ``[REDACTED]`` in place of every message. An
+    environment that opts in must also override that variable on the
+    AgentCore Runtime, e.g. ``gen_ai_unredacted_attributes=gen_ai.*``. That
+    records every conversation in the runtime log group, not just the
+    sampled ones.
     """
     return os.environ.get("FEEDBACK_EVAL_SAMPLING_ENABLED", "false").strip().lower() == "true"
+
+
+def dictation_enabled() -> bool:
+    """Whether the composer's Dictate button may transcribe speech.
+
+    Covers app-api's ``POST /dictation/ticket`` and ``WS /dictation/stream``,
+    the Amazon Transcribe Streaming proxy behind the composer's Dictate button.
+    **Default ON with a kill switch** (house style, mirroring
+    ``mid_turn_steering_enabled``): unset or empty resolves to enabled; only
+    the literal ``"false"`` (case-insensitive) disables.
+
+    While off both routes 404 (the socket closes before accept), and the SPA
+    hides the Dictate button on the first 404 for the rest of the tab session.
+    Nothing dictation produces reaches the model except the text the user
+    chooses to send, so the flag has no prompt-cache or token surface.
+    """
+    return os.environ.get("DICTATION_ENABLED", "").strip().lower() != "false"
+
+
+def platform_self_service_enabled() -> bool:
+    """Whether the platform self-service account tools are injected on a turn.
+
+    Covers the ``system`` account tools built per request and handed to the
+    agent as ``extra_tools`` — the read-only pilot ``whoami`` / ``get_my_quota``
+    / ``get_my_settings`` (``.kiro/specs/platform-self-service/``), and the
+    confirmed-write tools as they land. **Defaults OFF** (the
+    ``FINE_TUNING_ENABLED``-style opt-in): set
+    ``PLATFORM_SELF_SERVICE_ENABLED=true`` to turn it on.
+
+    Off by default on purpose, not by caution. These tools are injected on
+    **every** turn for every authenticated user (they are platform plumbing,
+    not a picker toggle), so while off a turn carries no self-service
+    ``extra_tools`` and its agent-cache eligibility is exactly what it was
+    before this feature — no per-turn cost, no prefix change. The tools close
+    over only the invoking ``User`` (keyed by ``user_id`` in the agent cache
+    key), so when on they are key-described and cacheable; identity is
+    captured by closure, never taken as a model argument (the same pattern the
+    six existing per-request tool families use, since the runtime does not
+    populate Strands' ToolContext). See the spec's design doc.
+    """
+    return os.environ.get("PLATFORM_SELF_SERVICE_ENABLED", "false").strip().lower() == "true"
+
+
+def projects_enabled() -> bool:
+    """Whether Shared Projects exist in this environment.
+
+    Covers app-api's ``/projects`` surface and the project harness everywhere it
+    is reachable (``docs/specs/shared-projects.md``). **Default ON with a kill
+    switch**: unset or empty resolves to enabled; only the literal ``"false"``
+    (case-insensitive) disables. A **feature switch**: Projects is a product
+    surface a deployment may not want. CDK sets it on app-api and the AgentCore
+    Runtime from ``config.projects.enabled``. The SPA's matching switch is
+    ``features.projects`` in ``frontend/ai.client/src/environments``.
+
+    While off the routes 404 after authentication (the auth sweep requires a
+    401 first), the harness refuses everyone, and existing rows are left untouched.
+    """
+    return os.environ.get("PROJECTS_ENABLED", "").strip().lower() != "false"
+
+
+def client_turn_timing_enabled() -> bool:
+    """Whether app-api records the SPA's own time-to-first-token for each turn.
+
+    ``POST /telemetry/turn-timing`` (``apis/app_api/telemetry/routes.py``) takes
+    the browser's send-to-first-token measurement and writes it as EMF into
+    ``AgentCoreStack/TurnLatency``. It is the only metric that covers the whole
+    wait a user sees: the browser, the app-api hop, Runtime routing and session
+    start, which the server-side ``FirstTokenMs`` (handler entry onward) cannot
+    see (``docs/specs/turn-path-ttft.md`` §6). **Default ON with a kill
+    switch**: unset or empty resolves to enabled; only the literal ``"false"``
+    (case-insensitive) disables; while off the route 404s after
+    authentication. CDK sets it on app-api from
+    ``config.clientTurnTiming.enabled``. The SPA's matching switch is
+    ``features.clientTurnTiming``.
+
+    A **feature switch**: it is observability a deployment may not want (a
+    handful of custom metrics, one small log line per turn). It records timings
+    and a model id, never message content, user ids or session ids.
+    """
+    return os.environ.get("CLIENT_TURN_TIMING_ENABLED", "").strip().lower() != "false"
+
+
+def handoffs_enabled() -> bool:
+    """Whether a mid-thread ``@``-mention hands off with context instead of sending at once.
+
+    ``docs/specs/agent-handoffs-and-consults.md`` Phase 0. Gates app-api's
+    ``/sessions/{id}/handoffs`` routes (404 after authentication while off),
+    and, from PR-0.2, the Runtime's acceptance of ``handoff_context`` and
+    ``deliveries`` on a turn, which a flag-off server ignores with a warning
+    rather than refusing, so a stale SPA never bricks a thread. **Opt-in while
+    the feature is in development** (CLAUDE.md "Feature flags"): only
+    ``"true"`` (case-insensitive) enables it; unset or anything else is off.
+    CDK sets it on app-api from ``config.handoffs.enabled``. The SPA's matching
+    switch will be ``features.handoffs``.
+
+    A **feature switch** once finished: off is today's immediate handoff into
+    a new conversation, which is a product choice a deployment may keep.
+    """
+    return os.environ.get("HANDOFFS_ENABLED", "").strip().lower() == "true"
+
+
+def session_prewarm_enabled() -> bool:
+    """Whether app-api warms a conversation's AgentCore Runtime session ahead of its first send.
+
+    ``POST /chat/prewarm`` (``apis/app_api/chat/proxy_routes.py``) forwards a
+    no-op ``warm`` invocation to ``/invocations`` with the conversation's
+    affinity header, so the microVM the first real turn will use is restored
+    (V2) or booted (V1) while the user is still reading or typing
+    (``docs/specs/agentcore-runtime-v2.md`` §5a). **Opt-in while the feature is
+    in development** (CLAUDE.md "Feature flags"): only ``"true"``
+    (case-insensitive) enables it; while off the route 404s after
+    authentication. CDK sets it on app-api from ``config.sessionPrewarm.enabled``.
+    The SPA's matching switch is ``features.sessionPrewarm``.
+
+    A **feature switch** once finished, not a rollout switch: it spends Runtime
+    session time on conversations the user may never send, which is a cost a
+    deployment may reasonably not want (cheap on V2, which reclaims idle
+    memory; billed at peak memory on V1). The Runtime side needs no flag and no
+    environment variable: the ``warm`` action is a no-op that returns before
+    any work, so the app-api route is the whole gate.
+    """
+    return os.environ.get("SESSION_PREWARM_ENABLED", "").strip().lower() == "true"
+
+
+def user_grants_enabled() -> bool:
+    """Whether the admin surface for direct user grants is mounted on app-api.
+
+    A direct grant (``apis.shared.rbac.models.UserGrant``) hands tools, models
+    and skills to one user beside their roles. **Default ON with a kill
+    switch**: unset or empty resolves to enabled; only the literal ``"false"``
+    (case-insensitive) disables. A **feature switch**: it is an access-control
+    surface a deployment may want to keep to roles alone. CDK sets it on
+    app-api from ``config.userGrants.enabled``. The SPA's matching switch is
+    ``features.userGrants``.
+
+    **This gates the write surface only.** Permission resolution reads a
+    user's grant row wherever it runs — app-api and the AgentCore Runtime —
+    without consulting this flag, for two reasons. The Runtime is at its
+    environment-variable cap (and Runtime V2 caps the whole payload), so a
+    second copy of the switch there would cost a slot the turn path needs
+    more. And an absent row *is* the off state: a grant can only exist where
+    an admin wrote one through these routes. Turning the flag off therefore
+    stops new grants and edits but does not revoke what was granted — delete
+    the grant to revoke it.
+    """
+    return os.environ.get("USER_GRANTS_ENABLED", "").strip().lower() != "false"
+
+
+def conversation_index_enabled() -> bool:
+    """Whether finished turns are written to the conversation archive.
+
+    The write path of conversation search (``docs/specs/conversation-search.md``
+    §4): the runtime's fire-and-forget put of each turn's user and assistant
+    text after ``done``, and app-api's put of each copied turn when a shared
+    conversation is forked. **Opt-in while the feature is in development**
+    (CLAUDE.md "Feature flags"): only ``"true"`` (case-insensitive) enables it;
+    unset or anything else is off. CDK sets it on app-api and the AgentCore
+    Runtime from ``config.conversationIndex.enabled``.
+
+    A feature switch, not a rollout switch: a deployment may legitimately not
+    want a second copy of its transcripts. It gates writes only. Deleting a
+    session's archived turns does not consult it, so a deployment that turns
+    indexing off can still remove what it already wrote.
+    """
+    return os.environ.get("CONVERSATION_INDEX_ENABLED", "").strip().lower() == "true"
+
+
+def conversation_search_enabled() -> bool:
+    """Whether ``GET /sessions/search`` is served.
+
+    The read path of conversation search (``docs/specs/conversation-search.md``
+    §5): a lexical leg over the user's own session rows and a text leg over the
+    shared ``conversations`` knowledge base. **Default ON with a kill switch**
+    (CLAUDE.md "Feature flags"): unset or empty resolves to enabled; only the
+    literal ``"false"`` (case-insensitive) disables it, and then the route
+    404s. CDK sets it on app-api from ``config.conversationSearch.enabled``; the
+    SPA's ``features.conversationSearch`` decides whether the modal is offered.
+
+    A feature switch, not a rollout switch: a deployment may not want search at
+    all. It is separate from :func:`conversation_index_enabled`, which stays
+    opt-in because it keeps a second copy of every transcript and spends
+    knowledge-base calls. With the index off and this on, the text leg is never
+    called and search is title and opening-prompt matches only, at no
+    knowledge-base cost. Rows written before ``titleLower`` existed match only
+    once ``backend/scripts/backfill_session_search_attributes.py`` has run.
+    """
+    return os.environ.get("CONVERSATION_SEARCH_ENABLED", "").strip().lower() != "false"
+
+
+def conversation_retention_prunes_sessions() -> bool:
+    """Whether the retention setting also removes session rows.
+
+    ``docs/specs/conversation-search.md`` §3: once a conversation's last turn is
+    older than ``CONVERSATION_RETENTION_DAYS``, every copy of its content has
+    expired, and the daily pruner deletes the row too (through the same cascade
+    as a user's delete) so it leaves the sidebar instead of opening empty.
+    **Default ON with a kill switch**: unset or empty is on, only the literal
+    ``"false"`` (case-insensitive) turns it off. A feature switch, permanent: a
+    deployment may prefer title-only shells to deletions.
+
+    On is not the same as deleting. The pruner reports what it would delete and
+    deletes nothing until :func:`conversation_retention_prune_armed` is set in
+    that environment, and even then not before a dry run has been recorded
+    there. Off, the pruner does not run its scan at all.
+    """
+    return os.environ.get("CONVERSATION_RETENTION_PRUNES_SESSIONS", "").strip().lower() != "false"
+
+
+def conversation_retention_prune_armed() -> bool:
+    """Whether the retention pruner may delete session rows, rather than only report.
+
+    **Opt-in per environment, default off**, like ``MANAGED_KB_RECONCILER_ARMED``:
+    the pruner deletes rows users can see, so every environment starts with
+    report-only runs whose counts can be checked against real data first. Only
+    an affirmative value arms it (``1``/``true``/``yes``/``on``); unset, empty and
+    anything else are off, because an unset GitHub variable arrives as ``""``.
+    """
+    return os.environ.get("CONVERSATION_RETENTION_PRUNE_ARMED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def compaction_summary_extract_enabled() -> bool:
+    """Whether a compaction cut pins verbatim facts ahead of its summary.
+
+    Extract-then-compress (``agents/main_agent/session/compaction_summary.py``):
+    one extraction call copies standing instructions, decisions, identifiers
+    and changed values verbatim into a pinned block, then the narrative is
+    compressed into the rest of the budget; the two calls run concurrently.
+    **Default ON with a kill switch** (house style, mirroring
+    ``TOOL_SUMMARIES_ENABLED``): unset or empty resolves to enabled; only the
+    literal ``"false"`` (case-insensitive) disables. Flipped from opt-in once
+    the quality harness showed no loss against the full history and a forced
+    cut on dev pinned and answered every planted fact (scoping doc
+    ``2026-09-21-quality-veto-harness.md`` §9.2–9.3). There is no CDK entry
+    and no SPA switch: a default-on flag needs no AgentCore Runtime env var
+    slot, so setting ``=false`` in a deployed environment is an out-of-band
+    Runtime update.
+
+    Read once per session manager, through ``CompactionConfig.from_env``. It
+    runs only when a cut advances the checkpoint, after the turn's final
+    ``metadata`` event, so it adds nothing before the first token; the cut
+    turn pays one extra side-channel call. The result is persisted verbatim,
+    so the restore bytes stay stable. While off, the cut makes the single
+    plain compression call. Needs ``AGENTCORE_MEMORY_COMPACTION_SUMMARY_MODEL_ENABLED`` on,
+    and a summary model that can extract: Nova 2 Lite and Haiku 4.5 held
+    every planted fact on the quality harness, Nova Micro 88%.
+    """
+    return os.environ.get("COMPACTION_SUMMARY_EXTRACT_ENABLED", "").strip().lower() != "false"
+
+
+
+def agent_build_shared_session_enabled() -> bool:
+    """Whether the agent build's SDK clients are built on one process-wide boto3 session.
+
+    Three things on a first-turn build construct a fresh ``boto3.Session``
+    and parse service models on it: the AgentCore Memory session manager
+    (which builds a ``MemoryClient``, then a second session and clients that
+    replace the first pair), ``_discover_strategy_ids``, and Strands'
+    ``BedrockModel``. A fresh session re-parses every model it touches, and
+    the parse is the cost. With this on, all three are handed the session
+    from ``apis.shared.aws_clients.shared_boto_session``, which warm-up
+    builds at container start together with its clients and the strategy
+    ids, so the first turn finds them ready.
+
+    **Default ON with a kill switch** (house style, mirroring
+    ``agent_status_enabled``): unset or empty resolves to enabled; only the
+    literal ``"false"`` (case-insensitive) disables. Off, every SDK builds its
+    own session exactly as before, and warm-up skips the shared step.
+
+    Measured on dev, 2026-09-30, 15 first turns per arm, interleaved, every
+    turn a cold Runtime process (docs/specs/turn-latency-preamble.md PR-6):
+    ``agent_build`` median 869ms → 372ms, time to first token at the client
+    4211ms → 3564ms, and the two distributions did not overlap. Nothing
+    reaches the prompt; the stamp on ``turn_prelude`` (``sharedSession``)
+    is a property, never a dimension.
+    """
+    return os.environ.get("AGENT_BUILD_SHARED_SESSION_ENABLED", "").strip().lower() != "false"
+
+
+def mcp_parallel_preflight_enabled() -> bool:
+    """Whether external MCP servers are pre-flighted concurrently at agent build.
+
+    Each external MCP server's client is started and its tools listed before
+    the agent is built, and that handshake blocks its thread. Loaded one after
+    another, two cold Lambda-URL servers cost 9.5s + 12s on a KB agent's first
+    turn on dev (docs/specs/turn-path-ttft.md §5 P3). With this on, each
+    pre-flight runs on its own worker thread and the build waits for the
+    slowest, not the sum; clients are still returned in catalog order, so the
+    tool order in ``toolConfig`` (the prompt-cache prefix) is unchanged.
+
+    **Default ON with a kill switch** (house style): unset or empty resolves
+    to enabled; only the literal ``"false"`` (case-insensitive) disables. Off,
+    servers load one at a time on the build's loop, exactly as before. A build with a
+    single external server always loads it inline.
+    """
+    return os.environ.get("MCP_PARALLEL_PREFLIGHT_ENABLED", "").strip().lower() != "false"
+
+
+def kb_search_ahead_enabled() -> bool:
+    """Whether an agent turn's knowledge-base search overlaps the agent build.
+
+    The search used to be awaited in the route, before the stream opened, and
+    the (deferred) agent build only started after it. The build reads neither
+    the retrieved chunks nor the augmented message — only the stream does — so
+    with this on the search starts where it always did and is awaited after
+    the build, ahead of the citation frames. The augmented message and the
+    citations are byte-identical either way; only when the round trip happens
+    moves (docs/specs/turn-path-ttft.md §5 P3b).
+
+    **Default ON with a kill switch** (house style): unset or empty resolves
+    to enabled; only the literal ``"false"`` (case-insensitive) disables. Off,
+    the search is awaited in the route, exactly as before.
+    """
+    return os.environ.get("KB_SEARCH_AHEAD_ENABLED", "").strip().lower() != "false"
+
+
+def memory_retrieval_prefetch_enabled() -> bool:
+    """Whether the long-term-memory lookup starts as soon as the user's message
+    is added, overlapping the two Memory writes the SDK awaits first.
+
+    On ``MessageAddedEvent`` the SDK awaits ``append_message`` and
+    ``sync_agent`` (two ``CreateEvent`` calls) and only then runs the lookup —
+    three network calls in series before the model is called, measured at
+    450ms of a 1687ms warm first token on dev (docs/specs/turn-path-ttft.md
+    P1b). With this on, ``TurnBasedSessionManager`` starts the lookup first and
+    applies its result at the same point as before, so persisted and live
+    message bytes are unchanged; only the round trip overlaps the writes.
+
+    **Default ON with a kill switch** (house style): unset or empty resolves
+    to enabled; only the literal ``"false"`` (case-insensitive) disables. Off,
+    the lookup runs inline after the writes, exactly as before.
+    """
+    return os.environ.get("MEMORY_RETRIEVAL_PREFETCH_ENABLED", "").strip().lower() != "false"
+
+
+def history_count_prefetch_enabled() -> bool:
+    """Whether the per-turn history count runs off the critical path.
+
+    Every turn counts the session's stored messages (a paginated
+    ``ListEvents`` with payloads) to key its per-message metadata. Read at the
+    head of the turn it cost ~62ms + 2.25ms per stored event before the model
+    was called, ~390ms at 100+ events (docs/specs/turn-path-ttft.md §5 P4).
+    With this on, the stream coordinator starts the read at the head of the
+    turn and awaits it only where the index is used, counting messages created
+    before the turn began so the number is the one the serial read gave.
+
+    **Default ON with a kill switch** (house style): unset or empty resolves
+    to enabled; only the literal ``"false"`` (case-insensitive) disables. Off,
+    the count is read at the head of the turn, exactly as before.
+    """
+    return os.environ.get("HISTORY_COUNT_PREFETCH_ENABLED", "").strip().lower() != "false"
+
+
+def inline_attachment_persist_enabled() -> bool:
+    """Whether inline ``files`` bytes of a diverted class (spreadsheets, decks)
+    are written to S3 and registered as session files before the turn runs.
+
+    Covers ``apis.shared.files.inline_persist`` as called from the inference
+    API's attachment phase. The SPA uploads first and sends ``file_upload_ids``,
+    so this only ever fires for headless callers posting base64 ``files`` —
+    without it their diverted attachments are dropped while the guidance note
+    says the spreadsheet / PowerPoint tools can reach them. **Default ON with
+    a kill switch** (house style): unset or empty resolves to enabled; only the
+    literal ``"false"`` (case-insensitive) disables. Off, the pre-fix behaviour
+    returns exactly: nothing is written and the note is unchanged.
+    """
+    return os.environ.get("INLINE_ATTACHMENT_PERSIST_ENABLED", "").strip().lower() != "false"
+
+
+def source_provenance_enabled() -> bool:
+    """Whether a cited passage is verified against the document it names
+    (``docs/specs/source-provenance-verification.md``).
+
+    On, a session that has a readable document also gets ``verify_sources``
+    beside ``document_read``: the model names the value it is asserting and the
+    passage it says supports it, and the backend answers two separate questions
+    — is that passage in the document, and does the value actually appear in it
+    — collapsing them into one of four states. The model is told only the state
+    (a word per claim, so it can correct a ``quote_unsupported``); the quote,
+    the locator and the method travel on the ``source_provenance`` SSE event and
+    a ``SRCV#`` row, never on the message content blocks, because those are the
+    cacheable prefix and a display string there is paid at model rates every
+    later turn. Off, the tool is never built and nothing is emitted.
+
+    **Opt-in while the feature is in development** (CLAUDE.md "Feature flags"):
+    only ``"true"`` (case-insensitive) enables it; unset arrives as ``""`` and
+    is off. CDK sets it on the AgentCore Runtime (which builds the tool,
+    verifies and emits) and on app-api (which replays the rows on
+    ``GET /messages``) from ``config.sourceProvenance.enabled``. The SPA's
+    matching switch is ``features.sourceProvenance``.
+
+    A **feature switch**, not a rollout switch, and therefore permanent: it adds
+    a tool to ``toolConfig`` for sessions with a document, and it changes what
+    the product asserts to a user about their own document — a judgement a
+    deployment may reasonably decline. Nothing about it is meant to be
+    invisible, so there is nothing for a rollout hedge to protect.
+    """
+    return os.environ.get("SOURCE_PROVENANCE_ENABLED", "").strip().lower() == "true"
+
+
+def document_extract_enabled() -> bool:
+    """Whether a named field set can be run over a document as typed rows
+    (``docs/specs/structured-extraction.md``).
+
+    On, a turn whose active skills declare a field set also gets
+    ``document_extract``: the model names a set and a document, and the backend
+    resolves the set's fields server-side, makes **its own** constrained model
+    call carrying the document text and the field schema, and verifies each
+    extracted value through ``source_provenance`` — so every row carries one of
+    the four states rather than a tidy value with nothing behind it. The field
+    schema never enters the turn's ``toolConfig``: the agent-facing spec is one
+    constant per deployment and the typed schema travels on a request of its
+    own, which has no cacheable prefix to re-write (D1). The model gets the
+    values and the states back, a few tokens each; the quotes, locators, the
+    rendered table and the workbook travel on the ``document_extraction`` SSE
+    event, an ``EXTR#`` row and an artifact. Off, the tool is never built.
+
+    Its model is named separately by ``DOCUMENT_EXTRACT_MODEL_ID``, which must
+    have a catalog row — without one the extraction call prices to ``None``,
+    costs $0, counts against no quota and fires ``UnmeteredModelCall`` (§9).
+
+    **Opt-in while the feature is in development** (CLAUDE.md "Feature flags"):
+    only ``"true"`` (case-insensitive) enables it; unset arrives as ``""`` and
+    is off. CDK sets it on the AgentCore Runtime (which mounts the tool,
+    extracts, verifies and emits) and on app-api (which replays the ``EXTR#``
+    rows on ``GET /messages``) from ``config.documentExtract.enabled``. The
+    SPA's matching switch is ``features.documentExtract``.
+
+    A **feature switch**, not a rollout switch, and therefore permanent: each
+    run spends money on a model call whose input scales with the document, it
+    adds a tool to ``toolConfig``, and it has the product assert typed values
+    about a document on a user's behalf. Every one of those is a judgement a
+    deployment may reasonably decline, so it is configuration rather than a
+    rollout hedge, and it does not retire.
+    """
+    return os.environ.get("DOCUMENT_EXTRACT_ENABLED", "").strip().lower() == "true"
+
+
+def document_extract_model_id() -> str:
+    """The Bedrock-native Converse model id the extraction call uses (§6.6).
+
+    Deliberately not the turn's model. The constrained call needs Converse's
+    strict tool use, which a Mantle-hosted OpenAI model never receives — so the
+    extraction builds its own dedicated ``BedrockModel`` and the turn's model,
+    and its model *class*, are irrelevant to it. The cost of that is worth
+    stating rather than hiding: extraction may run on a different (usually
+    cheaper) model than the one the user picked, which is why the id travels on
+    the SSE event.
+
+    Empty when unset, which the caller reports as a configuration error rather
+    than silently falling back — a wrong id here is an unmetered call (§9), and
+    a default that looks like it works is how one ships.
+    """
+    return os.environ.get("DOCUMENT_EXTRACT_MODEL_ID", "").strip()

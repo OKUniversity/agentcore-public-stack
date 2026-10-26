@@ -619,6 +619,14 @@ visual fidelity before any digest comparison is scored.
    flips at most once per session, on the attach turn, when restored history
    has no document to lose; the resume path recomputes the same gate so a
    paused agent's key is reproduced.
+
+   ⚠️ **The last two sentences were false as shipped, and are fixed in
+   decision 28.** "This turn attaches one" was implemented as
+   `if turn_upload_ids:` — presence, not class — so an image, a spreadsheet
+   or a deck opened the gate as readily as a PDF, and the "at most once per
+   session" claim failed in prod within a day. The resume path's
+   reproducibility failed with it: the live turn answered True from the raw
+   ids, resume answered False from the query.
 3. **Id recorded, never injected-filtered.** `DOCUMENT_TOOL_IDS` exists for
    the record and is deliberately not in `INJECTED_TOOL_IDS`; the only control
    is `DOCUMENT_READ_ENABLED` (default on, `=false` kills).
@@ -769,6 +777,57 @@ visual fidelity before any digest comparison is scored.
     the guard under a new name. The gap on the event is measured *before* the
     advance saves state, because the save re-stamps `updated_at` and would
     otherwise read as zero.
+
+**Post-epic — the attach-turn prompt-cache bust (2026-09-21)**
+
+28. **The gate classifies the turn's uploads; `document_read` stays injected
+    rather than permanently registered.** The reported symptom was that
+    attaching a document rotates `toolConfigHash` and re-writes the whole
+    cacheable prefix. Measured both ways before writing code.
+
+    *Where the dollars actually are.* Across every prod `C#` row in the first
+    19.25 h after the epic reached prod (2026-09-20T22:00 → 2026-09-21T17:15,
+    823 call pairs), 18 `toolConfigHash` rotations had an unchanged
+    `systemPromptHash` and no `agentSwitched`. Of the 29 sessions that
+    carried attachments in that window, **13 held no readable document at
+    all** — 53 PNG, 2 JPEG, 6 XLSX, 5 PPTX — and those 13 sessions account
+    for **100%** of the avoidable rotation cost: $0.18 counting only
+    rotations inside the 5-minute cache TTL (where the counterfactual read is
+    certain), $0.78 counting every rotation. The single rotation in a session
+    that genuinely gained a readable document cost **$0.00** — it read the
+    shared tools+system prefix another session had already written.
+
+    *And it thrashes.* The memo is per-process; the DynamoDB query is not.
+    On an image-only session the two disagree, so the tool appeared and
+    vanished as microVMs recycled: session `be4f0784` ran A→B→A→B and
+    `841d162d` and `077aa73e` ran A→B→A, each flip a full prefix re-write
+    (19,664 / 33,508 / 23,923 tokens at 1.25× input).
+
+    *Arm B, rejected.* Registering `document_read` permanently removes the
+    rotation but puts the spec in every conversation's prefix forever. The
+    spec measures **664 tokens** — Bedrock `CountTokens` against
+    `anthropic.claude-haiku-4-5`, as the marginal difference between a
+    6-tool `toolConfig` and the same list plus `document_read` (5,838 →
+    6,502), not read off `prefixTokens.tools`, which is a residual between
+    two estimators. Kimi K3's tokenizer independently corroborates it at 546
+    (dev session `dca13df7`, cache write 9,295 against a prior read of 8,749,
+    `toolConfig` the only changed component). Costed against 14 days of real
+    prod traffic (26,395 model calls, 8.8% of them full-prefix writes, at
+    each session's own model rate): **$0.44/day, $161/yr**, unconditional —
+    more than the conservative arm it would replace, and it would also
+    advertise a tool with an empty listing to every conversation that has no
+    attachment at all.
+
+    *Arm C, taken.* Classify the turn's resolved uploads
+    (`_resolved_files_include_a_document`) and pass a boolean, mirroring what
+    `_session_has_tabular` already does for the Spreadsheet Analysis
+    auto-enable. This removes the whole measured avoidable cost, removes the
+    flap, makes the resume path's gate reproducible again, and leaves the one
+    irreducible rotation — a session that gains its first readable document
+    mid-conversation — which measured $0.00 in the same window. An image-only
+    turn now falls through to the authoritative query instead of guessing;
+    that query already ran on every non-attach turn of such a session, so it
+    is not a new read.
 
 ---
 

@@ -10,7 +10,7 @@ Three routers:
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 
 from apis.shared.auth.dependencies import get_current_user_from_session
 from apis.shared.auth.models import User
@@ -35,6 +35,7 @@ from .models import (
 from .service import (
     AccessDeniedError,
     NotOwnerError,
+    ProjectShareError,
     SessionNotFoundError,
     ShareNotFoundError,
     ShareStorageUnavailableError,
@@ -68,17 +69,24 @@ shared_view_router = APIRouter(prefix="/shared", tags=["shares"])
 async def create_share(
     session_id: str,
     request: CreateShareRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user_from_session),
 ):
-    """Create a point-in-time share snapshot for a conversation."""
+    """Create a point-in-time share snapshot for a conversation.
+
+    A project share's ``notify`` fan-out runs after the response is sent.
+    """
     try:
         return await get_share_service().create_share(
             session_id=session_id,
             user=current_user,
             request=request,
+            schedule=background_tasks.add_task,
         )
     except SessionNotFoundError:
         raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+    except ProjectShareError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except NotOwnerError:
         raise HTTPException(status_code=403, detail="You do not have permission to share this session")
     except ShareTableNotFoundError:
@@ -138,6 +146,10 @@ async def update_share(
         )
     except ShareNotFoundError:
         raise HTTPException(status_code=404, detail="Share not found")
+    except SessionNotFoundError:
+        raise HTTPException(status_code=404, detail="The shared conversation no longer exists")
+    except ProjectShareError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except NotOwnerError:
         raise HTTPException(status_code=403, detail="You do not have permission to update this share")
     except ShareTableNotFoundError:

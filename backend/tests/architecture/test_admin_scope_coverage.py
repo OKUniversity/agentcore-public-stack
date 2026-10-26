@@ -35,6 +35,7 @@ NON_DELEGABLE_MODULES = {
     "roles/routes.py",
     "auth_providers/routes.py",
     "audit/routes.py",
+    "user_grants/routes.py",
 }
 
 # Scope claimed by each router module. `roles/agent_pins.py` is the one place
@@ -49,6 +50,7 @@ EXPECTED_MODULE_SCOPES = {
     "tools/routes.py": "admin.tools",
     "skills/routes.py": "admin.skills",
     "agents/routes.py": "admin.marketplace",
+    "projects/routes.py": "admin.projects",
     "oauth/routes.py": "admin.connectors",
     "file_sources/routes.py": "admin.file_sources",
     "export_targets/routes.py": "admin.export_targets",
@@ -76,7 +78,7 @@ def _admin_route_modules() -> list[pathlib.Path]:
 
 
 def _rel(path: pathlib.Path) -> str:
-    return str(path.relative_to(ADMIN_SRC))
+    return path.relative_to(ADMIN_SRC).as_posix()
 
 
 # ---------------------------------------------------------------------------

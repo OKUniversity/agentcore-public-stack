@@ -13,6 +13,9 @@ import { SessionService } from '../session/services/session/session.service';
 import { UserService } from '../auth/user.service';
 import { SidenavService } from '../services/sidenav/sidenav.service';
 import { Message } from '../session/services/models/message.model';
+import { matchToolResultsToToolUses } from '../session/services/session/tool-results';
+import { normalizeSteeringMessages } from '../session/services/chat/steering';
+import { ToolInsightService } from '../session/services/chat/tool-insight.service';
 import { SpinnerComponent } from '../components/spinner/spinner.component';
 
 @Component({
@@ -21,9 +24,13 @@ import { SpinnerComponent } from '../components/spinner/spinner.component';
   imports: [NgIcon, DatePipe, MessageListComponent, SpinnerComponent],
   providers: [provideIcons({ heroLockClosed, heroExclamationTriangle, heroChatBubbleLeftRight })],
   template: `
-    <div class="min-h-screen bg-white dark:bg-gray-900">
+    <!-- No surface of its own: the page sits on the shell's body background
+         like the conversation page does. The assistant bubble is drawn in
+         that same gray-50, so a white panel here turned every turn into a
+         gray card inside a white box framed by the shell's gray padding. -->
+    <div>
       <!-- Header banner -->
-      <div class="sticky top-0 z-10 border-b border-gray-200 bg-white/95 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95">
+      <div class="sticky top-0 z-10 border-b border-gray-200 bg-gray-50/95 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95">
         <div class="mx-auto flex max-w-4xl items-center justify-center px-4 py-3">
           <div class="flex items-center gap-2">
             <ng-icon name="heroLockClosed" class="size-4 text-gray-400" aria-hidden="true" />
@@ -52,8 +59,9 @@ import { SpinnerComponent } from '../components/spinner/spinner.component';
               <h2 class="mt-4 text-lg font-semibold text-gray-900 dark:text-white">Access denied</h2>
               <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">You don't have permission to view this conversation.</p>
             } @else if (errorStatus() === 404) {
-              <h2 class="mt-4 text-lg font-semibold text-gray-900 dark:text-white">Conversation not found</h2>
-              <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">This share link may have been revoked.</p>
+              <!-- Also where a share notification lands once the share is revoked (2.5b). -->
+              <h2 class="mt-4 text-lg font-semibold text-gray-900 dark:text-white">This is no longer shared</h2>
+              <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">The person who shared it stopped sharing it, or the link is incomplete.</p>
             } @else {
               <h2 class="mt-4 text-lg font-semibold text-gray-900 dark:text-white">Something went wrong</h2>
               <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">Failed to load the shared conversation.</p>
@@ -80,6 +88,7 @@ import { SpinnerComponent } from '../components/spinner/spinner.component';
             [embeddedMode]="true"
             [sharedArtifacts]="conversation()!.artifacts"
             [sharedArtifactShareId]="conversation()!.shareId"
+            [insightSessionId]="insightKey()"
           />
         </div>
 
@@ -111,6 +120,7 @@ export class SharedViewPage implements OnInit {
   private sessionService = inject(SessionService);
   private userService = inject(UserService);
   private sidenavService = inject(SidenavService);
+  private toolInsight = inject(ToolInsightService);
 
   /** Left offset for the floating button so it centers over the content area, not the viewport */
   readonly buttonLeft = computed(() => {
@@ -120,6 +130,11 @@ export class SharedViewPage implements OnInit {
 
   protected conversation = signal<SharedConversationResponse | null>(null);
   protected messages = signal<Message[]>([]);
+  /** Where this snapshot's summaries are seeded; namespaced so it can't match a session id. */
+  protected insightKey = computed(() => {
+    const shareId = this.conversation()?.shareId;
+    return shareId ? `share:${shareId}` : null;
+  });
   protected isLoading = signal(true);
   protected isExporting = signal(false);
   protected errorStatus = signal<number | null>(null);
@@ -134,8 +149,12 @@ export class SharedViewPage implements OnInit {
 
     try {
       const data = await this.shareService.getSharedConversation(shareId);
+      this.toolInsight.seedFromHydration(`share:${data.shareId}`, data.toolSummaries ?? []);
       this.conversation.set(data);
-      this.messages.set(data.messages as Message[]);
+      // A snapshot is the same `get_messages` shape the session page loads, so
+      // it needs the same fold: without it every toolUse keeps its default
+      // `pending` status and a finished conversation's rail reads "Running …".
+      this.messages.set(normalizeSteeringMessages(matchToolResultsToToolUses(data.messages as Message[])));
     } catch (err: unknown) {
       const status = (err as any)?.status ?? (err as any)?.error?.status ?? 500;
       this.errorStatus.set(status);

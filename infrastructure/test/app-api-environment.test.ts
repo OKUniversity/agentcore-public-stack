@@ -54,6 +54,107 @@ describe('buildAppApiEnvironment — Memory Spaces', () => {  it('wires the tabl
   });
 });
 
+describe('buildAppApiEnvironment — Shared Projects', () => {
+  it('always wires the table name and gates only feature existence on the flag', () => {
+    const params = stubParams({ projectsTableName: 'test-project-projects' });
+
+    const off = buildAppApiEnvironment(createMockConfig(), params);
+    expect(off.PROJECTS_ENABLED).toBe('false');
+    expect(off.DYNAMODB_PROJECTS_TABLE_NAME).toBe('test-project-projects');
+
+    const on = buildAppApiEnvironment(createMockConfig({ projects: { enabled: true } }), params);
+    expect(on.PROJECTS_ENABLED).toBe('true');
+  });
+});
+
+describe('buildAppApiEnvironment — direct user grants', () => {
+  it('forwards the flag, off by default', () => {
+    const off = buildAppApiEnvironment(createMockConfig(), stubParams());
+    expect(off.USER_GRANTS_ENABLED).toBe('false');
+
+    const on = buildAppApiEnvironment(createMockConfig({ userGrants: { enabled: true } }), stubParams());
+    expect(on.USER_GRANTS_ENABLED).toBe('true');
+  });
+});
+
+describe('buildAppApiEnvironment — session prewarm', () => {
+  it('forwards the flag, off by default', () => {
+    const off = buildAppApiEnvironment(createMockConfig(), stubParams());
+    expect(off.SESSION_PREWARM_ENABLED).toBe('false');
+
+    const on = buildAppApiEnvironment(createMockConfig({ sessionPrewarm: { enabled: true } }), stubParams());
+    expect(on.SESSION_PREWARM_ENABLED).toBe('true');
+  });
+});
+
+describe('buildAppApiEnvironment — handoffs', () => {
+  it('forwards the flag, off by default', () => {
+    const off = buildAppApiEnvironment(createMockConfig(), stubParams());
+    expect(off.HANDOFFS_ENABLED).toBe('false');
+
+    const on = buildAppApiEnvironment(createMockConfig({ handoffs: { enabled: true } }), stubParams());
+    expect(on.HANDOFFS_ENABLED).toBe('true');
+  });
+});
+
+describe('buildAppApiEnvironment — folder sync', () => {
+  it('forwards the flag, off by default', () => {
+    expect(buildAppApiEnvironment(createMockConfig(), stubParams()).FOLDER_SYNC_ENABLED).toBe('false');
+    const on = buildAppApiEnvironment(createMockConfig({ folderSync: { enabled: true } }), stubParams());
+    expect(on.FOLDER_SYNC_ENABLED).toBe('true');
+  });
+});
+
+describe('buildAppApiEnvironment — source provenance', () => {
+  it('forwards the flag, off by default', () => {
+    expect(buildAppApiEnvironment(createMockConfig(), stubParams()).SOURCE_PROVENANCE_ENABLED).toBe('false');
+    const on = buildAppApiEnvironment(
+      createMockConfig({ sourceProvenance: { enabled: true } }),
+      stubParams(),
+    );
+    expect(on.SOURCE_PROVENANCE_ENABLED).toBe('true');
+  });
+});
+
+describe('buildAppApiEnvironment — client turn timing', () => {
+  it('forwards the flag, off by default', () => {
+    expect(buildAppApiEnvironment(createMockConfig(), stubParams()).CLIENT_TURN_TIMING_ENABLED).toBe('false');
+    const on = buildAppApiEnvironment(createMockConfig({ clientTurnTiming: { enabled: true } }), stubParams());
+    expect(on.CLIENT_TURN_TIMING_ENABLED).toBe('true');
+  });
+});
+
+describe('buildAppApiEnvironment — project-memory content lint (2.7)', () => {
+  it('always sets the mode and sets the patterns only when there are some', () => {
+    const plain = buildAppApiEnvironment(createMockConfig(), stubParams());
+    expect(plain.MEMORY_LINT_MODE).toBe('warn');
+    expect(plain).not.toHaveProperty('MEMORY_SENSITIVE_PATTERNS');
+
+    const patterns = '["\\\\bS\\\\d{8}\\\\b"]';
+    const set = buildAppApiEnvironment(
+      createMockConfig({ memoryLint: { mode: 'block', sensitivePatterns: patterns } }),
+      stubParams(),
+    );
+    expect(set.MEMORY_LINT_MODE).toBe('block');
+    expect(set.MEMORY_SENSITIVE_PATTERNS).toBe(patterns);
+  });
+});
+
+describe('buildAppApiEnvironment — dictation', () => {
+  it('threads the kill switch and the language list', () => {
+    const env = buildAppApiEnvironment(createMockConfig(), stubParams());
+    expect(env.DICTATION_ENABLED).toBe('true');
+    expect(env.DICTATION_LANGUAGES).toBe('en-US');
+
+    const off = buildAppApiEnvironment(
+      createMockConfig({ dictation: { enabled: false, languages: 'en-US,es-US' } }),
+      stubParams(),
+    );
+    expect(off.DICTATION_ENABLED).toBe('false');
+    expect(off.DICTATION_LANGUAGES).toBe('en-US,es-US');
+  });
+});
+
 /**
  * Agent Templates: the admin CRUD routes and the public `/templates` picker
  * feed read the table name from `DYNAMODB_AGENT_TEMPLATES_TABLE_NAME`. Mirrors

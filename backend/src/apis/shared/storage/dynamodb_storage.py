@@ -1456,6 +1456,77 @@ class DynamoDBStorage(MetadataStorage):
         except ClientError as e:
             raise Exception(f"Failed to get system summary: {e}")
 
+    async def get_platform_cost_summary(
+        self,
+        period: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get the synced AWS platform cost summary for a period (YYYY-MM).
+
+        Written by the platform-cost-sync Lambda
+        (infrastructure/lambda-assets/platform-cost-sync). Returns None when
+        the sync has never run for this period — which is the normal state
+        when the feature is disabled, and must be distinguishable from a
+        genuine zero.
+
+        Args:
+            period: Monthly period (YYYY-MM)
+
+        Returns:
+            Platform cost summary, or None if not synced
+        """
+        try:
+            response = self.system_rollup_table.get_item(
+                Key={"PK": "PLATFORM#MONTHLY", "SK": period}
+            )
+
+            if "Item" not in response:
+                return None
+
+            item = self._convert_decimal_to_float(response["Item"])
+            for key in ["PK", "SK"]:
+                item.pop(key, None)
+            return item
+
+        except ClientError as e:
+            raise Exception(f"Failed to get platform cost summary: {e}")
+
+    async def get_platform_service_costs(
+        self,
+        period: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Get the per-service AWS cost breakdown for a period (YYYY-MM).
+
+        One query over the period's own partition — the sync writes each
+        service as its own item under PK=PLATFORM#SERVICE#{period}, so the
+        whole breakdown is a single-partition read regardless of how many
+        services the account bills.
+
+        Args:
+            period: Monthly period (YYYY-MM)
+
+        Returns:
+            Service cost rows, cost-descending
+        """
+        try:
+            response = self.system_rollup_table.query(
+                KeyConditionExpression="PK = :pk",
+                ExpressionAttributeValues={":pk": f"PLATFORM#SERVICE#{period}"}
+            )
+
+            items = [
+                self._convert_decimal_to_float(item)
+                for item in response.get("Items", [])
+            ]
+            # SK is the service name, so DynamoDB returns these alphabetically.
+            # Cost order is what a reader wants.
+            items.sort(key=lambda row: row.get("cost", 0.0), reverse=True)
+            return items
+
+        except ClientError as e:
+            raise Exception(f"Failed to get platform service costs: {e}")
+
     async def get_daily_trends(
         self,
         start_date: str,

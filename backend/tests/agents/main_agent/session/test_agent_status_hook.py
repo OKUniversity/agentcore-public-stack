@@ -164,6 +164,47 @@ def test_tool_failure_inside_a_successful_invocation_is_not_ok(hook):
     assert status["ok"] is False
 
 
+def _github_form_stub_event():
+    from types import SimpleNamespace
+
+    return _after_tool_event(
+        name="issue_write",
+        selected_tool=SimpleNamespace(
+            tool_name="issue_write",
+            mcp_tool=SimpleNamespace(meta={"ui": {"resourceUri": "ui://github/issue_write"}}),
+            mcp_client=SimpleNamespace(context_label="GitHub"),
+        ),
+        result={
+            "status": "error",
+            "isError": True,
+            "content": [
+                {"text": "An interactive form has been shown to the user for creating a "
+                         "new issue in owner/repo. STOP — do not call any other tools."}
+            ],
+        },
+    )
+
+
+def test_an_app_form_waiting_for_the_user_is_not_a_failure(hook):
+    """GitHub's App stub is `isError` on purpose; nothing failed (2026-10-18)."""
+    hook._on_after_tool_call(_github_form_stub_event())
+    hook._on_after_tools(MagicMock())
+
+    (status,) = hook.drain_statuses()
+    assert status["ok"] is True
+    (batch,) = hook.drain_batches()
+    assert batch["calls"][0]["ok"] is True
+    assert batch["calls"][0]["awaiting"] is True
+
+
+def test_an_ordinary_call_is_not_awaiting(hook):
+    hook._on_after_tool_call(_after_tool_event())
+    hook._on_after_tools(MagicMock())
+
+    (batch,) = hook.drain_batches()
+    assert batch["calls"][0]["awaiting"] is False
+
+
 def test_raised_exception_is_not_ok(hook):
     hook._on_after_tool_call(_after_tool_event(exception=RuntimeError("boom")))
 
@@ -294,3 +335,78 @@ def test_status_queue_is_capped(hook):
         hook._on_before_model_call(MagicMock())
 
     assert len(hook.drain_statuses()) == _MAX_QUEUED_STATUSES
+
+
+# -- 6. first-model-call stamp (turn-path P1b) ------------------------------
+
+
+def test_first_model_call_is_stamped_once_per_turn(hook, monkeypatch):
+    clock = iter([10.0, 11.0, 12.0])
+    monkeypatch.setattr(
+        "agents.main_agent.session.hooks.agent_status.time.perf_counter",
+        lambda: next(clock),
+    )
+    hook._on_turn_start(MagicMock())
+    hook._on_before_model_call(MagicMock())
+    hook._on_before_model_call(MagicMock())  # cycle 2 must not move it
+
+    assert hook.first_model_call_at == 10.0
+
+    hook._on_turn_start(MagicMock())
+    assert hook.first_model_call_at is None
+    hook._on_before_model_call(MagicMock())
+    assert hook.first_model_call_at == 11.0
+
+
+def test_first_model_call_is_stamped_with_narration_off(hook, monkeypatch):
+    """A measurement, not narration: the kill switch silences the status line,
+    not the first-token clock."""
+    monkeypatch.setenv("AGENT_STATUS_ENABLED", "false")
+    hook._on_before_model_call(MagicMock())
+
+    assert hook.first_model_call_at is not None
+    assert hook.drain_statuses() == []
+
+
+# -- 6. which integration a call belongs to -------------------------------
+#
+# prod, 2026-10-17: a failed GitHub call was headed "Couldn't reach Canvas".
+# The summarizer only ever saw the tool name, so it guessed the system.
+
+
+def test_a_call_records_its_servers_catalog_name(hook):
+    from types import SimpleNamespace
+
+    selected = SimpleNamespace(mcp_client=SimpleNamespace(context_label="GitHub Projects"))
+    hook._on_after_tool_call(_after_tool_event(name="projects_list", selected_tool=selected))
+    hook._on_after_tools(MagicMock())
+
+    (batch,) = hook.drain_batches()
+    assert batch["calls"][0]["integration"] == "GitHub Projects"
+
+
+def test_an_unknown_tool_records_no_integration(hook):
+    """The model invented `search_issues`; nothing resolved it to a server."""
+    hook._on_after_tool_call(
+        _after_tool_event(
+            name="search_issues",
+            selected_tool=None,
+            result={"status": "error", "content": [{"text": "Unknown tool: search_issues"}]},
+        )
+    )
+    hook._on_after_tools(MagicMock())
+
+    (batch,) = hook.drain_batches()
+    assert batch["calls"][0]["integration"] is None
+
+
+def test_a_built_in_tool_records_no_integration(hook):
+    from types import SimpleNamespace
+
+    hook._on_after_tool_call(
+        _after_tool_event(name="calculator", selected_tool=SimpleNamespace(tool_name="calculator"))
+    )
+    hook._on_after_tools(MagicMock())
+
+    (batch,) = hook.drain_batches()
+    assert batch["calls"][0]["integration"] is None

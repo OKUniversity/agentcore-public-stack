@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from strands.hooks import (
@@ -69,6 +70,10 @@ from strands.hooks import (
     BeforeToolCallEvent,
     HookProvider,
     HookRegistry,
+)
+
+from agents.main_agent.session.hooks.mcp_app_awaiting import (
+    call_awaits_user_submission,
 )
 
 logger = logging.getLogger(__name__)
@@ -147,6 +152,21 @@ def _tool_use_fields(event: Any) -> tuple[Optional[str], Optional[str], Any]:
     )
 
 
+def _integration_of(event: Any) -> Optional[str]:
+    """The catalog display name of the server a call ran on, or None.
+
+    External MCP clients carry it as ``context_label`` (the catalog row's
+    ``display_name``, set when the client is built). Built-in tools have none,
+    and nor does a call the model invented (``selected_tool`` is None). The
+    summarizer names a failed call by this, never by a guess: given only a tool
+    name it headed a failed GitHub call "Couldn't reach Canvas" (prod,
+    2026-10-17).
+    """
+    client = getattr(getattr(event, "selected_tool", None), "mcp_client", None)
+    label = getattr(client, "context_label", None)
+    return label if isinstance(label, str) and label else None
+
+
 class AgentStatusHook(HookProvider):
     """Record model-call and tool-call transitions for the live status line.
 
@@ -169,6 +189,11 @@ class AgentStatusHook(HookProvider):
         self._cycle = 0
         # Monotonic batch counter, used to build a stable batch id.
         self._batch_seq = 0
+        # `perf_counter()` at this turn's FIRST model call — the boundary the
+        # coordinator's first-token clock needs between pre-model work (the
+        # user message's append, LTM retrieval) and the model's own time to
+        # first token. Read by the coordinator within the same turn.
+        self.first_model_call_at: Optional[float] = None
 
     def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
         registry.add_callback(BeforeInvocationEvent, self._on_turn_start)
@@ -204,8 +229,13 @@ class AgentStatusHook(HookProvider):
         self._open_batch = []
         self._cycle = 0
         self._batch_seq = 0
+        self.first_model_call_at = None
 
     def _on_before_model_call(self, event: BeforeModelCallEvent) -> None:
+        # A measurement, not narration: stamped whether or not the status
+        # line is on. One `perf_counter()` per model call.
+        if self.first_model_call_at is None:
+            self.first_model_call_at = time.perf_counter()
         if not self._enabled():
             return
         try:
@@ -250,7 +280,10 @@ class AgentStatusHook(HookProvider):
             duration_ms = _duration_ms(getattr(event, "duration", None))
             ok = getattr(event, "exception", None) is None
             result = getattr(event, "result", None)
-            if ok and isinstance(result, dict):
+            # An MCP App's form waiting for the user reports `isError` on
+            # purpose; it has not failed, and it has not done anything yet.
+            awaiting = ok and call_awaits_user_submission(event)
+            if ok and not awaiting and isinstance(result, dict):
                 # A tool can fail *inside* a successful invocation; Strands
                 # reports that as a result with status "error", not as a raised
                 # exception. The rail's red dot depends on catching both.
@@ -276,7 +309,9 @@ class AgentStatusHook(HookProvider):
                         "input": _stringify(tool_input, _MAX_INPUT_CHARS),
                         "result": _stringify(result, _MAX_RESULT_CHARS),
                         "ok": ok,
+                        "awaiting": awaiting,
                         "durationMs": duration_ms,
+                        "integration": _integration_of(event),
                     }
                 )
         except Exception:  # noqa: BLE001

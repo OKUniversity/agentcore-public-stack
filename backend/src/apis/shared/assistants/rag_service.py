@@ -24,8 +24,9 @@ implemented twice is a rule that will eventually differ (Requirement 3):
   cannot silently shrink a five-chunk answer.
 * **The context cap, per engine.** ``augment_prompt_with_context`` takes an
   explicit ``max_context_length``; :func:`resolve_context_cap` decides it from
-  the assistant's engine. Legacy keeps the historical 2,000 characters; managed
-  gets :data:`MANAGED_MAX_CONTEXT_CHARS` (8,000). This is a *deliberate*
+  the assistant's engine. Legacy gets :data:`MAX_CONTEXT_CHARS` (22,000, sized
+  so ``top_k`` full-size Docling chunks fit; it was 2,000 until 2026-10);
+  managed gets :data:`MANAGED_MAX_CONTEXT_CHARS` (8,000). This is a *deliberate*
   managed-only asymmetry, amended into Requirement 3.2 on 2026-09-04 after
   measurement: holding the *character* cap identical across backends did **not**
   hold retrieval identical, because Bedrock's chunks are ~3x the size of the
@@ -51,12 +52,12 @@ Score direction
 client already reads. The rename stops at the seam; no caller has to change.
 """
 
+import asyncio
 import logging
 import os
+import re
 import time
-from typing import Any, Dict, List, Mapping, Optional, Set
-
-import boto3
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from apis.shared.assistants.kb_access import KbAccess
 from apis.shared.kb_backend.dual_read import schedule_observation, start_managed_read
@@ -77,10 +78,17 @@ from apis.shared.kb_backend.resolver import (
 
 logger = logging.getLogger(__name__)
 
-#: Legacy context cap (Requirement 3.2): 2,000 characters, unchanged from the
-#: value the S3 Vectors path has always used. Named so a change to it is a visible
-#: change to a constant rather than an edit to a default argument.
-MAX_CONTEXT_CHARS = 2000
+#: Legacy context cap (Requirement 3.2): sized so ``top_k`` (5) full-size chunks
+#: reach the model. Docling's ``HybridChunker`` cuts at 1,024 cl100k tokens
+#: (``docling_processor.py``), about 4,100 characters of English, and
+#: ``contextualize`` prepends the chunk's headings: ~4,300 a chunk, plus its
+#: ``[Context i]`` header, so five are ~21,600. The historical 2,000 fit fewer
+#: than half of ONE such chunk, so on a corpus of long documents top_k=5 reached
+#: the model as one truncated excerpt (2026-10, an instructor's course assistant
+#: answered for one assignment out of several). The cap only binds when chunks are
+#: large; a corpus of short chunks pays nothing for it. Pin the literal, as with
+#: the managed figure below: it follows Docling's chunk size, not either cap.
+MAX_CONTEXT_CHARS = 22000
 
 #: Managed context cap (Requirement 3.2, amended by measurement 2026-09-04).
 #: Bedrock's chunks run ~3x larger than the Docling chunks 2,000 was sized for, so
@@ -113,6 +121,27 @@ def resolve_context_cap(assistant_id: str, *, record: Optional[Mapping[str, Any]
     return MANAGED_MAX_CONTEXT_CHARS if engine == ENGINE_MANAGED else MAX_CONTEXT_CHARS
 
 
+async def _search_then_filter(
+    backend: Any,
+    assistant_id: str,
+    query: str,
+    top_k: int,
+    record: Optional[Mapping[str, Any]] = None,
+) -> Tuple[List[Chunk], float, List[Chunk]]:
+    """``(raw chunks, search ms, chunks whose document is complete)``.
+
+    Runs on a private event loop in a worker thread (see the caller). Only the
+    backend call and the filter belong here: neither schedules anything that
+    must outlive this loop. ``search ms`` times the backend call alone — it is
+    the number the dual-read observation compares across engines.
+    """
+    started = time.perf_counter()
+    chunks = await backend.search(assistant_id, query, top_k, record=record)
+    search_ms = (time.perf_counter() - started) * 1000.0
+    complete = _filter_chunks_by_document_status(chunks, assistant_id) if chunks else []
+    return chunks, search_ms, complete
+
+
 async def search_assistant_knowledgebase_with_formatting(
     assistant_id: str,
     query: str,
@@ -120,8 +149,30 @@ async def search_assistant_knowledgebase_with_formatting(
     *,
     access: Optional[KbAccess],
 ) -> List[Dict[str, Any]]:
+    """Search an assistant's knowledge base; see :func:`search_assistant_knowledgebase_with_cap`.
+
+    For callers that do not augment a prompt and so have no use for the cap.
     """
-    Search assistant knowledge base and return formatted results
+    results, _ = await search_assistant_knowledgebase_with_cap(
+        assistant_id, query, top_k, access=access
+    )
+    return results
+
+
+async def search_assistant_knowledgebase_with_cap(
+    assistant_id: str,
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+    *,
+    access: Optional[KbAccess],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Search assistant knowledge base and return formatted results, with the context cap
+
+    The cap is :func:`resolve_context_cap` decided from the same KB_Record that
+    chose the backend. Returning it here is what lets a turn read that record
+    once: the backend's own lookup of ``awsKbId`` and the cap each used to read it
+    again, on a fresh client, on the turn's critical path (~50ms apiece on dev).
 
     Resolves the knowledge base's backend, delegates the search across the seam,
     then applies the parity rules that must hold on every backend: the document
@@ -139,13 +190,14 @@ async def search_assistant_knowledgebase_with_formatting(
             ``kb_access.resolve_kb_access`` if it is not.
 
     Returns:
-        List of dictionaries containing:
+        ``(results, cap)``. ``results`` is a list of dictionaries containing:
         - text: Chunk text content
         - distance: Similarity distance (lower = more similar)
         - metadata: Original metadata from vector store
         - key: Vector key/ID
 
-        Empty when the caller has no grant — no backend is contacted at all.
+        Empty when the caller has no grant — no backend is contacted at all, and
+        ``cap`` is the legacy :data:`MAX_CONTEXT_CHARS` (nothing to cap).
     """
     # Authorization first, before the backend resolution, the query clamp, and
     # any AWS call (Requirement 25.1). Ordering is the requirement: a check that
@@ -157,7 +209,7 @@ async def search_assistant_knowledgebase_with_formatting(
             f"no resolved access grant"
         )
         emit_count(METRIC_ACCESS_DENIED, dimensions={"reason": "no_grant"})
-        return []
+        return [], MAX_CONTEXT_CHARS
 
     if access.assistant_id != assistant_id:
         # A grant for a different assistant is not a grant for this one. This is
@@ -169,14 +221,15 @@ async def search_assistant_knowledgebase_with_formatting(
             f"{access.assistant_id}, not {assistant_id}"
         )
         emit_count(METRIC_ACCESS_DENIED, dimensions={"reason": "grant_mismatch"})
-        return []
+        return [], MAX_CONTEXT_CHARS
 
     managed_task = None
+    cap = MAX_CONTEXT_CHARS
     try:
-        # One record read serves both questions: which backend to use, and whether
-        # this knowledge base is in the dual-read pilot. Reading it here rather
-        # than letting the resolver read it internally is what keeps the pilot
-        # from costing an extra DynamoDB round trip on every turn.
+        # One record read serves every question this search asks of it: which
+        # backend to use, whether this knowledge base is in the dual-read pilot,
+        # the managed backend's ``awsKbId``, and the context cap. Each of those
+        # used to be its own DynamoDB round trip on the turn's critical path.
         record = load_record(assistant_id)
         backend = resolve_backend(assistant_id, record=record)
 
@@ -188,6 +241,7 @@ async def search_assistant_knowledgebase_with_formatting(
         # the SAME record ``resolve_backend`` just used (no extra DynamoDB round
         # trip), so the logged engine can never disagree with the one that ran.
         engine = resolve_engine_for(assistant_id, record=record)
+        cap = resolve_context_cap(assistant_id, record=record)
         logger.info(
             "knowledge base retrieval for assistant %s served by engine=%s (%s)",
             assistant_id,
@@ -209,9 +263,17 @@ async def search_assistant_knowledgebase_with_formatting(
         # ``None`` whenever there is no comparison to make.
         managed_task = start_managed_read(record, assistant_id, query, top_k)
 
-        started = time.perf_counter()
-        chunks = await backend.search(assistant_id, query, top_k)
-        legacy_ms = (time.perf_counter() - started) * 1000.0
+        # The search and the document-status filter run back to back on one
+        # worker thread, on a loop of its own. An agent turn starts this search
+        # before the agent build and awaits it after (turn-path spec §5 P3b),
+        # and a cold build holds the event loop: had the filter run here, after
+        # the search, its DynamoDB reads would have waited for the build to let
+        # go (~60ms of residual `rag_wait` on dev). Everything that schedules
+        # onto THIS loop — the observational read above, the observation and
+        # the activity touch below — stays on it.
+        chunks, legacy_ms, complete_chunks = await asyncio.to_thread(
+            asyncio.run, _search_then_filter(backend, assistant_id, query, top_k, record)
+        )
 
         # Detach the comparison. Legacy is what gets served either way — including
         # when it is empty, which is a finding rather than a reason to reach for
@@ -233,10 +295,10 @@ async def search_assistant_knowledgebase_with_formatting(
 
         if not chunks:
             logger.info(f"No vectors found for assistant {assistant_id} with query: {query[:50]}...")
-            return []
+            return [], cap
 
         # Filter out chunks from documents that are not in "complete" status
-        chunks = _filter_chunks_by_document_status(chunks, assistant_id)
+        chunks = complete_chunks
 
         # Format results - return document_id for on-demand download URL generation
         formatted_results = []
@@ -252,8 +314,20 @@ async def search_assistant_knowledgebase_with_formatting(
                 }
             )
 
-        logger.info(f"Found {len(formatted_results)} relevant chunks for assistant {assistant_id}")
-        return formatted_results
+        # Remove duplicate content before returning (issue #1236). One pass here
+        # cleans both the model-facing context and the citation cards, which are
+        # built from this same list downstream. No-op when results are distinct.
+        deduped_results = dedupe_context_chunks(formatted_results)
+        if len(deduped_results) < len(formatted_results):
+            logger.info(
+                "Deduplicated context chunks for assistant %s: %d → %d",
+                assistant_id,
+                len(formatted_results),
+                len(deduped_results),
+            )
+
+        logger.info(f"Found {len(deduped_results)} relevant chunks for assistant {assistant_id}")
+        return deduped_results, cap
 
     except Exception as e:
         logger.error(f"Error searching knowledge base for assistant {assistant_id}: {e}", exc_info=True)
@@ -264,7 +338,19 @@ async def search_assistant_knowledgebase_with_formatting(
             # exception was never retrieved.
             managed_task.cancel()
         # Return empty list on error (graceful degradation)
-        return []
+        return [], cap
+
+
+def _documents_table(table_name: str, region: str) -> Any:
+    """The assistants table for the status lookups, on the process-cached resource.
+
+    A fresh ``boto3.resource`` per search paid ~45–55ms for its first ``GetItem`` in
+    the Runtime (a new connection pool) against ~3ms on a reused one, and this
+    lookup sits between the retrieval and the model's first token.
+    """
+    from apis.shared.aws_clients import get_dynamodb_table
+
+    return get_dynamodb_table(table_name, region)
 
 
 def _filter_chunks_by_document_status(chunks: List[Chunk], assistant_id: str) -> List[Chunk]:
@@ -346,8 +432,7 @@ def _filter_vectors_by_document_status(vectors: List[Dict[str, Any]], assistant_
         table_name = os.environ.get("DYNAMODB_ASSISTANTS_TABLE_NAME")
         if table_name:
             region = os.environ.get("AWS_REGION", "us-west-2")
-            dynamodb = boto3.resource("dynamodb", region_name=region)
-            table = dynamodb.Table(table_name)
+            table = _documents_table(table_name, region)
             for doc_id in doc_ids:
                 try:
                     response = table.get_item(
@@ -401,6 +486,183 @@ def _filter_vectors_by_document_status(vectors: List[Dict[str, Any]], assistant_
     return filtered
 
 
+# ── Duplicate-content removal (issue #1236) ──────────────────────────────────
+#
+# Managed knowledge bases can hand back near-identical content two ways, and both
+# reach the user because the formatted result list feeds the model prompt AND the
+# citation cards from one source (see ``search_assistant_knowledgebase_with_formatting``
+# → ``augment_prompt_with_context`` and the ``citations_for_storage`` build off the
+# same ``context_chunks`` in ``inference_api/chat/routes.py``):
+#
+#   1. The image-to-text parser on poster/infographic PDFs repeats a descriptive
+#      sentence several times *inside* one chunk.
+#   2. Fixed-window chunking (~300 tokens, 20% overlap) lets reranking surface two
+#      chunks that are substantially the same text.
+#
+# Deduplication lives here, above the seam, for the same reason the other parity
+# rules do: it must hold identically on every backend. It is a no-op on
+# already-distinct results, so legacy — which rarely duplicates — is unaffected.
+# It deliberately does NOT change chunking or re-ingest anything; it cleans the
+# retrieved set at answer time.
+
+#: Segments shorter than this (normalized character length) are never dropped as
+#: intra-chunk repeats. Short recurring lines — a header, "Yes.", a label — can
+#: legitimately appear more than once; the vision-repeat this targets is whole
+#: descriptive sentences.
+_MIN_DEDUP_SEGMENT_CHARS = 25
+
+#: Below this token count, only *exact* or *substring* duplication is trusted;
+#: fuzzy set-overlap is skipped. Two short chunks can share most of their few
+#: words while being genuinely distinct, so set-overlap on tiny token sets
+#: over-drops.
+_MIN_TOKENS_FOR_FUZZY = 8
+
+#: Two chunks are near-duplicates when their normalized word sets reach this
+#: Jaccard similarity, OR when the smaller set is this-fraction contained in the
+#: larger. 0.9 catches reranked near-twins and substantially-contained chunks
+#: while leaving genuinely distinct ~20%-overlap window neighbours (which share
+#: only their edges) in place.
+_NEAR_DUPLICATE_JACCARD = 0.9
+_CONTAINMENT_RATIO = 0.9
+
+_WHITESPACE_RE = re.compile(r"\s+")
+#: Split a chunk into sentence/line segments: after sentence-ending punctuation
+#: followed by whitespace, or on any run of newlines.
+_SEGMENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _normalize_for_compare(text: str) -> str:
+    """Whitespace-collapsed, case-folded form used only for equality/overlap tests.
+
+    Never stored or returned to a caller — the original text is always what
+    survives. This exists so "Foo  bar" and "foo bar\n" compare equal.
+    """
+    return _WHITESPACE_RE.sub(" ", text).strip().casefold()
+
+
+def _collapse_repeated_segments(text: str) -> str:
+    """Drop duplicate sentences/lines within a single chunk, order-preserving.
+
+    Targets the vision-extraction repetition (cause 1). A segment is a maximal run
+    split on newlines or after sentence-ending punctuation. Only segments at least
+    :data:`_MIN_DEDUP_SEGMENT_CHARS` long (normalized) are eligible to be dropped,
+    and the first occurrence's original text is kept verbatim. Segments are rejoined
+    with a single space, so the only change to surviving text is whitespace
+    normalization at the split points.
+
+    Limitation: repetition with no sentence/line separator between the copies is
+    not collapsed here; the cross-chunk pass and exact-duplicate handling cover the
+    whole-chunk-repeated case.
+    """
+    if not text or not text.strip():
+        return text
+    segments = _SEGMENT_SPLIT_RE.split(text)
+    if len(segments) < 2:
+        return text
+    seen: Set[str] = set()
+    kept: List[str] = []
+    dropped = False
+    for segment in segments:
+        norm = _normalize_for_compare(segment)
+        if len(norm) >= _MIN_DEDUP_SEGMENT_CHARS:
+            if norm in seen:
+                dropped = True
+                continue
+            seen.add(norm)
+        kept.append(segment.strip())
+    if not dropped:
+        return text
+    return " ".join(part for part in kept if part)
+
+
+def _is_near_duplicate(
+    a_norm: str,
+    a_tokens: "frozenset[str]",
+    b_norm: str,
+    b_tokens: "frozenset[str]",
+) -> bool:
+    """True when chunk *a* is a duplicate of, or substantially contained in, *b*.
+
+    Cheap tests first: exact normalized equality, then whole-text substring
+    containment (one chunk's text sits verbatim inside the other). Set-overlap
+    (Jaccard and smaller-in-larger containment) is only consulted when both chunks
+    clear :data:`_MIN_TOKENS_FOR_FUZZY`, so short distinct chunks that happen to
+    share words are never fused.
+    """
+    if a_norm == b_norm:
+        return True
+    if a_norm in b_norm or b_norm in a_norm:
+        return True
+    if len(a_tokens) < _MIN_TOKENS_FOR_FUZZY or len(b_tokens) < _MIN_TOKENS_FOR_FUZZY:
+        return False
+    intersection = len(a_tokens & b_tokens)
+    if not intersection:
+        return False
+    union = len(a_tokens | b_tokens)
+    if union and intersection / union >= _NEAR_DUPLICATE_JACCARD:
+        return True
+    smaller = min(len(a_tokens), len(b_tokens))
+    return smaller > 0 and intersection / smaller >= _CONTAINMENT_RATIO
+
+
+def dedupe_context_chunks(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove duplicate content from formatted retrieval results (issue #1236).
+
+    Two order-preserving, best-first passes over the formatted result dicts
+    (``{"text", "distance", "metadata", "key"}``):
+
+      1. Collapse repeated sentences/lines within each chunk's ``text``.
+      2. Drop a chunk whose (collapsed) text is a near-duplicate of one already
+         kept.
+
+    Because the same list feeds the model prompt and the citation cards, one pass
+    here cleans both. Returns new dicts (originals are not mutated); metadata and
+    all other keys are carried through untouched. Safe to run on any engine.
+    """
+    kept: List[Dict[str, Any]] = []
+    kept_compare: List[Tuple[str, "frozenset[str]"]] = []
+    for result in results:
+        collapsed = _collapse_repeated_segments(result.get("text", "") or "")
+        cleaned = {**result, "text": collapsed}
+        norm = _normalize_for_compare(collapsed)
+        if not norm:
+            # Nothing to compare; keep it (the formatter drops empty text later).
+            kept.append(cleaned)
+            kept_compare.append((norm, frozenset()))
+            continue
+        tokens = frozenset(norm.split())
+        if any(
+            _is_near_duplicate(norm, tokens, k_norm, k_tokens)
+            for k_norm, k_tokens in kept_compare
+            if k_norm
+        ):
+            continue
+        kept.append(cleaned)
+        kept_compare.append((norm, tokens))
+    return kept
+
+
+#: What the model is told about retrieved chunks. They are the top few search
+#: hits for the user's message, not the knowledge base, and the old wording ("Use
+#: this information to answer ... accurately and comprehensively") read as if they
+#: were all of it: asked "Can I use AI on my assignment?", a course assistant that
+#: retrieved one assignment's policy answered for that assignment alone, even with
+#: instructions to ask which assignment when the policy varies. Changing this text
+#: changes the persisted user message of every later assistant turn, not the
+#: cacheable prefix of an existing conversation (earlier turns keep their bytes).
+RETRIEVED_EXCERPTS_PREAMBLE = (
+    "The following excerpts were retrieved from the assistant's knowledge base by a "
+    "search on the user's message. They are partial: the knowledge base may hold more "
+    "on this topic than these excerpts show, including material that applies to a "
+    "different case. Answer from them when they settle the question. If the question "
+    "could have different answers depending on something the excerpts do not settle "
+    "(for example, which assignment, course, section or date the user means), ask the "
+    "user a short clarifying question instead of answering for only the case the "
+    "excerpts happen to cover. Do not present the excerpts as everything the "
+    "knowledge base contains."
+)
+
+
 def augment_prompt_with_context(user_message: str, context_chunks: List[Dict[str, Any]], max_context_length: int = MAX_CONTEXT_CHARS) -> str:
     """
     Augment user message with retrieved context chunks
@@ -451,7 +713,7 @@ def augment_prompt_with_context(user_message: str, context_chunks: List[Dict[str
 
     # Combine context and user message
     context_section = "\n".join(context_parts)
-    augmented_message = f"""The following context is retrieved from the assistant's knowledge base. Use this information to answer the user's question accurately and comprehensively.
+    augmented_message = f"""{RETRIEVED_EXCERPTS_PREAMBLE}
 
 {context_section}
 ---

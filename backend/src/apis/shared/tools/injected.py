@@ -42,6 +42,12 @@ POWERPOINT_PRESENTATION_TOOL_IDS = frozenset({"create_powerpoint_presentation"})
 # Session workspace files. A single toggle that provisions list/read/write.
 WORKSPACE_TOOL_IDS = frozenset({"workspace_files"})
 
+# Authoring the invoking user's own skills (bound to session/user). A single
+# toggle that provisions all seven ``my_skill_*`` tools
+# (docs/specs/skill-creator.md, Gating); additionally gated on
+# ``skill_authoring_enabled()`` and ``skills_enabled()``.
+SKILL_AUTHORING_TOOL_IDS = frozenset({"my_skill_create"})
+
 # Document retrieval (bound to session/user). Listed for the record, and
 # deliberately NOT folded into ``INJECTED_TOOL_IDS`` below: ``document_read``
 # is gated on the session having a readable attachment, not on
@@ -52,9 +58,9 @@ WORKSPACE_TOOL_IDS = frozenset({"workspace_files"})
 DOCUMENT_TOOL_IDS = frozenset({"document_read"})
 
 # Every id owned by a per-request factory. Memory-Space and document tools are
-# deliberately absent: they are gated on an Agent's memory binding / the
-# session's attachments rather than on ``enabled_tools``, so they never reach
-# the filter.
+# deliberately absent: they are gated on an Agent's memory binding (or a
+# project harness) / the session's attachments rather than on
+# ``enabled_tools``, so they never reach the filter.
 INJECTED_TOOL_IDS = frozenset(
     SPREADSHEET_TOOL_IDS
     | ARTIFACT_TOOL_IDS
@@ -62,6 +68,7 @@ INJECTED_TOOL_IDS = frozenset(
     | EXCEL_SPREADSHEET_TOOL_IDS
     | POWERPOINT_PRESENTATION_TOOL_IDS
     | WORKSPACE_TOOL_IDS
+    | SKILL_AUTHORING_TOOL_IDS
 )
 
 
@@ -93,7 +100,10 @@ INJECTED_TOOL_IDS = frozenset(
 #   - WORD (`_build_word_document_tools`), EXCEL
 #     (`_build_excel_spreadsheet_tools`), POWERPOINT
 #     (`_build_powerpoint_presentation_tools`), WORKSPACE
-#     (`_build_workspace_tools`).
+#     (`_build_workspace_tools`). With `WORD_TRACKED_CHANGES_ENABLED` on, WORD
+#     also closes over the user's display name, as `redline_word_document`'s
+#     default revision author. That names the same identity as `user_id`, the
+#     equivalence SKILL_AUTHORING's email rests on below.
 #
 #   - SPREADSHEET (`_build_spreadsheet_tools`) closes over `assistant_id` as
 #     well. That was NOT a key element until `_create_cache_key` gained it,
@@ -103,12 +113,24 @@ INJECTED_TOOL_IDS = frozenset(
 #     is the dominant cohort: the 2026-08-03 prod read put
 #     `analyze_spreadsheet` on ~2,669 of 3,565 sessions.
 #
-# Still excluded:
+#   - SKILL_AUTHORING (`_build_skill_authoring_tools`) closes over
+#     `(session_id, user_id, user_email)`. The email is not a key element of
+#     its own, but it names the same identity as `user_id` (the Memory-Space
+#     tools below rest on the same equivalence), and the tools only log it. The
+#     binding-reach lookup (skill-creator spec D9) runs per call, at approval
+#     time, so the closure holds nothing else. Admitted with the family rather
+#     than later: an opt-in family left out of this set makes every turn that
+#     enables it rebuild the agent and re-write the prompt-cache prefix.
 #
-#   - Memory-Space tools: capture the resolved binding (space id + access) and
-#     are not gated on `enabled_tools` at all, so they are not in any set here.
-#     `get_agent`'s caller must treat a live memory binding as an independent
-#     veto — see `injected_tools_are_key_described`.
+# Memory-Space tools are not in any set here (they are not gated on
+# `enabled_tools`), but they are described too: they close over the resolved
+# binding (space id, name, access) plus `(user_id, user_email)`, and
+# `_create_cache_key` carries a digest of the binding (Shared Projects 2.1).
+# The caller must pass that binding to `get_agent` for the key to carry it;
+# the tools themselves read the space live on every call. A project harness's
+# scope-addressed family (Shared Projects 2.4b) is described the same way: it
+# closes over the project and its two space ids, which reach the key through
+# the same `memory_binding` element in a different shape.
 KEY_DESCRIBED_INJECTED_TOOL_IDS = frozenset(
     ARTIFACT_TOOL_IDS
     | WORD_DOCUMENT_TOOL_IDS
@@ -116,12 +138,12 @@ KEY_DESCRIBED_INJECTED_TOOL_IDS = frozenset(
     | POWERPOINT_PRESENTATION_TOOL_IDS
     | WORKSPACE_TOOL_IDS
     | SPREADSHEET_TOOL_IDS
+    | SKILL_AUTHORING_TOOL_IDS
 )
 
 
 def injected_tools_are_key_described(
     enabled_tools: list | frozenset | set | None,
-    has_memory_binding: bool,
 ) -> bool:
     """Whether this turn's injected tools are fully described by the cache key.
 
@@ -133,16 +155,14 @@ def injected_tools_are_key_described(
         enabled_tools: The turn's *effective* enabled tool ids (an Agent's tool
             binding replaces the request's list — pass whatever reaches
             ``get_agent``, or the key and this predicate disagree).
-        has_memory_binding: Whether a resolved Memory-Space binding produced
-            tools this turn. An independent veto: those tools close over the
-            binding, which is not in the key, and they are not gated on
-            ``enabled_tools`` so no id here can represent them.
+
+    Memory-Space tools need no argument here: the binding they close over is a
+    cache-key element (``memory_binding`` on ``get_agent``), not something this
+    predicate has to veto.
 
     Conservative in both directions that matter. A feature-flagged-off family
     whose id is still in ``enabled_tools`` counts as not-described even though
     it built nothing — that costs a cache bypass, never a wrong reuse.
     """
-    if has_memory_binding:
-        return False
     built = INJECTED_TOOL_IDS.intersection(enabled_tools or ())
     return built.issubset(KEY_DESCRIBED_INJECTED_TOOL_IDS)

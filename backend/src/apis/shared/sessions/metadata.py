@@ -31,7 +31,7 @@ import base64
 from dataclasses import dataclass
 
 from apis.shared.aws_clients import get_dynamodb_table
-from typing import Iterable, List, Optional, Tuple, Any, Dict
+from typing import Iterable, List, Literal, Optional, Tuple, Any, Dict
 from decimal import Decimal
 
 # Relative imports from shared sessions module
@@ -43,6 +43,10 @@ from .models import ExportReceipt, MessageMetadata, PausedTurnSnapshot, PendingI
 # The headless delivery path (ensure_session_metadata_exists) calls
 # is_preview_session, so a lazy import would only defer the crash.
 from .preview import is_preview_session
+
+# Stdlib-only normalizer for the conversation-search attributes written beside
+# the title (titleLower, firstPrompt).
+from .search_text import first_prompt_value, normalize_search_text
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +208,27 @@ async def store_user_display_text(
         logger.error(f"Failed to store user displayText: {e}", exc_info=True)
 
 
+def get_user_display_text(session_id: str, user_id: str, message_id: int) -> Optional[str]:
+    """The ``displayText`` stored for one user message, or None.
+
+    Synchronous (call it through ``asyncio.to_thread``). Never raises: a
+    missing table, row or attribute all read as "no display text".
+    """
+    table_name = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
+    if not table_name or is_preview_session(session_id):
+        return None
+    try:
+        response = get_dynamodb_table(table_name).get_item(
+            Key={"PK": f"USER#{user_id}", "SK": f"D#{session_id}#{message_id}"},
+            ProjectionExpression="displayText",
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to read user displayText", exc_info=True)
+        return None
+    text = (response.get("Item") or {}).get("displayText")
+    return text if isinstance(text, str) and text.strip() else None
+
+
 
 async def _store_message_metadata_cloud(
     session_id: str,
@@ -342,6 +367,14 @@ async def _store_message_metadata_cloud(
             message_metadata=message_metadata
         )
 
+        # Shared Projects: a call made by a project's harness also counts toward that
+        # project's month. Best-effort, like every aggregate above.
+        await _update_project_rollup_async(
+            user_id=user_id,
+            timestamp=timestamp,
+            message_metadata=message_metadata,
+        )
+
     except Exception as e:
         logger.error(f"Failed to store message metadata in DynamoDB: {e}", exc_info=True)
         # Propagate error - metadata storage is critical for cost tracking and audit trail
@@ -393,13 +426,19 @@ def _derive_cache_observability(
     query) and derives:
 
     - ``cacheStatus``: first_write | hit | partial_miss | miss_ttl_expired |
-      miss_avoidable | uncached (see ``apis.shared.observability.CacheStatus``).
+      miss_avoidable | uncached (see ``apis.shared.observability.CacheStatus``),
+      or ``estimated`` for a row whose usage was never reported — those return
+      early, before the query, and are never classified.
     - ``cacheGapSeconds``: whole seconds since the previous call, when known.
     - ``cachePrefixGapSeconds``: seconds since the last call with the *same*
       prefix, when that is a different (older) call than the previous one.
     - ``wastedUsd``: for avoidable and partial misses, the re-written
       previously-cached prefix priced at the cache-write premium over the
       cache-read rate, using this row's own pricingSnapshot.
+    - ``agentSwitched`` / ``modelSwitched``: set when this call ran on a
+      different Agent / model than the previous call — an explained re-write
+      (an ``@``-mention, a mid-conversation model switch). The waste stays in
+      ``wastedUsd``; the flags let readers subtract it.
 
     ⚠️ The predecessor that decides ``miss_avoidable`` vs ``miss_ttl_expired``
     is the last call with the **same toolConfig + system-prompt fingerprints**,
@@ -408,6 +447,10 @@ def _derive_cache_observability(
     moment two prefixes interleave in one session — which is exactly what an
     `@`-mention does — and it reported genuine TTL expiries as avoidable waste,
     inflating the metric that exists to catch nondeterministic prefix assembly.
+
+    A row whose fingerprints carry ``extendsMessagesHashes`` (api-converse)
+    also needs the predecessor's ``messagesHash`` to be in that list, and with
+    no such predecessor it classifies as ``first_write``.
 
     The stream coordinator writes a turn's rows sequentially in call order,
     so within a multi-call turn each call sees its predecessor. Returns {}
@@ -435,6 +478,18 @@ def _derive_cache_observability(
             return {}
 
         cache_read, cache_write = _extract_cache_usage(message_metadata)
+
+        # A call whose usage was never reported (an interrupted turn's cut
+        # generation) carries estimated buckets, so there is nothing here to
+        # classify. Say exactly that instead of deriving a status from the
+        # estimate: `cacheStatus` is where a cache investigation starts, and a
+        # confident-looking `first_write` or `miss_avoidable` on numbers nobody
+        # measured would send it after the wrong call. `wastedUsd` stays zero
+        # for the same reason — it is the metric the AvoidableMiss alarm reads.
+        # The buckets themselves are still the row's best estimate of what was
+        # billed, so the next call's own classification keeps its predecessor.
+        if (message_metadata.model_extra or {}).get("usageEstimated"):
+            return {"cacheStatus": CacheStatus.ESTIMATED.value, "wastedUsd": 0.0}
 
         # Recent cost rows for this session, newest first (GSI_SK = C#<timestamp>
         # sorts chronologically). We need a window rather than just the previous
@@ -484,16 +539,37 @@ def _derive_cache_observability(
         # only a wider read of rows we were already indexing.
         own_prints = getattr(message_metadata, "prefixFingerprints", None) or {}
         own_key = (own_prints.get("toolConfigHash"), own_prints.get("systemPromptHash"))
+        # Stateless callers (api-converse) opt into a stricter predecessor: a
+        # row counts only if its whole message list is one this call's prompt
+        # extends. Their rows share a per-key pseudo-session, where the same
+        # system prompt does not mean the same prefix — a batch client sends
+        # one system prompt with a different message each time, and there is
+        # nothing to read. The runtime never sets this key, so chat rows are
+        # matched exactly as before.
+        extends = own_prints.get("extendsMessagesHashes")
+        stateless = isinstance(extends, list)
         match_row: Optional[Dict[str, Any]] = None
         comparable = all(part is not None for part in own_key)
         if comparable:
             for row in prev_items:  # already newest-first
                 row_prints = row.get("prefixFingerprints") or {}
-                if (row_prints.get("toolConfigHash"), row_prints.get("systemPromptHash")) == own_key:
-                    match_row = row
-                    break
+                if (row_prints.get("toolConfigHash"), row_prints.get("systemPromptHash")) != own_key:
+                    continue
+                if stateless and row_prints.get("messagesHash") not in extends:
+                    continue
+                match_row = row
+                break
 
-        if not comparable:
+        previous_call_exists = prev_row is not None
+        if stateless and comparable and match_row is None:
+            # No earlier request in the window is a prefix of this one, so no
+            # cache entry existed for it to read: this is that prefix's first
+            # write. `miss_ttl_expired` would assert an entry had existed and
+            # lapsed, which for an unrelated stateless request is a guess.
+            previous_call_exists = False
+            classify_gap = None
+            prev_cached_prefix = None
+        elif not comparable:
             # No fingerprints on this call (hook disabled, or a non-Bedrock
             # provider): fall back to the previous call, which is what this
             # derivation did before #753.
@@ -527,7 +603,7 @@ def _derive_cache_observability(
         status = classify_cache_status(
             cache_read_tokens=cache_read,
             cache_write_tokens=cache_write,
-            previous_call_exists=prev_row is not None,
+            previous_call_exists=previous_call_exists,
             gap_seconds=classify_gap,
             previous_cached_prefix_tokens=prev_cached_prefix,
             ttl_seconds=ttl_seconds,
@@ -564,6 +640,19 @@ def _derive_cache_observability(
         prev_agent = (prev_row or {}).get("turnAgentId")
         if prev_row is not None and own_agent != prev_agent:
             result["agentSwitched"] = True
+
+        # The same question for the model. Each model has its own cache, so a
+        # call on a different model than the one before it re-writes the whole
+        # prefix even though the fingerprints match, and the classifier above
+        # (which keys on the fingerprints) books it `miss_avoidable`. Since a
+        # model switch continues the conversation in place, that is a routine,
+        # user-chosen re-write — the dialog quoted its cost before the user
+        # confirmed it. Same discipline as `agentSwitched`: the spend stays in
+        # `wastedUsd`, the flag says it was explained.
+        own_model = getattr(model_info, "model_id", None)
+        prev_model = ((prev_row or {}).get("modelInfo") or {}).get("modelId")
+        if prev_row is not None and own_model and prev_model and own_model != prev_model:
+            result["modelSwitched"] = True
 
         # `cacheGapSeconds` keeps its original meaning — seconds since the
         # previous call — because the anatomy page and its consumers read it as
@@ -639,9 +728,52 @@ def _emit_cache_metrics(
             session_id=session_id,
             cache_status=status,
             agent_switched=bool(cache_observability.get("agentSwitched")),
+            model_switched=bool(cache_observability.get("modelSwitched")),
         )
     except Exception as e:  # noqa: BLE001 - metrics must never break the write path
         logger.debug("Cache EMF emission skipped: %s", e)
+
+
+async def _update_project_rollup_async(
+    user_id: str,
+    timestamp: str,
+    message_metadata: MessageMetadata,
+) -> None:
+    """Add this call to ``PROJECT#{id}/COST#{YYYY-MM}`` when it ran a project's harness.
+
+    The project id rides on the row as the ``projectId`` extra (set per turn by the stream
+    coordinator), exactly like ``turnAgentId``. Rows without one — every call that did not
+    run a project harness — return immediately and touch nothing. Never raises: a missed
+    rollup costs a number on a usage page, and the ``C#`` row it came from is still the
+    source of truth.
+    """
+    project_id = (message_metadata.model_extra or {}).get("projectId")
+    if not project_id:
+        return
+    try:
+        import asyncio
+        from datetime import datetime, timezone
+
+        from apis.shared.projects.repository import ProjectRepository
+
+        try:
+            period = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).strftime("%Y-%m")
+        except (ValueError, AttributeError):
+            period = datetime.now(timezone.utc).strftime("%Y-%m")
+
+        usage = message_metadata.token_usage
+        await asyncio.to_thread(
+            ProjectRepository().add_call_cost,
+            project_id,
+            user_id,
+            period,
+            Decimal(str(_coerce_cost_total(message_metadata.cost))),
+            (usage.input_tokens or 0) if usage else 0,
+            (usage.output_tokens or 0) if usage else 0,
+            timestamp,
+        )
+    except Exception as e:
+        logger.warning("Project cost rollup failed for project %s: %s", project_id, e)
 
 
 async def _update_cost_summary_async(
@@ -964,8 +1096,18 @@ async def _store_session_metadata_cloud(
         # First, check if session exists via GSI to get current SK
         existing_session = await _get_session_by_gsi(session_id, user_id, table)
 
-        # Prepare item for DynamoDB
+        # Prepare item for DynamoDB. A model read back through get_session_metadata
+        # carries the row's recency keys as extras; drop them so the keys written
+        # below are derived from this write alone.
         item = session_metadata.model_dump(by_alias=True, exclude_none=True)
+        # Pin keys are owned by set_session_pinned alone: a full-row write never
+        # writes them, so a stale model can't resurrect a pin the user removed.
+        for gsi_key in (*_RECENCY_KEY_ATTRS, *_PIN_KEY_ATTRS):
+            item.pop(gsi_key, None)
+        # The lexical search attribute follows the title on every full-row write
+        # (the rename route, the first-turn create), never a stale copy of it.
+        if isinstance(item.get('title'), str):
+            item['titleLower'] = normalize_search_text(item['title'])
 
         # Convert floats to Decimal for DynamoDB compatibility
         item = _convert_floats_to_decimal(item)
@@ -985,6 +1127,14 @@ async def _store_session_metadata_cloud(
         item['GSI_SK'] = 'META'
         # Sparse recency keys — added for active, absent for deleted.
         item.update(_recency_gsi_keys(user_id, session_id, last_message_at, is_active))
+        # ProjectSessionIndex (GSI5) rides beside GSI4 for project sessions. A write
+        # without `preferences` leaves the row's map untouched, so the project id then
+        # comes from the stored row.
+        prefs_source = item if 'preferences' in item else (existing_session or {})
+        project_keys = _project_gsi_keys(
+            user_id, session_id, last_message_at, _preferences_project_id(prefs_source), is_active
+        )
+        item.update(project_keys)
 
         if existing_session:
             # Session exists - check if the (now static) SK needs to change, which
@@ -993,17 +1143,23 @@ async def _store_session_metadata_cloud(
 
             if old_sk and old_sk != new_sk:
                 # Legacy row → migrate to the static SK. Deep-merge existing onto the
-                # new item, but drop any stale GSI4 keys so status drives them freshly.
+                # new item, but drop any stale recency keys so state drives them freshly.
                 merged_item = _deep_merge(
                     {k: v for k, v in existing_session.items()
-                     if k not in ['PK', 'SK', 'GSI4_PK', 'GSI4_SK']},
+                     if k not in ('PK', 'SK', *_RECENCY_KEY_ATTRS)},
                     item
                 )
                 merged_item['PK'] = pk
                 merged_item['SK'] = new_sk
+                # Pin keys carry across the move, but a deleted session is never pinned.
                 if not is_active:
-                    merged_item.pop('GSI4_PK', None)
-                    merged_item.pop('GSI4_SK', None)
+                    for pin_key in _PIN_KEY_ATTRS:
+                        merged_item.pop(pin_key, None)
+                # The merge can surface a project id only the old row had.
+                merged_item.update(_project_gsi_keys(
+                    user_id, session_id, last_message_at,
+                    _preferences_project_id(merged_item), is_active,
+                ))
 
                 # Put new SK first, then delete old — if the put fails the original
                 # is untouched. This is the row's one-time migration move.
@@ -1037,10 +1193,12 @@ async def _store_session_metadata_cloud(
                     expression_attribute_values[placeholder_value] = value
 
                 remove_parts = []
-                if not is_active:
-                    for gsi_key in ('GSI4_PK', 'GSI4_SK'):
-                        expression_attribute_names[f"#{gsi_key}"] = gsi_key
-                        remove_parts.append(f"#{gsi_key}")
+                stale_keys = [] if is_active else ['GSI4_PK', 'GSI4_SK', *_PIN_KEY_ATTRS]
+                if not project_keys:
+                    stale_keys += ['GSI5_PK', 'GSI5_SK']
+                for gsi_key in stale_keys:
+                    expression_attribute_names[f"#{gsi_key}"] = gsi_key
+                    remove_parts.append(f"#{gsi_key}")
 
                 update_expression = ""
                 if update_expression_parts:
@@ -1104,13 +1262,79 @@ def _recency_gsi_keys(
     return {}
 
 
+# Sparse index keys derived from a session row's state. Never read back as
+# session fields, and never carried from one write to the next.
+_RECENCY_KEY_ATTRS = ("GSI4_PK", "GSI4_SK", "GSI5_PK", "GSI5_SK")
+
+PROJECT_SESSION_INDEX = "ProjectSessionIndex"
+
+# PinnedSessionIndex (GSI6, issue #711): GSI6_PK = USER#{userId},
+# GSI6_SK = {pinnedAt}#{sessionId}. Present only while pinned. Unlike the recency
+# keys they are not derived from row state on each write: set_session_pinned is
+# their only writer, row moves carry them, and soft-delete removes them.
+PINNED_SESSION_INDEX = "PinnedSessionIndex"
+_PIN_KEY_ATTRS = ("GSI6_PK", "GSI6_SK")
+
+
+def _project_gsi_pk(project_id: str, user_id: str) -> str:
+    return f"PROJECT#{project_id}#USER#{user_id}"
+
+
+def _project_gsi_keys(
+    user_id: str,
+    session_id: str,
+    last_message_at: str,
+    project_id: Optional[str],
+    is_active: bool,
+) -> Dict[str, str]:
+    """ProjectSessionIndex (GSI5) keys: one member's tasks in one project, newest first.
+
+    The same recency sort key as GSI4, and present exactly when GSI4 is, but only
+    for a session bound to a project (``preferences.projectId``).
+    """
+    if is_active and project_id:
+        return {
+            "GSI5_PK": _project_gsi_pk(project_id, user_id),
+            "GSI5_SK": f"{last_message_at}#{session_id}",
+        }
+    return {}
+
+
+def _preferences_project_id(row: Dict[str, Any]) -> Optional[str]:
+    """``preferences.projectId`` of a raw row or dumped model, if any."""
+    prefs = row.get("preferences")
+    if isinstance(prefs, dict):
+        return prefs.get("projectId") or None
+    return None
+
+
+def session_is_incognito(row: Optional[Dict[str, Any]], requested: bool = False) -> bool:
+    """Whether a conversation is incognito (#1738): reads memory, never writes it.
+
+    An existing row decides, whatever the request says: the flag is fixed when
+    the row is created, because facts extracted from earlier turns can't be
+    traced back to the conversation and removed. With no row yet (the first
+    turn), the request's choice applies.
+    """
+    if row is None:
+        return bool(requested)
+    prefs = row.get("preferences")
+    return isinstance(prefs, dict) and prefs.get("incognito") is True
+
+
 async def ensure_session_metadata_exists(
-    session_id: str, user_id: str, snapshot: Optional["SessionMetaSnapshot"] = None
+    session_id: str,
+    user_id: str,
+    snapshot: Optional["SessionMetaSnapshot"] = None,
+    incognito: bool = False,
 ) -> bool:
     """Idempotently create a session metadata row if it doesn't exist yet.
 
     Returns ``True`` when a new row was created (caller can use this as the
     "first turn" signal, e.g. to fire title generation).
+
+    ``incognito`` is stamped on the new row's preferences. It has no effect on
+    a row that already exists: a conversation can't become incognito later.
 
     Existence is gated on a ``SessionLookupIndex`` GSI lookup rather than a
     conditional ``put_item``: the main-table SK encodes ``lastMessageAt``
@@ -1190,6 +1414,8 @@ async def ensure_session_metadata_exists(
             "starred": False,
             "tags": [],
         }
+        if incognito:
+            item["preferences"] = {"incognito": True}
 
         # The SK is now deterministic (S#{session_id}), so attribute_not_exists is a
         # real idempotency guard (issue #175): two concurrent first turns compute the
@@ -1212,13 +1438,27 @@ async def ensure_session_metadata_exists(
         return False
 
 
-async def update_session_title(session_id: str, user_id: str, title: str) -> None:
-    """Update only the title attribute on the session row.
+async def update_session_title(
+    session_id: str, user_id: str, title: str, first_prompt: Optional[str] = None
+) -> None:
+    """Update only the title attributes on the session row.
+
+    Writes ``title`` and its search form ``titleLower`` together, and, when the
+    caller has the conversation's opening prompt, ``firstPrompt`` (first 300
+    normalized characters, set only if absent so a later title can never
+    replace it). Both feed the lexical leg of conversation search
+    (``docs/specs/conversation-search.md`` §5) and ride on this one write, so a
+    title costs no extra round trip.
 
     Uses a targeted ``UpdateExpression`` so it can run concurrently with
     ``store_session_metadata`` (which does a full-row merge) without racing
-    on other fields like ``messageCount`` or ``lastMessageAt``. Looks up the
-    current SK via the GSI because the SK contains a timestamp.
+    on other fields like ``messageCount`` or ``lastMessageAt``.
+
+    One round trip in the common case: every row is born with the static
+    ``S#{session_id}`` SK (issue #175), and this runs on a session's first
+    turn, so the key is known without a lookup. A row still on a legacy
+    timestamped SK fails the ``attribute_exists`` guard and falls back to
+    resolving the SK through the GSI.
 
     No-op when the session row doesn't exist (preview sessions, sessions
     deleted mid-turn).
@@ -1231,8 +1471,23 @@ async def update_session_title(session_id: str, user_id: str, title: str) -> Non
         raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
 
     try:
+        from botocore.exceptions import ClientError
 
         table = get_dynamodb_table(sessions_metadata_table)
+        update_expression, values = _title_update(title, first_prompt)
+
+        try:
+            table.update_item(
+                Key={"PK": f"USER#{user_id}", "SK": _static_session_sk(session_id)},
+                UpdateExpression=update_expression,
+                ConditionExpression="attribute_exists(PK)",
+                ExpressionAttributeValues=values,
+            )
+            logger.info(f"💾 Updated title for session {session_id}")
+            return
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -1245,12 +1500,23 @@ async def update_session_title(session_id: str, user_id: str, title: str) -> Non
 
         table.update_item(
             Key={"PK": f"USER#{user_id}", "SK": sk},
-            UpdateExpression="SET title = :t",
-            ExpressionAttributeValues={":t": title},
+            UpdateExpression=update_expression,
+            ExpressionAttributeValues=values,
         )
         logger.info(f"💾 Updated title for session {session_id}")
     except Exception as e:
         logger.error(f"update_session_title failed: {e}", exc_info=True)
+
+
+def _title_update(title: str, first_prompt: Optional[str]) -> Tuple[str, Dict[str, Any]]:
+    """The ``UpdateExpression`` for a title write, with its search attributes."""
+    expression = "SET title = :t, titleLower = :tl"
+    values: Dict[str, Any] = {":t": title, ":tl": normalize_search_text(title)}
+    prompt = first_prompt_value(first_prompt)
+    if prompt:
+        expression += ", firstPrompt = if_not_exists(firstPrompt, :fp)"
+        values[":fp"] = prompt
+    return expression, values
 
 
 async def set_session_unread(session_id: str, user_id: str, unread: bool) -> None:
@@ -1315,6 +1581,91 @@ async def mark_session_unread(session_id: str, user_id: str) -> None:
     inside ``set_session_unread`` via the per-user GSI lookup.
     """
     await set_session_unread(session_id, user_id, True)
+
+
+PinResult = Literal["ok", "not_found", "project"]
+
+
+async def set_session_pinned(session_id: str, user_id: str, pinned: bool) -> PinResult:
+    """Pin or unpin one of the user's conversations (issue #711).
+
+    Pinning writes the sparse PinnedSessionIndex keys with the pin time as the
+    sort key (most recently pinned lists first); unpinning removes them. A
+    targeted update on the current SK, so it never races the full-row writers.
+
+    Returns ``"not_found"`` for a session the user doesn't own (or that is
+    deleted) and ``"project"`` when pinning a project task: those already sit
+    under their project in the sidebar, so they can't be pinned. Unpinning is
+    always allowed and idempotent.
+    """
+    from datetime import datetime, timezone
+
+    sessions_metadata_table = os.environ.get("DYNAMODB_SESSIONS_METADATA_TABLE_NAME")
+    if not sessions_metadata_table:
+        raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
+    table = get_dynamodb_table(sessions_metadata_table)
+
+    existing = await _get_session_by_gsi(session_id, user_id, table)
+    if not existing or not existing.get("SK") or existing.get("deleted") or existing.get("status") == "deleted":
+        return "not_found"
+    key = {"PK": f"USER#{user_id}", "SK": existing["SK"]}
+
+    if not pinned:
+        table.update_item(Key=key, UpdateExpression="REMOVE GSI6_PK, GSI6_SK")
+        return "ok"
+
+    if _preferences_project_id(existing):
+        return "project"
+    pinned_at = datetime.now(timezone.utc).isoformat()
+    table.update_item(
+        Key=key,
+        UpdateExpression="SET GSI6_PK = :pk, GSI6_SK = :sk",
+        ExpressionAttributeValues={":pk": f"USER#{user_id}", ":sk": f"{pinned_at}#{session_id}"},
+    )
+    return "ok"
+
+
+async def list_pinned_sessions(user_id: str) -> List[Tuple[SessionMetadata, str]]:
+    """The user's pinned conversations as ``(session, pinnedAt)``, most recently pinned first.
+
+    Reads PinnedSessionIndex, which holds only pinned rows, so this is one small
+    query regardless of how many conversations the user has. Empty while the
+    index is absent or still building.
+    """
+    from boto3.dynamodb.conditions import Key
+    from botocore.exceptions import ClientError
+
+    from apis.shared.dynamo_errors import is_missing_index_error, log_missing_index
+
+    table_name = os.environ.get("DYNAMODB_SESSIONS_METADATA_TABLE_NAME")
+    if not table_name:
+        raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
+    table = get_dynamodb_table(table_name)
+
+    params: Dict[str, Any] = {
+        "IndexName": PINNED_SESSION_INDEX,
+        "KeyConditionExpression": Key("GSI6_PK").eq(f"USER#{user_id}"),
+        "ScanIndexForward": False,
+    }
+    pinned: List[Tuple[SessionMetadata, str]] = []
+    try:
+        while True:
+            response = table.query(**params)
+            for item in response["Items"]:
+                pinned_at = str(item.get("GSI6_SK", "")).rsplit("#", 1)[0]
+                metadata = _item_to_session_metadata(item)
+                if metadata is None or metadata.deleted:
+                    continue
+                pinned.append((metadata, pinned_at))
+            lek = response.get("LastEvaluatedKey")
+            if not lek:
+                return pinned
+            params["ExclusiveStartKey"] = lek
+    except ClientError as e:
+        if is_missing_index_error(e):
+            log_missing_index(PINNED_SESSION_INDEX, "pinned conversations")
+            return []
+        raise
 
 
 async def update_session_activity(
@@ -1398,25 +1749,31 @@ async def update_session_activity(
         pk = f"USER#{user_id}"
         target_sk = _static_session_sk(session_id)
         gsi4 = _recency_gsi_keys(user_id, session_id, now, is_active=True)
+        gsi5 = _project_gsi_keys(
+            user_id, session_id, now, merged_prefs.get("projectId"), is_active=True
+        )
 
         if old_sk == target_sk:
             # Already migrated (issue #175): pure in-place update — lastMessageAt is a
             # plain attribute and recency lives in GSI4_SK, so SET-ting GSI4_SK just
             # re-positions the index entry. No row move → no SK rotation → the
             # ghost-row race is structurally gone.
+            set_clause = "SET lastMessageAt = :t, preferences = :p, GSI4_PK = :gp, GSI4_SK = :gs"
+            values = {
+                ":one": 1,
+                ":t": now,
+                ":p": _convert_floats_to_decimal(merged_prefs),
+                ":gp": gsi4["GSI4_PK"],
+                ":gs": gsi4["GSI4_SK"],
+            }
+            if gsi5:
+                set_clause += ", GSI5_PK = :pp, GSI5_SK = :ps"
+                values[":pp"] = gsi5["GSI5_PK"]
+                values[":ps"] = gsi5["GSI5_SK"]
             table.update_item(
                 Key={"PK": pk, "SK": target_sk},
-                UpdateExpression=(
-                    "ADD messageCount :one "
-                    "SET lastMessageAt = :t, preferences = :p, GSI4_PK = :gp, GSI4_SK = :gs"
-                ),
-                ExpressionAttributeValues={
-                    ":one": 1,
-                    ":t": now,
-                    ":p": _convert_floats_to_decimal(merged_prefs),
-                    ":gp": gsi4["GSI4_PK"],
-                    ":gs": gsi4["GSI4_SK"],
-                },
+                UpdateExpression="ADD messageCount :one " + set_clause,
+                ExpressionAttributeValues=values,
             )
             logger.info("Updated session activity for %s (in-place, static SK)", session_id)
             return True
@@ -1432,12 +1789,12 @@ async def update_session_activity(
             )
             return True
         carried = {
-            k: v for k, v in fresh.items() if k not in ("PK", "SK", "GSI4_PK", "GSI4_SK")
+            k: v for k, v in fresh.items() if k not in ("PK", "SK", *_RECENCY_KEY_ATTRS)
         }
         carried["lastMessageAt"] = now
         carried["messageCount"] = int(fresh.get("messageCount", 0) or 0) + 1
         carried["preferences"] = _convert_floats_to_decimal(merged_prefs)
-        new_item = {"PK": pk, "SK": target_sk, **carried, **gsi4}
+        new_item = {"PK": pk, "SK": target_sk, **carried, **gsi4, **gsi5}
         table.put_item(Item=new_item)
         table.delete_item(Key={"PK": pk, "SK": old_sk})
 
@@ -1646,10 +2003,17 @@ async def session_owned_by_other_user(session_id: str, user_id: str) -> bool:
     the resulting duplicate META row made the original owner's session resolve
     non-deterministically afterwards (see the item-scan in `_get_session_by_gsi`).
 
-    NOT a data-disclosure fix: conversation content lives in AgentCore Memory
-    keyed by actor id, so the second user always saw an empty conversation,
-    never the owner's messages. What leaked was the id, and what broke was the
-    owner's session record.
+    It is ALSO a data-disclosure guard. An earlier version of this note said
+    the second user always saw an empty thread because Memory is keyed by
+    actor id. That was wrong. Runtime affinity then hashed the session id
+    alone, so both users' turns reached the same container, and while the owner's agent
+    was still cached there, ``_adopt_session_conversation`` matched on session
+    id alone and aliased its live message list onto the second user's agent.
+    On dev, 2026-08-31, a probe user read back the owner's content that way.
+    The prod fork described above came 34 minutes after the owner's last turn,
+    after the container had idled out, and the second user's call carried no
+    history (``prefixFingerprints.messageCount == 1``). Runtime affinity now
+    pins per ``(user, session)`` and adoption matches on the same pair.
 
     Returns True only when at least one META row exists AND none of them belong
     to `user_id` — so a session the caller legitimately owns is never blocked,
@@ -2096,6 +2460,77 @@ async def _backfill_session_aggregates(
         logger.warning("backfill_session_aggregates failed for %s: %s", session_id, e)
 
 
+def set_session_spawned_from(session_id: str, user_id: str, source_session_id: str, handoff_id: str) -> bool:
+    """Record on a handoff's target conversation where it came from (handoffs spec §4.2).
+
+    ``spawnedFrom: {sessionId, handoffId}`` on the target's ``META`` row. It is how every later
+    turn of the target finds the source's ``HANDOFF#`` row to keep its status current, from the
+    B1 snapshot, with no extra read. A field-level ``SET`` on the static SK, so the full-row
+    writes elsewhere (which only ``SET`` their own fields) never remove it. Synchronous: callers
+    run it in a worker thread, after the first token. Returns False when the row is missing.
+    """
+    from botocore.exceptions import ClientError
+
+    table_name = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
+    if not table_name:
+        return False
+    try:
+        get_dynamodb_table(table_name).update_item(
+            Key={"PK": f"USER#{user_id}", "SK": _static_session_sk(session_id)},
+            UpdateExpression="SET spawnedFrom = :sf",
+            ConditionExpression="attribute_exists(PK)",
+            ExpressionAttributeValues={":sf": {"sessionId": source_session_id, "handoffId": handoff_id}},
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def settle_session_spawned_from(session_id: str, user_id: str) -> None:
+    """Mark a target's ``spawnedFrom`` settled: its handoff is done and stops following its turns.
+
+    Without it, every later turn of a finished handoff's target would make a status write that the
+    row refuses (``done`` is frozen). The link itself stays; Phase 2 reads it.
+    """
+    from botocore.exceptions import ClientError
+
+    table_name = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
+    if not table_name:
+        return
+    try:
+        get_dynamodb_table(table_name).update_item(
+            Key={"PK": f"USER#{user_id}", "SK": _static_session_sk(session_id)},
+            UpdateExpression="SET spawnedFrom.settled = :t",
+            ConditionExpression="attribute_exists(spawnedFrom)",
+            ExpressionAttributeValues={":t": True},
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+
+
+async def get_session_compaction(session_id: str, user_id: str) -> Tuple[int, Optional[str]]:
+    """The applied compaction checkpoint and its summary for a session, or ``(0, None)``.
+
+    ``SessionMetadata`` deliberately carries only ``totalSummarizedTurns`` from
+    the nested ``compaction`` map. A handoff's excerpt needs the applied
+    checkpoint (an absolute message index) and the summary that stands in for
+    the messages before it, which is what the conversation's own model sees.
+    A pending, not yet applied, cut is ignored for the same reason.
+    """
+    table_name = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
+    if not table_name:
+        return 0, None
+    item = await _get_session_by_gsi(session_id, user_id, get_dynamodb_table(table_name))
+    compaction = (item or {}).get("compaction")
+    if not isinstance(compaction, dict):
+        return 0, None
+    summary = compaction.get("summary")
+    return int(compaction.get("checkpoint") or 0), summary if isinstance(summary, str) else None
+
+
 async def get_session_metadata(session_id: str, user_id: str) -> Optional[SessionMetadata]:
     """
     Retrieve session metadata
@@ -2361,7 +2796,7 @@ async def _get_session_metadata_cloud(
             )
 
         # Remove DynamoDB keys before validation
-        for key in ['PK', 'SK', 'GSI_PK', 'GSI_SK']:
+        for key in ('PK', 'SK', 'GSI_PK', 'GSI_SK', *_RECENCY_KEY_ATTRS, *_PIN_KEY_ATTRS):
             item.pop(key, None)
 
         # Dedupe pending interrupts at the storage boundary so list_append
@@ -2481,7 +2916,7 @@ def _item_to_session_metadata(item: Dict[str, Any]) -> Optional[SessionMetadata]
     """
     try:
         item = _convert_decimal_to_float(item)
-        for key in ('PK', 'SK', 'GSI_PK', 'GSI_SK', 'GSI4_PK', 'GSI4_SK'):
+        for key in ('PK', 'SK', 'GSI_PK', 'GSI_SK', *_RECENCY_KEY_ATTRS, *_PIN_KEY_ATTRS):
             item.pop(key, None)
 
         # Skip preview sessions - they should not appear in user's session list
@@ -2727,6 +3162,54 @@ async def _list_user_sessions_cloud(
                 detail=str(e)
             )
         )
+
+
+async def list_project_sessions(
+    user_id: str,
+    project_id: str,
+    limit: int = 50,
+    next_token: Optional[str] = None,
+) -> Tuple[list[SessionMetadata], Optional[str]]:
+    """One member's active sessions in one project, newest first (ProjectSessionIndex).
+
+    Only the caller's own sessions: the index partition is per member, so a
+    project's tasks are never listed across people. Uses the same value cursor as
+    ``list_user_sessions``. While the index is still building, or absent, the list
+    is empty rather than an error (``dynamo_errors``).
+    """
+    from boto3.dynamodb.conditions import Key
+    from botocore.exceptions import ClientError
+
+    from apis.shared.dynamo_errors import is_missing_index_error, log_missing_index
+
+    table_name = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
+    if not table_name:
+        raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
+    table = get_dynamodb_table(table_name)
+
+    condition = Key('GSI5_PK').eq(_project_gsi_pk(project_id, user_id))
+    cursor = _decode_list_cursor(next_token)
+    if cursor:
+        la, sid = cursor
+        condition = condition & Key('GSI5_SK').lt(f'{la}#{sid}')
+    want = limit + 1
+    params: Dict[str, Any] = {
+        'IndexName': PROJECT_SESSION_INDEX,
+        'KeyConditionExpression': condition,
+        'ScanIndexForward': False,
+        'Limit': want,
+    }
+    try:
+        sessions = _collect_valid_sessions(table, params, want)
+    except ClientError as e:
+        if is_missing_index_error(e):
+            log_missing_index(PROJECT_SESSION_INDEX, "a project's tasks")
+            return [], None
+        raise
+
+    has_more = len(sessions) > limit
+    page = sessions[:limit]
+    return page, (_encode_list_cursor(page[-1]) if has_more and page else None)
 
 
 def _deep_merge(base: dict, updates: dict) -> dict:

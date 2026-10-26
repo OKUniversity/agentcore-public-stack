@@ -25,11 +25,14 @@ Requirements: 7.1-7.8, 8.1-8.8, 9.1-9.6, 11.1-11.5, 20.7, 24.2, 24.3, 24.11
 """
 
 import ast
+import logging
+import os
 import subprocess
 import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from unittest.mock import MagicMock
 
 import boto3
 import pytest
@@ -41,6 +44,7 @@ from apis.shared.kb_backend import provisioning as p
 from apis.shared.kb_backend import records as r
 from apis.shared.kb_backend.protocol import DEFAULT_TOP_K, Chunk, DocumentSource
 from apis.shared.kb_backend.protocol import KnowledgeBaseBackend
+from tests.shared.docx_fixtures import build_docx, deleted, inserted, paragraph, run
 
 REGION = "us-east-1"
 TABLE = "test-managed-kb"
@@ -1198,6 +1202,36 @@ class TestManagedSearch:
 
         assert runtime.calls[0]["knowledgeBaseId"] == AWS_KB_ID
 
+    @pytest.mark.asyncio
+    async def test_a_record_the_caller_already_read_is_not_read_again(self):
+        """The facade read this row to choose the backend; a second read of the
+        same row cost ~50ms on a turn's critical path."""
+        looked_up: List[str] = []
+
+        def _locate(kb_ref: str) -> Tuple[str, str]:
+            looked_up.append(kb_ref)
+            return "KB-FROM-LOCATOR", AWS_DS_ID
+
+        runtime = FakeBedrockAgentRuntime([])
+        backend = mb.ManagedKbBackend(runtime_client=runtime, locator=_locate)
+
+        await backend.search(APP_KB_ID, "query", record={"awsKbId": "KB-FROM-RECORD"})
+
+        assert runtime.calls[0]["knowledgeBaseId"] == "KB-FROM-RECORD"
+        assert looked_up == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("record", [{}, {"awsKbId": None}, {"retrievalEngine": "managed"}])
+    async def test_a_record_without_an_aws_kb_id_falls_back_to_the_lookup(self, record):
+        """A record that cannot answer is not trusted to: the backend resolves the
+        id itself, and an unprovisioned knowledge base still raises from there."""
+        runtime = FakeBedrockAgentRuntime([])
+        backend = mb.ManagedKbBackend(runtime_client=runtime, locator=_locator("KB-RESOLVED"))
+
+        await backend.search(APP_KB_ID, "query", record=record)
+
+        assert runtime.calls[0]["knowledgeBaseId"] == "KB-RESOLVED"
+
 
 # ===========================================================================
 # 8.4 — direct ingestion and deletion
@@ -1459,6 +1493,203 @@ class TestIngestion:
             await backend.ingest(APP_KB_ID, DocumentSource("doc-a", "a.pdf", chunks=["x"]))
 
 
+def _ingest_detail(document_id: str, status: str, reason: Optional[str] = None) -> Dict[str, Any]:
+    """One ``documentDetails`` entry, in the shape the service model declares."""
+    detail: Dict[str, Any] = {
+        "knowledgeBaseId": AWS_KB_ID,
+        "dataSourceId": AWS_DS_ID,
+        "status": status,
+        "identifier": {"dataSourceType": "CUSTOM", "custom": {"id": document_id}},
+    }
+    if reason:
+        detail["statusReason"] = reason
+    return detail
+
+
+class TestIngestRefusalsSurface:
+    """``IngestKnowledgeBaseDocuments`` succeeds at the HTTP level even when it
+    refuses a document; the refusal is only in ``documentDetails``. Dropping the
+    response is what let a document whose S3 object never existed look submitted
+    in prod, and dead-letter one poll later with no reason attached."""
+
+    @staticmethod
+    def _agent_answering(*details: Dict[str, Any]) -> FakeBedrockAgent:
+        agent = FakeBedrockAgent()
+
+        def _ingest(**kwargs):
+            agent.ingest_calls.append(kwargs)
+            return {"documentDetails": list(details)}
+
+        agent.ingest_knowledge_base_documents = _ingest
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_a_refused_single_document_raises_with_its_reason(self):
+        agent = self._agent_answering(
+            _ingest_detail("doc-a", "FAILED", "The S3 object does not exist")
+        )
+        backend = mb.ManagedKbBackend(agent_client=agent, locator=_locator())
+
+        with pytest.raises(mb.ManagedKbDocumentRejected, match="does not exist") as caught:
+            await backend.ingest(APP_KB_ID, DocumentSource("doc-a", "a.pdf", chunks=["x"]))
+
+        assert caught.value.rejections == {
+            "doc-a": ("FAILED", "The S3 object does not exist")
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["FAILED", "METADATA_UPDATE_FAILED", "IGNORED"])
+    async def test_every_refusal_status_is_surfaced(self, status):
+        agent = self._agent_answering(_ingest_detail("doc-a", status))
+        backend = mb.ManagedKbBackend(agent_client=agent, locator=_locator())
+
+        with pytest.raises(mb.ManagedKbDocumentRejected):
+            await backend.ingest(APP_KB_ID, DocumentSource("doc-a", "a.pdf", chunks=["x"]))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["STARTING", "PENDING", "IN_PROGRESS", "INDEXED"])
+    async def test_an_accepted_document_does_not_raise(self, status):
+        agent = self._agent_answering(_ingest_detail("doc-a", status))
+        backend = mb.ManagedKbBackend(agent_client=agent, locator=_locator())
+
+        await backend.ingest(APP_KB_ID, DocumentSource("doc-a", "a.pdf", chunks=["x"]))
+
+    @pytest.mark.asyncio
+    async def test_a_batch_returns_its_refusals_without_failing_the_rest(self, caplog):
+        """A batch caller (migration worker, conversation index) must not lose its
+        accepted documents to one refusal; it gets the refusals back, logged."""
+        agent = self._agent_answering(
+            _ingest_detail("doc-a", "STARTING"),
+            _ingest_detail("doc-b", "IGNORED", "unsupported file type"),
+        )
+        backend = mb.ManagedKbBackend(agent_client=agent, locator=_locator())
+
+        with caplog.at_level(logging.ERROR, logger=mb.logger.name):
+            rejected = await backend.ingest_documents(
+                APP_KB_ID,
+                [
+                    DocumentSource("doc-a", "a.pdf", chunks=["x"]),
+                    DocumentSource("doc-b", "b.bin", chunks=["x"]),
+                ],
+            )
+
+        assert rejected == {"doc-b": ("IGNORED", "unsupported file type")}
+        assert "doc-b" in caplog.text and "unsupported file type" in caplog.text
+
+    def test_a_response_that_is_not_a_mapping_is_ignored(self):
+        assert mb.ingest_rejections([None, MagicMock(), {"documentDetails": None}]) == {}
+
+
+class TestTrackedChangesIngestion:
+    """A .docx with tracked changes is sent as inline annotated text (finding B9).
+
+    Bedrock's parser flattens ``w:ins``/``w:del`` into one run of text, and given an
+    annotated ``.docx`` instead it rewrote what was inside the markers. Text is
+    indexed as given. Everything else must still ingest from S3 exactly as before.
+    """
+
+    KEY = "assistants/ast/documents/doc-r/redline.docx"
+
+    def _reader(self, payload, calls=None):
+        def _read(bucket, key, max_bytes):
+            if calls is not None:
+                calls.append((bucket, key, max_bytes))
+            if isinstance(payload, Exception):
+                raise payload
+            return payload
+
+        return _read
+
+    async def _ingest(self, source, reader):
+        agent = FakeBedrockAgent()
+        backend = mb.ManagedKbBackend(
+            agent_client=agent, locator=_locator(), bucket="docs-bucket", object_reader=reader
+        )
+        await backend.ingest(APP_KB_ID, source)
+        return agent.ingest_calls[0]["documents"][0]
+
+    @pytest.mark.asyncio
+    async def test_a_redline_is_sent_as_annotated_inline_text(self):
+        redline = build_docx(paragraph(run("Pay "), deleted("in 30 days"), inserted("in 90 days")))
+        calls: List[tuple] = []
+
+        document = await self._ingest(
+            DocumentSource("doc-r", "Redline.DOCX", s3_key=self.KEY), self._reader(redline, calls)
+        )
+
+        assert calls == [("docs-bucket", self.KEY, mb.MAX_ANNOTATE_SOURCE_BYTES)]
+        custom = document["content"]["custom"]
+        assert custom["sourceType"] == "IN_LINE"
+        assert "s3Location" not in custom
+        content = custom["inlineContent"]
+        assert content == {"type": "TEXT", "textContent": {"data": content["textContent"]["data"]}}
+        text = content["textContent"]["data"]
+        assert text.startswith("Note: this document contains tracked changes by Sponsor Counsel.")
+        assert text.endswith("\n\nPay [deleted: in 30 days][inserted: in 90 days]")
+        # Identity and metadata are unchanged by the switch of source.
+        assert custom["customDocumentIdentifier"] == {"id": "doc-r"}
+        keys = {a["key"] for a in document["metadata"]["inlineAttributes"]}
+        assert {"document_id", "filename"} <= keys
+
+    @pytest.mark.asyncio
+    async def test_a_docx_without_revisions_ingests_from_s3_exactly_as_before(self):
+        source = DocumentSource("doc-r", "plain.docx", s3_key=self.KEY)
+
+        document = await self._ingest(source, self._reader(build_docx(paragraph(run("x")))))
+
+        assert document == mb.document_payload(source, bucket="docs-bucket")
+
+    @pytest.mark.asyncio
+    async def test_other_formats_are_never_read(self):
+        calls: List[tuple] = []
+        source = DocumentSource("doc-p", "a.pdf", s3_key="assistants/ast/documents/doc-p/a.pdf")
+
+        document = await self._ingest(source, self._reader(b"%PDF", calls))
+
+        assert calls == []
+        assert document == mb.document_payload(source, bucket="docs-bucket")
+
+    @pytest.mark.asyncio
+    async def test_an_object_too_large_to_send_inline_falls_back_to_s3(self):
+        source = DocumentSource("doc-r", "big.docx", s3_key=self.KEY)
+
+        document = await self._ingest(source, self._reader(None))
+
+        assert document["content"]["custom"]["sourceType"] == "S3_LOCATION"
+
+    @pytest.mark.asyncio
+    async def test_annotated_text_over_the_limit_falls_back_to_s3(self, monkeypatch):
+        redline = build_docx(paragraph(deleted("a"), inserted("b")))
+        monkeypatch.setattr(mb, "MAX_INLINE_TEXT_CHARS", 10)
+
+        document = await self._ingest(
+            DocumentSource("doc-r", "r.docx", s3_key=self.KEY), self._reader(redline)
+        )
+
+        assert document["content"]["custom"]["sourceType"] == "S3_LOCATION"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_still_ingests_the_document(self):
+        """Losing the markers is the old behaviour; losing the document is not."""
+        document = await self._ingest(
+            DocumentSource("doc-r", "r.docx", s3_key=self.KEY),
+            self._reader(RuntimeError("AccessDenied")),
+        )
+
+        assert document["content"]["custom"]["sourceType"] == "S3_LOCATION"
+
+    @pytest.mark.asyncio
+    async def test_a_chunked_docx_source_is_not_read(self):
+        calls: List[tuple] = []
+
+        document = await self._ingest(
+            DocumentSource("doc-r", "r.docx", chunks=["x"]), self._reader(b"", calls)
+        )
+
+        assert calls == []
+        assert document["content"]["custom"]["inlineContent"]["type"] == "TEXT"
+
+
 class TestDeletion:
     @pytest.mark.asyncio
     async def test_delete_is_by_platform_document_id(self):
@@ -1545,7 +1776,13 @@ class TestImportWeight:
             capture_output=True,
             text=True,
             cwd=str(backend_root),
-            env={"PYTHONPATH": str(backend_root / "src"), "PATH": "/usr/bin:/bin"},
+            env={
+                "PYTHONPATH": str(backend_root / "src"),
+                "PATH": "/usr/bin:/bin",
+                # Windows needs SYSTEMROOT to initialise sockets (asyncio
+                # import fails with WinError 10106). Absent on Linux/macOS.
+                **({"SYSTEMROOT": os.environ["SYSTEMROOT"]} if "SYSTEMROOT" in os.environ else {}),
+            },
         )
         assert result.returncode == 0, result.stderr
         return [name for name in result.stdout.strip().split(",") if name]
@@ -1642,8 +1879,71 @@ def test_the_module_constants_match_the_verified_api_limits():
     assert p.CLIENT_TOKEN_MAX_LENGTH == 256
     assert mb.MAX_DOCUMENTS_PER_CALL == 10
     assert mb.MAX_CONCURRENT_DOCUMENT_OPERATIONS == 10
+    # TextContentDoc.data: 5,242,880 characters (bedrock-agent model).
+    assert mb.MAX_INLINE_TEXT_CHARS == 5_242_880
     assert p.DATA_DELETION_POLICY == "RETAIN"
     assert p.IMAGE_EXTRACTION_STATUS == "ENABLED"
     assert p.EMBEDDING_MODEL_ID == "amazon.titan-embed-text-v2:0"
     assert p.EMBEDDING_DIMENSIONS == 1024
     assert mb.RERANKING_MODEL_TYPE == "MANAGED"
+
+
+# ===========================================================================
+# Document status, for migration verify
+# ===========================================================================
+
+
+class _StatusAgent:
+    """``get_knowledge_base_documents`` with Bedrock's per-document answers."""
+
+    def __init__(self, known: Dict[str, Tuple[str, Optional[str]]]):
+        self.known = known
+        self.calls: List[List[str]] = []
+
+    def get_knowledge_base_documents(self, *, knowledgeBaseId, dataSourceId, documentIdentifiers):
+        assert (knowledgeBaseId, dataSourceId) == (AWS_KB_ID, AWS_DS_ID)
+        ids = [identifier["custom"]["id"] for identifier in documentIdentifiers]
+        self.calls.append(ids)
+        return {
+            "documentDetails": [
+                {
+                    "identifier": {"dataSourceType": "CUSTOM", "custom": {"id": i}},
+                    "status": self.known.get(i, ("NOT_FOUND", None))[0],
+                    "statusReason": self.known.get(i, ("NOT_FOUND", None))[1],
+                }
+                for i in ids
+            ]
+        }
+
+
+class TestDocumentStatuses:
+    @pytest.mark.asyncio
+    async def test_statuses_come_back_per_document_in_batches_of_ten(self):
+        agent = _StatusAgent({"d0": ("INDEXED", None), "d11": ("FAILED", "parse error")})
+        backend = mb.ManagedKbBackend(agent_client=agent, locator=_locator())
+
+        statuses = await backend.document_statuses(APP_KB_ID, [f"d{i}" for i in range(12)])
+
+        assert [len(call) for call in agent.calls] == [10, 2], "the API takes at most 10 identifiers"
+        assert statuses["d0"] == ("INDEXED", None)
+        assert statuses["d11"] == ("FAILED", "parse error")
+        assert statuses["d5"] == ("NOT_FOUND", None)
+
+    @pytest.mark.asyncio
+    async def test_a_document_bedrock_leaves_out_reads_as_not_found(self):
+        class _Silent(_StatusAgent):
+            def get_knowledge_base_documents(self, **kwargs):
+                return {"documentDetails": []}
+
+        backend = mb.ManagedKbBackend(agent_client=_Silent({}), locator=_locator())
+        assert await backend.document_statuses(APP_KB_ID, ["d1"]) == {"d1": ("NOT_FOUND", None)}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_call_raises_rather_than_reading_as_not_found(self):
+        class _Throttled(_StatusAgent):
+            def get_knowledge_base_documents(self, **kwargs):
+                raise RuntimeError("ThrottlingException")
+
+        backend = mb.ManagedKbBackend(agent_client=_Throttled({}), locator=_locator())
+        with pytest.raises(RuntimeError):
+            await backend.document_statuses(APP_KB_ID, ["d1"])

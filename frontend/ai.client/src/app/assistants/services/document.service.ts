@@ -13,6 +13,7 @@ import {
   STALE_DOCUMENT_THRESHOLD_MS,
 } from '../models/document.model';
 import { parseIso } from '../../utils/date';
+import { KnowledgeTarget, knowledgePaths } from '../models/knowledge-target.model';
 
 /**
  * Error class for document upload operations
@@ -50,10 +51,17 @@ export class DocumentService {
    *
    * @param assistantId - The assistant identifier
    * @param file - The file to upload
+   * @param options - `suppressErrorToast` skips the global error toast, for a
+   *   caller that handles the failure itself (the replace flow turns a 413 into
+   *   a confirmation dialog, so a toast first would contradict it)
    * @returns Promise resolving to upload URL response
    * @throws DocumentUploadError on validation or API failure
    */
-  async requestUploadUrl(assistantId: string, file: File): Promise<UploadUrlResponse> {
+  async requestUploadUrl(
+    assistantId: string,
+    file: File,
+    options?: { suppressErrorToast?: boolean },
+  ): Promise<UploadUrlResponse> {
     const request: CreateDocumentRequest = {
       filename: file.name,
       contentType: file.type || 'application/octet-stream',
@@ -65,6 +73,11 @@ export class DocumentService {
         this.http.post<UploadUrlResponse>(
           `${this.baseUrl()}/${assistantId}/documents/upload-url`,
           request,
+          {
+            context: options?.suppressErrorToast
+              ? new HttpContext().set(SUPPRESS_ERROR_TOAST, true)
+              : undefined,
+          },
         ),
       );
     } catch (err) {
@@ -260,13 +273,13 @@ export class DocumentService {
    * they need to see as an error.
    */
   async getExtractedChunks(
-    assistantId: string,
+    target: KnowledgeTarget,
     documentId: string,
   ): Promise<ExtractedChunksResponse> {
     try {
       return await firstValueFrom(
         this.http.get<ExtractedChunksResponse>(
-          `${this.baseUrl()}/${assistantId}/documents/${documentId}/chunks`,
+          `${this.config.appApiUrl()}${knowledgePaths(target).documents}/${encodeURIComponent(documentId)}/chunks`,
         ),
       );
     } catch (err) {

@@ -1,5 +1,7 @@
 import { Component, ChangeDetectionStrategy, inject, signal, computed, OnInit } from '@angular/core';
 import { toSignal } from '@angular/core/rxjs-interop';
+import { Dialog } from '@angular/cdk/dialog';
+import { firstValueFrom } from 'rxjs';
 import { Router, ActivatedRoute, RouterLink } from '@angular/router';
 import {
   AbstractControl,
@@ -12,7 +14,7 @@ import {
   ReactiveFormsModule,
 } from '@angular/forms';
 import { NgIcon, provideIcons } from '@ng-icons/core';
-import { heroArrowLeft, heroChevronDown, heroChevronRight } from '@ng-icons/heroicons/outline';
+import { heroArrowLeft, heroChevronDown, heroChevronRight, heroTrash } from '@ng-icons/heroicons/outline';
 import {
   AVAILABLE_PROVIDERS,
   CACHING_CAPABLE_PROVIDERS,
@@ -27,8 +29,11 @@ import {
   MANTLE_API_MODE_LABELS,
   ManagedModelFormData,
   MantleApiMode,
+  MODEL_STATUSES,
+  MODEL_STATUS_LABELS,
   ModelParamSpec,
   ModelProvider,
+  ModelStatus,
   SupportedParams,
 } from './models/managed-model.model';
 import {
@@ -42,6 +47,11 @@ import { ManagedModelsService } from './services/managed-models.service';
 import { CuratedModelPrefillService } from './services/curated-model-prefill.service';
 import { AppRolesService } from '../roles/services/app-roles.service';
 import { SpinnerComponent } from '../../components/spinner/spinner.component';
+import {
+  DeleteModelDialogComponent,
+  DeleteModelDialogData,
+  DeleteModelDialogResult,
+} from './components/delete-model-dialog.component';
 
 interface ParamRowGroup {
   /**
@@ -244,10 +254,16 @@ interface ModelFormGroup {
   enabled: FormControl<boolean>;
   isDefault: FormControl<boolean>;
   isFeatured: FormControl<boolean>;
+  status: FormControl<ModelStatus>;
+  replacedBy: FormControl<string>;
+  retiresOn: FormControl<string>;
+  retirementNote: FormControl<string>;
   inputPricePerMillionTokens: FormControl<number>;
   outputPricePerMillionTokens: FormControl<number>;
   cacheWritePricePerMillionTokens: FormControl<number | null>;
   cacheReadPricePerMillionTokens: FormControl<number | null>;
+  speechInputPricePerMillionTokens: FormControl<number | null>;
+  speechOutputPricePerMillionTokens: FormControl<number | null>;
   knowledgeCutoffDate: FormControl<string | null>;
   supportsCaching: FormControl<boolean>;
   mantleApiMode: FormControl<MantleApiMode>;
@@ -259,7 +275,7 @@ interface ModelFormGroup {
 @Component({
   selector: 'app-model-form-page',
   imports: [ReactiveFormsModule, RouterLink, NgIcon, ModelIconComponent, SpinnerComponent],
-  providers: [provideIcons({ heroArrowLeft, heroChevronDown, heroChevronRight })],
+  providers: [provideIcons({ heroArrowLeft, heroChevronDown, heroChevronRight, heroTrash })],
   templateUrl: './model-form.page.html',
   styleUrl: './model-form.page.css',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -271,6 +287,7 @@ export class ModelFormPage implements OnInit {
   private managedModelsService = inject(ManagedModelsService);
   private prefillService = inject(CuratedModelPrefillService);
   private appRolesService = inject(AppRolesService);
+  private dialog = inject(Dialog);
 
   // Available options for multi-select fields
   readonly availableProviders = AVAILABLE_PROVIDERS;
@@ -341,6 +358,7 @@ export class ModelFormPage implements OnInit {
   readonly isEditMode = signal<boolean>(false);
   readonly modelId = signal<string | null>(null);
   readonly isSubmitting = signal<boolean>(false);
+  readonly isDeleting = signal<boolean>(false);
   readonly isLoading = signal<boolean>(false);
 
   // Inference-param row metadata, parallel to the ``inferenceParams`` FormArray.
@@ -374,10 +392,18 @@ export class ModelFormPage implements OnInit {
     enabled: this.fb.control(true, { nonNullable: true }),
     isDefault: this.fb.control(false, { nonNullable: true }),
     isFeatured: this.fb.control(true, { nonNullable: true }),
+    // Lifecycle (docs/specs/model-retirement.md §7). Strings, not null, for the
+    // same reason as shortDescription: '' is how an update clears a field.
+    status: this.fb.control<ModelStatus>('active', { nonNullable: true }),
+    replacedBy: this.fb.control('', { nonNullable: true }),
+    retiresOn: this.fb.control('', { nonNullable: true }),
+    retirementNote: this.fb.control('', { nonNullable: true, validators: [Validators.maxLength(300)] }),
     inputPricePerMillionTokens: this.fb.control(0, { nonNullable: true, validators: [Validators.required, Validators.min(0)] }),
     outputPricePerMillionTokens: this.fb.control(0, { nonNullable: true, validators: [Validators.required, Validators.min(0)] }),
     cacheWritePricePerMillionTokens: this.fb.control<number | null>(null, { validators: [Validators.min(0)] }),
     cacheReadPricePerMillionTokens: this.fb.control<number | null>(null, { validators: [Validators.min(0)] }),
+    speechInputPricePerMillionTokens: this.fb.control<number | null>(null, { validators: [Validators.min(0)] }),
+    speechOutputPricePerMillionTokens: this.fb.control<number | null>(null, { validators: [Validators.min(0)] }),
     knowledgeCutoffDate: this.fb.control<string | null>(null),
     // Seeded for the form's initial provider ('bedrock') and re-derived on
     // every provider switch. A hardcoded `false` here disagreed with the
@@ -914,10 +940,16 @@ export class ModelFormPage implements OnInit {
         // Absent on records written before the field existed, and those
         // models are featured today — mirror the backend default.
         isFeatured: model.isFeatured ?? true,
+        status: model.status ?? 'active',
+        replacedBy: model.replacedBy ?? '',
+        retiresOn: model.retiresOn ?? '',
+        retirementNote: model.retirementNote ?? '',
         inputPricePerMillionTokens: model.inputPricePerMillionTokens,
         outputPricePerMillionTokens: model.outputPricePerMillionTokens,
         cacheWritePricePerMillionTokens: model.cacheWritePricePerMillionTokens ?? null,
         cacheReadPricePerMillionTokens: model.cacheReadPricePerMillionTokens ?? null,
+        speechInputPricePerMillionTokens: model.speechInputPricePerMillionTokens ?? null,
+        speechOutputPricePerMillionTokens: model.speechOutputPricePerMillionTokens ?? null,
         knowledgeCutoffDate: model.knowledgeCutoffDate,
         supportsCaching: model.supportsCaching ?? true,
         mantleApiMode: this.coerceMantleApiMode(model.apiMode),
@@ -964,6 +996,8 @@ export class ModelFormPage implements OnInit {
       outputPricePerMillionTokens: template.outputPricePerMillionTokens,
       cacheWritePricePerMillionTokens: template.cacheWritePricePerMillionTokens ?? null,
       cacheReadPricePerMillionTokens: template.cacheReadPricePerMillionTokens ?? null,
+      speechInputPricePerMillionTokens: template.speechInputPricePerMillionTokens ?? null,
+      speechOutputPricePerMillionTokens: template.speechOutputPricePerMillionTokens ?? null,
       knowledgeCutoffDate: template.knowledgeCutoffDate ?? null,
       supportsCaching: template.supportsCaching ?? true,
       mantleApiMode: this.coerceMantleApiMode(template.apiMode),
@@ -1064,7 +1098,29 @@ export class ModelFormPage implements OnInit {
     iconSlug: this.iconSlugValue(),
     providerName: this.providerNameValue(),
     modelName: this.modelNameValue(),
+    modelId: this.modelIdValue(),
   }));
+
+  protected readonly modelStatuses = MODEL_STATUSES.map((value) => ({
+    value,
+    label: MODEL_STATUS_LABELS[value],
+  }));
+
+  readonly selectedStatus = toSignal(this.modelForm.controls.status.valueChanges, {
+    initialValue: this.modelForm.controls.status.value,
+  });
+
+  /**
+   * Models this one can be replaced by: every other active, enabled model. The
+   * backend enforces the same rule; offering only valid choices keeps the admin
+   * from finding that out from an error.
+   */
+  readonly successorOptions = computed(() => {
+    const self = this.modelIdValue();
+    return this.managedModelsService
+      .getManagedModels()
+      .filter((m) => (m.status ?? 'active') === 'active' && m.enabled && m.modelId !== self);
+  });
 
   private readonly providerNameValue = toSignal(
     this.modelForm.controls.providerName.valueChanges,
@@ -1072,6 +1128,9 @@ export class ModelFormPage implements OnInit {
   );
   private readonly modelNameValue = toSignal(this.modelForm.controls.modelName.valueChanges, {
     initialValue: this.modelForm.controls.modelName.value,
+  });
+  private readonly modelIdValue = toSignal(this.modelForm.controls.modelId.valueChanges, {
+    initialValue: this.modelForm.controls.modelId.value,
   });
 
   /**
@@ -1086,7 +1145,8 @@ export class ModelFormPage implements OnInit {
     const icon = resolveModelIcon(this.iconPreviewModel());
     if (icon.kind === 'upload') return 'Uploaded image';
     if (icon.kind === 'none') return 'No icon — showing the model\'s initial';
-    return this.iconSlugValue() ? 'Built-in logo' : 'Matched from the provider name';
+    if (icon.via === 'slug') return 'Built-in logo';
+    return icon.via === 'model' ? 'Matched from the model ID' : 'Matched from the provider name';
   });
 
   /** Pick a built-in logo, or clear the selection by picking the active one again. */
@@ -1187,10 +1247,16 @@ export class ModelFormPage implements OnInit {
         enabled: v.enabled,
         isDefault: v.isDefault,
         isFeatured: v.isFeatured,
+        status: v.status,
+        replacedBy: v.replacedBy,
+        retiresOn: v.retiresOn,
+        retirementNote: v.retirementNote.trim(),
         inputPricePerMillionTokens: v.inputPricePerMillionTokens,
         outputPricePerMillionTokens: v.outputPricePerMillionTokens,
         cacheWritePricePerMillionTokens: v.cacheWritePricePerMillionTokens,
         cacheReadPricePerMillionTokens: v.cacheReadPricePerMillionTokens,
+        speechInputPricePerMillionTokens: v.speechInputPricePerMillionTokens,
+        speechOutputPricePerMillionTokens: v.speechOutputPricePerMillionTokens,
         knowledgeCutoffDate: v.knowledgeCutoffDate,
         supportsCaching: supportsCachingForProvider(v.provider, v.supportsCaching),
         // Only meaningful on an OpenAI-compatible Bedrock surface; null
@@ -1250,6 +1316,38 @@ export class ModelFormPage implements OnInit {
     return MANTLE_API_MODES.includes(value as MantleApiMode)
       ? (value as MantleApiMode)
       : 'chat';
+  }
+
+  /**
+   * Confirm, delete, and return to the list. On failure the admin stays on the
+   * form with their unsaved edits intact.
+   */
+  async deleteModel(): Promise<void> {
+    const id = this.modelId();
+    if (!id || this.isDeleting()) {
+      return;
+    }
+
+    const { modelId, modelName } = this.modelForm.getRawValue();
+    const dialogRef = this.dialog.open<DeleteModelDialogResult>(
+      DeleteModelDialogComponent,
+      { data: { modelId, modelName } as DeleteModelDialogData },
+    );
+    const confirmed = await firstValueFrom(dialogRef.closed);
+    if (!confirmed) {
+      return;
+    }
+
+    this.isDeleting.set(true);
+    try {
+      await this.managedModelsService.deleteModel(id);
+      this.router.navigate(['/admin/manage-models']);
+    } catch (error) {
+      console.error('Error deleting model:', error);
+      alert('Failed to delete model. Please try again.');
+    } finally {
+      this.isDeleting.set(false);
+    }
   }
 
   /**

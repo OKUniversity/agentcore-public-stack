@@ -5,9 +5,15 @@ import { Subscription } from 'rxjs';
 import { v4 as uuidv4 } from 'uuid';
 import { ChatRequestService } from './services/chat/chat-request.service';
 import { MessageMapService } from './services/session/message-map.service';
-import { Message } from './services/models/message.model';
+import { FolderAttachmentData, Message } from './services/models/message.model';
 import { SessionService } from './services/session/session.service';
+import { SessionPrewarmService } from './services/session/session-prewarm.service';
+import { persistedAggregatesOf, samePersistedAggregates } from './services/session/persisted-aggregates';
 import { ScrollPositionService } from './services/session/scroll-position.service';
+import {
+  ComposerDraftStorageService,
+  NEW_CONVERSATION_DRAFT_KEY,
+} from './services/session/composer-draft-storage.service';
 import { ChatStateService } from './services/chat/chat-state.service';
 import { SidenavService } from '../services/sidenav/sidenav.service';
 import { HeaderService } from '../services/header/header.service';
@@ -19,6 +25,7 @@ import { CompactionSummaryService } from './services/chat/compaction-summary.ser
 import { SteeringService } from './services/chat/steering.service';
 import { ArtifactStateService } from './services/artifacts/artifact-state.service';
 import { FilePreviewStateService } from './services/file-preview/file-preview-state.service';
+import { BrowserPaneStateService } from './services/browser-pane/browser-pane-state.service';
 import { ArtifactHttpService } from './services/artifacts/artifact-http.service';
 import { McpAppCardStateService } from './services/mcp-apps/mcp-app-card-state.service';
 import { McpAppCardHttpService } from './services/mcp-apps/mcp-app-card-http.service';
@@ -27,6 +34,9 @@ import { McpAppConsentService } from './services/mcp-apps/mcp-app-consent.servic
 import { Dialog } from '@angular/cdk/dialog';
 import { AssistantService } from '../assistants/services/assistant.service';
 import { Assistant } from '../assistants/models/assistant.model';
+import { FEATURES } from '../services/features';
+import { ComposerProject } from './components/chat-input/chat-input.component';
+import { ConversationBindingService } from './services/session/conversation-binding.service';
 import { AgentService } from '../agents/services/agent.service';
 import { AgentMentionService } from '../agents/services/agent-mention.service';
 import { routeMention } from './services/chat/mention-routing';
@@ -53,6 +63,7 @@ import { GreetingProvider } from '../../branding/greeting.provider';
 export class ConversationPage implements OnDestroy {
   private route = inject(ActivatedRoute);
   private sessionService = inject(SessionService);
+  private sessionPrewarm = inject(SessionPrewarmService);
   private chatRequestService = inject(ChatRequestService);
   private messageMapService = inject(MessageMapService);
   private chatStateService = inject(ChatStateService);
@@ -66,6 +77,7 @@ export class ConversationPage implements OnDestroy {
   private steering = inject(SteeringService);
   private artifactState = inject(ArtifactStateService);
   private filePreviewState = inject(FilePreviewStateService);
+  private browserPaneState = inject(BrowserPaneStateService);
   private mcpAppCardState = inject(McpAppCardStateService);
   private mcpAppCardHttp = inject(McpAppCardHttpService);
   private mcpAppTeardown = inject(McpAppTeardownService);
@@ -82,8 +94,11 @@ export class ConversationPage implements OnDestroy {
   private systemPromptsService = inject(SystemPromptsService);
   private greetingProvider = inject(GreetingProvider);
   private scrollPositions = inject(ScrollPositionService);
+  private composerDrafts = inject(ComposerDraftStorageService);
   private agentMentionService = inject(AgentMentionService);
   private toast = inject(ToastService);
+  private features = inject(FEATURES);
+  private binding = inject(ConversationBindingService);
   private platformId = inject(PLATFORM_ID);
   private isBrowser = isPlatformBrowser(this.platformId);
 
@@ -100,18 +115,32 @@ export class ConversationPage implements OnDestroy {
   }
 
   /**
-   * The conversation whose scroll position we're currently tracking.
-   * Captured into ScrollPositionService the moment the user navigates away
-   * (route change or component teardown) — see the scroll policy note on
-   * the route subscription.
+   * The conversation the viewport was last reset for, so a route-param
+   * re-emission for the same one does not reset it again — see the scroll
+   * policy note on the route subscription.
    */
   private lastViewedSessionId: string | null = null;
 
+  /**
+   * Set in ngOnDestroy, so a restore still waiting on its animation frames
+   * neither scrolls the page that replaced this one nor re-tracks this
+   * conversation in ScrollPositionService.
+   */
+  private destroyed = false;
+
+  /**
+   * The `?m=` message last scrolled to (conversation search's jump-to-message),
+   * as `{sessionId}|{messageId}`, so a query-param re-emission does not yank the
+   * viewport back after the user has scrolled away from it.
+   */
+  private lastJumpedTo: string | null = null;
+
   sessionId = signal<string | null>(null);
-  assistantIdFromQuery = signal<string | null>(null);
 
   assistant = signal<Assistant | null>(null);
   assistantError = signal<string | null>(null);
+  /** The empty state's error line: the Agent's load, else a `?project=` that would not resolve. */
+  readonly bindingError = computed(() => this.assistantError() ?? this.binding.projectError());
   // Agent Designer: the governed Agent behind this conversation (agentId ==
   // assistantId), when the /agents surface is enabled and it resolves. Drives
   // the per-primitive picker locks; null for plain chat or a legacy assistant.
@@ -142,6 +171,19 @@ export class ConversationPage implements OnDestroy {
     return this.sessionId() ?? this.stagedSessionId();
   });
 
+  /**
+   * Which conversation the composer parks its unsent text under.
+   *
+   * The *route* conversation, not {@link effectiveSessionId}: a new
+   * conversation mints a staged id the moment a file is attached, and keying
+   * drafts off that would swap the composer out from under text the user had
+   * already typed. Before the first send every visit to `/` is the same
+   * composer, so they all share one key.
+   */
+  readonly draftKey = computed(
+    () => this.sessionId() ?? NEW_CONVERSATION_DRAFT_KEY,
+  );
+
   // Writable signal that holds the current messages signal reference
   private messagesSignal = signal<Signal<Message[]>>(signal([]));
 
@@ -168,6 +210,14 @@ export class ConversationPage implements OnDestroy {
   private routeSubscription?: Subscription;
   private queryParamSubscription?: Subscription;
   readonly sessionConversation = this.sessionService.currentSession;
+
+  // The session row's cost/context aggregates, changing only when one of
+  // them (or the session) does — see `samePersistedAggregates`.
+  private readonly persistedAggregates = computed(
+    () => persistedAggregatesOf(this.sessionConversation()),
+    { equal: samePersistedAggregates },
+  );
+
   readonly isChatLoading = this.chatStateService.isChatLoading;
   readonly isLoadingSession = this.messageMapService.isLoadingSession;
 
@@ -192,10 +242,35 @@ export class ConversationPage implements OnDestroy {
     embeddedMode: false,
   };
 
+  /**
+   * The Shared Project this conversation runs in, for the composer's
+   * placeholder and the empty state's layout. The URL names it (`?project=`,
+   * resolved by `ConversationBindingService`), so a project picked from the
+   * composer shows at once rather than after its harness Agent loads, under the
+   * project's current name. An older link that names the harness in
+   * `assistantId` resolves through the project list; until that list loads, the
+   * loaded harness's own `projectId` stands in, with the harness's (possibly
+   * older) name. That fallback only trusts an Agent matching the URL: on a
+   * switch, `assistant()` still holds the previous one until the new load lands.
+   */
+  readonly composerProject = computed<ComposerProject | null>(() => {
+    const bound = this.binding.boundProject();
+    if (bound) return { projectId: bound.projectId, name: bound.name };
+    const assistant = this.assistant();
+    if (
+      this.features.projects &&
+      assistant?.projectId &&
+      assistant.assistantId === this.binding.boundAgentId()
+    ) {
+      return { projectId: assistant.projectId, name: assistant.name };
+    }
+    return null;
+  });
+
   // Computed signal to determine if assistant can be closed
-  // Only allow closing if: no messages exist AND assistant is from query param (not session preferences)
+  // Only allow closing if: no messages exist AND the binding is on the URL (not session preferences)
   readonly canCloseAssistant = computed(() => {
-    return !this.hasMessages() && !!this.assistantIdFromQuery() && !!this.assistant();
+    return !this.hasMessages() && this.binding.hasUrlBinding() && !!this.assistant();
   });
 
   // Show skeleton when loading a session that matches current route and has no messages yet
@@ -223,12 +298,23 @@ export class ConversationPage implements OnDestroy {
       }
     });
 
-    // Apply model from session preferences when session metadata loads
+    // Apply the conversation's last model once, when it is opened. Not on
+    // every metadata update: a model switch now continues the conversation
+    // in place, and a later refresh (rename, star, the post-turn title read)
+    // can still carry the previous turn's model, which would silently undo
+    // the user's pick. Retried until the model list has loaded, because
+    // `setSelectedModelById` changes nothing for an id it can't find yet.
+    let restoredSessionId: string | undefined;
+    let restored = false;
     effect(() => {
       const session = this.sessionConversation();
-      if (session?.preferences?.lastModel) {
-        this.modelService.setSelectedModelById(session.preferences.lastModel);
+      if (session?.sessionId !== restoredSessionId) {
+        restoredSessionId = session?.sessionId;
+        restored = false;
       }
+      const lastModel = session?.preferences?.lastModel;
+      if (restored || !lastModel) return;
+      restored = this.modelService.setSelectedModelById(lastModel);
     });
 
     // Hydrate active system prompt from session preferences. We treat the
@@ -258,17 +344,21 @@ export class ConversationPage implements OnDestroy {
     });
 
     // Seed the session cost + context aggregates from session metadata so
-    // the badge shows totals immediately on revisit. Cleared first on route
-    // change (below) to avoid briefly showing stale numbers from a previous
-    // session.
+    // the badge shows totals immediately on revisit. Keyed on the aggregates
+    // themselves, not the whole row: see `persistedAggregates`.
+    effect(() => {
+      const aggregates = this.persistedAggregates();
+      if (!aggregates) return;
+      this.chatStateService.seedSessionAggregates(aggregates.sessionId, {
+        totalCost: aggregates.totalCost,
+        lastContextTokens: aggregates.lastContextTokens,
+        contextWindow: aggregates.contextWindow,
+      });
+    });
+
     effect(() => {
       const session = this.sessionConversation();
       if (!session?.sessionId) return;
-      this.chatStateService.seedSessionAggregates(session.sessionId, {
-        totalCost: session.totalCost,
-        lastContextTokens: session.lastContextTokens,
-        contextWindow: session.contextWindow,
-      });
       // Refresh-survival for the max_tokens "Continue" affordance: the
       // truncated partial is already in restored history; this flag is the
       // missing piece. Only set true here — the live stream_error path owns
@@ -306,7 +396,9 @@ export class ConversationPage implements OnDestroy {
       }
     });
 
-    // Single source of truth: the URL's `assistantId` query parameter.
+    // Single source of truth: the URL's binding — `?assistantId=` for an
+    // Agent, `?project=` for a Shared Project, whose harness Agent
+    // `ConversationBindingService` resolves.
     //
     // The URL is authoritative for which assistant is attached to the
     // current view. Session preferences on the backend still record the
@@ -317,7 +409,7 @@ export class ConversationPage implements OnDestroy {
     // entire class of races around metadata fetch timing and component
     // recreation (see #205).
     effect(() => {
-      const queryAssistantId = this.assistantIdFromQuery();
+      const queryAssistantId = this.binding.boundAgentId();
       const loadedAssistant = this.assistant();
 
       if (queryAssistantId) {
@@ -349,35 +441,49 @@ export class ConversationPage implements OnDestroy {
       this.clearAgentBindingLocks();
     });
 
-    // Self-heal effect: when the user lands on `/s/:id` without an
-    // `assistantId` query param but the session's stored preferences carry
-    // one (bookmarks, legacy URLs, shared session links), redirect to the
-    // same session with the param filled in. From that point on, the URL
-    // is the sole source of truth for the assistant-loading effect above.
+    // Self-heal effect: when the user lands on `/s/:id` without a binding
+    // on the URL but the session's stored preferences carry one (bookmarks,
+    // legacy URLs, shared session links), redirect to the same session with
+    // it filled in: `?project=` for a project task, else `?assistantId=`.
+    // From that point on, the URL is the sole source of truth for the
+    // assistant-loading effect above.
     //
     // Intentionally narrow: we only redirect when the URL is empty. If the
-    // URL already carries an `assistantId`, we trust it — including when
-    // it differs from preferences (the backend will reject a conflict on
-    // the next message).
+    // URL already carries a binding, we trust it — including when it
+    // differs from preferences (the backend will reject a conflict on the
+    // next message).
     effect(() => {
       const session = this.sessionConversation();
-      const sessionAssistantId = session?.preferences?.assistantId;
+      const preferences = session?.preferences;
       const currentSessionId = this.sessionId();
-      const queryAssistantId = this.assistantIdFromQuery();
 
       if (
         currentSessionId &&
         session?.sessionId === currentSessionId &&
-        sessionAssistantId &&
-        !queryAssistantId
+        (preferences?.assistantId || preferences?.projectId) &&
+        !this.binding.hasUrlBinding()
       ) {
         this.router.navigate([], {
           relativeTo: this.route,
-          queryParams: { assistantId: sessionAssistantId },
+          queryParams: this.binding.queryParamsFor(preferences.assistantId, preferences.projectId),
           queryParamsHandling: 'merge',
           replaceUrl: true,
         });
       }
+    });
+
+    // An older link names a project's harness Agent in `assistantId`. It
+    // resolves as-is; this only rewrites the address to `?project=`, the one
+    // shape a project conversation's URL takes, once the project is known.
+    effect(() => {
+      const project = this.binding.boundProject();
+      if (!project || this.binding.queryProjectId() || !this.binding.queryAssistantId()) return;
+      this.router.navigate([], {
+        relativeTo: this.route,
+        queryParams: this.binding.queryParamsFor(project.harnessAgentId, project.projectId),
+        queryParamsHandling: 'merge',
+        replaceUrl: true,
+      });
     });
 
     // Subscribe to route parameter changes.
@@ -388,23 +494,66 @@ export class ConversationPage implements OnDestroy {
     // per-session sync effect), and the backend completes and persists the
     // turn either way. Only the Stop button aborts, and only its own session.
     //
-    // Scroll policy on conversation change: remember where the user was in
-    // the conversation they're leaving, reset to the top while the next one
-    // loads (the leftover window offset is meaningless against different
-    // content), then restore below — remembered position if we have one,
-    // otherwise anchor the latest turn (restoreScrollPosition).
+    // Scroll policy on conversation change: ScrollPositionService has
+    // already remembered where the user was in the conversation they're
+    // leaving (at NavigationStart, while it was still on screen). Stop
+    // tracking it, reset to the top while the next one loads (the leftover
+    // offset is meaningless against different content), then restore below —
+    // remembered position if we have one, otherwise anchor the latest turn
+    // (restoreScrollPosition).
     this.routeSubscription = this.route.paramMap.subscribe(async params => {
       const id = params.get('sessionId');
 
       if (this.isBrowser && this.lastViewedSessionId !== id) {
-        if (this.lastViewedSessionId) {
-          this.scrollPositions.save(this.lastViewedSessionId, this.scrollContainer?.scrollTop ?? 0);
-        }
+        this.scrollPositions.untrack();
         this.scrollContainer?.scrollTo({ top: 0, behavior: 'auto' });
       }
       this.lastViewedSessionId = id;
+      this.lastJumpedTo = null;
 
       this.sessionId.set(id);
+
+      // A new-conversation draft with attachments names the conversation its
+      // uploads were filed under. Re-adopt it, or the next file attached after
+      // a reload mints a *second* staged id and the send carries upload ids
+      // from a conversation it does not name.
+      //
+      // `addSessionToCache` is not optional here, even though this id was
+      // already staged once: it also marks the id as new, which is what tells
+      // the metadata fetch to skip a conversation the backend has not created
+      // yet. That marker lives in memory and so died with the reload — without
+      // this call the first send lands on "Session not found".
+      if (!id) {
+        const staged = this.composerDrafts.read(NEW_CONVERSATION_DRAFT_KEY).attachmentSessionId;
+        if (staged && this.stagedSessionId() !== staged) {
+          this.stagedSessionId.set(staged);
+          this.sessionService.addSessionToCache(
+            staged,
+            this.userService.currentUser()?.user_id || 'anonymous',
+          );
+        }
+      }
+
+      // Session prewarm: start the Runtime microVM this conversation's next
+      // turn will use while the user reads and types. A new conversation warms
+      // on load (the id its first send will claim, or the staged id its
+      // attachments are filed under): opening it is almost always intent to
+      // send. An existing one warms on the composer's first input, since
+      // opening it is often just reading. A conversation this tab just created
+      // is already warm from its first turn. Fire-and-forget, off unless
+      // `features.sessionPrewarm`; see SessionPrewarmService.
+      if (!id) {
+        const staged = this.stagedSessionId();
+        if (staged) {
+          this.sessionPrewarm.warm(staged);
+        } else {
+          this.sessionPrewarm.warmNewConversation();
+        }
+      } else if (!this.sessionService.isNewSession(id)) {
+        this.sessionPrewarm.armOnTyping(id);
+      } else {
+        this.sessionPrewarm.clearCurrent();
+      }
 
       // Cost/context badge and Continue-affordance state is per-session in
       // ChatStateService, and the viewed-session effect above repoints the
@@ -432,6 +581,8 @@ export class ConversationPage implements OnDestroy {
       // one rail, so leaving it open would also hold the gutter for a
       // session that has nothing to show in it.
       this.filePreviewState.reset();
+      // And the sign-in browser, which belongs to the conversation being left.
+      this.browserPaneState.reset();
 
       // Tell every open MCP App it is going away BEFORE its iframe
       // unmounts with the message list (SEP-1865: the host sends
@@ -502,23 +653,34 @@ export class ConversationPage implements OnDestroy {
       }
     });
 
-    // Subscribe to query parameter changes for assistantId
+    // Subscribe to query parameter changes for `m` — the turn a search
+    // result points at. (The binding params are read by
+    // ConversationBindingService.) A new `m` on the conversation already
+    // open (no route-param change, so no restore) scrolls straight to it; on a
+    // fresh navigation the element is not rendered yet, so this misses and
+    // restoreScrollPosition handles it once the messages land.
     this.queryParamSubscription = this.route.queryParamMap.subscribe(params => {
-      const assistantId = params.get('assistantId');
-      this.assistantIdFromQuery.set(assistantId);
+      const messageId = params.get('m');
+      const sessionId = this.sessionId();
+      if (this.isBrowser && messageId && sessionId) {
+        requestAnimationFrame(() => {
+          if (this.sessionId() === sessionId) this.jumpToMessage(sessionId, messageId);
+        });
+      }
     });
   }
 
   ngOnDestroy() {
+    this.destroyed = true;
+    // Leaving the conversation page: returning to this tab later warms nothing.
+    this.sessionPrewarm.clearCurrent();
     // Leaving the conversation view entirely (e.g. to an admin page, or the
-    // `/` ↔ `/s/:id` transitions that recreate this component) — remember
-    // where the user was so navigating back restores it.
-    if (this.isBrowser) {
-      const id = this.sessionId();
-      if (id) {
-        this.scrollPositions.save(id, this.scrollContainer?.scrollTop ?? 0);
-      }
-    }
+    // `/` ↔ `/s/:id` transitions that recreate this component). Where the
+    // user was is already remembered — reading it here would be too late, as
+    // the router has removed this page's DOM before calling ngOnDestroy, so
+    // the container has clamped to 0. Stop tracking so the next page's
+    // navigations are not recorded against this conversation.
+    this.scrollPositions.untrack();
     this.routeSubscription?.unsubscribe();
     this.queryParamSubscription?.unsubscribe();
   }
@@ -534,14 +696,24 @@ export class ConversationPage implements OnDestroy {
    * Runs two animation frames after the messages landed in the map so the
    * message DOM (and the last-turn min-height that provides the scroll
    * room) has committed and the full scroll height exists; bails if the
-   * user has already navigated elsewhere.
+   * user has already navigated elsewhere. Once positioned, the conversation
+   * is tracked: ScrollPositionService remembers its offset as each
+   * navigation starts.
    */
   private restoreScrollPosition(sessionId: string): void {
     if (!this.isBrowser) return;
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        if (this.sessionId() !== sessionId) return;
+        if (this.destroyed || this.sessionId() !== sessionId) return;
+
+        // From here on, leaving remembers this conversation's offset.
+        this.scrollPositions.track(sessionId);
+
+        // Opened from a search result: the matching turn wins over any
+        // remembered position. Falls through when that turn is not rendered.
+        const messageId = this.route.snapshot.queryParamMap.get('m');
+        if (messageId && this.jumpToMessage(sessionId, messageId)) return;
 
         const saved = this.scrollPositions.get(sessionId);
         if (saved !== undefined) {
@@ -551,6 +723,19 @@ export class ConversationPage implements OnDestroy {
         }
       });
     });
+  }
+
+  /**
+   * Scroll to a turn's user message (`message-{id}` anchor), instantly. True if
+   * it was there to scroll to. Only user messages carry anchors, which is where
+   * a matched turn's answer begins (conversation-search §6).
+   */
+  private jumpToMessage(sessionId: string, messageId: string): boolean {
+    const key = `${sessionId}|${messageId}`;
+    if (this.lastJumpedTo === key) return true;
+    if (!this.chatContainer()?.scrollToMessage(messageId, 'auto')) return false;
+    this.lastJumpedTo = key;
+    return true;
   }
 
   /**
@@ -592,19 +777,29 @@ export class ConversationPage implements OnDestroy {
       });
   }
 
-  onMessageSubmitted(message: { content: string, timestamp: Date, fileUploadIds?: string[], mentionAgentId?: string, invokedSkillIds?: string[] }) {
+  async onMessageSubmitted(message: { content: string, timestamp: Date, fileUploadIds?: string[], mentionAgentId?: string, invokedSkillIds?: string[], folders?: FolderAttachmentData[] }) {
     // Use the effective session ID (route sessionId or staged sessionId)
     const sessionIdToUse = this.effectiveSessionId();
 
-    // The URL's `assistantId` query param is the sole source of truth. It's
-    // set on initial navigation (assistant card, share link) and kept in
-    // sync by the self-heal redirect in the constructor for existing
-    // sessions opened without one. Falling back to the in-memory
-    // `assistant()` signal guards the brief window during the `/` → `/s/:id`
-    // route transition where the component is recreated and the query
-    // param hasn't yet propagated to the new instance.
-    const boundAssistantId =
-      this.assistantIdFromQuery() || this.assistant()?.assistantId || undefined;
+    // The URL's binding is the sole source of truth. It's set on initial
+    // navigation (assistant card, project, share link) and kept in sync by
+    // the self-heal redirect in the constructor for existing sessions opened
+    // without one. Falling back to the in-memory `assistant()` signal guards
+    // the brief window during the `/` → `/s/:id` route transition where the
+    // component is recreated and the query param hasn't yet propagated to the
+    // new instance.
+    //
+    // A `?project=` still resolving to its harness is waited for: sent now,
+    // the message would go out unbound and start a plain chat. Only that case
+    // awaits, so every other send stays synchronous.
+    const urlAgentId = this.binding.projectPending()
+      ? await this.binding.resolveBoundAgentId()
+      : this.binding.boundAgentId();
+    if (this.binding.queryProjectId() && !urlAgentId) {
+      this.toast.error('This project isn’t available', 'Your message was not sent.');
+      return;
+    }
+    const boundAssistantId = urlAgentId || this.assistant()?.assistantId || undefined;
 
     // An `@`-mention means "talk to this Agent", and always yields a conversation the
     // Agent keeps its tools in — never the one-turn borrow that used to leave the *next*
@@ -637,7 +832,8 @@ export class ConversationPage implements OnDestroy {
       message.fileUploadIds,
       routed.assistantId,
       undefined,
-      message.invokedSkillIds
+      message.invokedSkillIds,
+      message.folders,
     ).catch((error) => {
       console.error('Error sending chat request:', error);
     });
@@ -670,7 +866,7 @@ export class ConversationPage implements OnDestroy {
   onContinueRequested() {
     const sessionIdToUse = this.effectiveSessionId();
     const assistantIdToUse =
-      this.assistantIdFromQuery() || this.assistant()?.assistantId || undefined;
+      this.binding.boundAgentId() || this.assistant()?.assistantId || undefined;
     this.chatRequestService
       .continueTruncatedTurn(sessionIdToUse, assistantIdToUse)
       .catch((error) => {
@@ -686,7 +882,9 @@ export class ConversationPage implements OnDestroy {
     // If no session exists (not navigated to /s/:id and no staged session),
     // create a staged session for file uploads
     if (!this.sessionId() && !this.stagedSessionId()) {
-      const newSessionId = uuidv4();
+      // Reuse the id the page warmed, so the uploads and the first turn share
+      // the microVM that is already starting (session prewarm).
+      const newSessionId = this.sessionPrewarm.claimNewConversationId() ?? uuidv4();
       this.stagedSessionId.set(newSessionId);
 
       // Add the session to cache so sidenav can show it
@@ -750,10 +948,10 @@ export class ConversationPage implements OnDestroy {
       this.sessionService.addSessionToCache(sessionId, userId);
       // Carry the assistant id forward if one is attached to this view —
       // keeps the URL the single source of truth after voice ends.
-      const assistantId = this.assistantIdFromQuery() || this.assistant()?.assistantId;
+      const assistantId = this.binding.boundAgentId() || this.assistant()?.assistantId;
       this.router.navigate(['s', sessionId], {
         replaceUrl: true,
-        queryParams: assistantId ? { assistantId } : {},
+        queryParams: this.binding.queryParamsFor(assistantId),
       });
     }
 
@@ -840,7 +1038,13 @@ export class ConversationPage implements OnDestroy {
     }
   }
 
-  /** Lock each picker to the Agent's binding, or release it when unbound. */
+  /**
+   * Lock each picker to the Agent's binding. Tools and skills are always locked, to
+   * none if the Agent binds none: the backend runs every Agent (a project's included)
+   * on its own tools and skills, never the viewer's picks. An Agent that binds no
+   * tools still gets the admin's always-on tools, so its lock keeps them; skills have
+   * no such floor.
+   */
   private applyAgentBindingLocks(agent: Agent): void {
     const modelId = agent.modelConfig?.modelId;
     if (modelId) {
@@ -853,20 +1057,16 @@ export class ConversationPage implements OnDestroy {
     if (toolIds.length > 0) {
       this.toolService.lockToAgentTools(toolIds);
     } else {
-      this.toolService.clearAgentLock();
+      this.toolService.lockToAgentTools([], { keepAlwaysOn: true });
     }
 
     const skillIds = agent.bindings.filter(b => b.kind === 'skill').map(b => b.ref);
-    if (skillIds.length > 0) {
-      this.skillService.lockToAgentSkills(skillIds);
-      // Load the accessible skills so the locked rows can render their names.
-      // Only fires when an Agent actually binds skills (a skills-enabled
-      // context), so there is no /skills fetch in flag-off environments.
-      if (!this.skillService.initialized()) {
-        void this.skillService.loadSkills();
-      }
-    } else {
-      this.skillService.clearAgentLock();
+    this.skillService.lockToAgentSkills(skillIds);
+    // Load the accessible skills so the locked rows can render their names.
+    // Only fires when an Agent actually binds skills (a skills-enabled
+    // context), so there is no /skills fetch in flag-off environments.
+    if (skillIds.length > 0 && !this.skillService.initialized()) {
+      void this.skillService.loadSkills();
     }
   }
 
@@ -878,12 +1078,12 @@ export class ConversationPage implements OnDestroy {
   }
 
   /**
-   * Clear assistantId from URL query parameters
+   * Clear the binding (`assistantId` or `project`) from URL query parameters
    */
   private clearAssistantIdFromUrl(): void {
     this.router.navigate([], {
       relativeTo: this.route,
-      queryParams: { assistantId: null },
+      queryParams: { assistantId: null, project: null },
       queryParamsHandling: 'merge'
     });
   }
@@ -901,16 +1101,17 @@ export class ConversationPage implements OnDestroy {
       // Already on a new session page — just reset signals to clear messages
       this.assistant.set(null);
       this.assistantError.set(null);
-      // Re-set assistantId query param to trigger the assistant load effect
+      // Re-set the binding query param to trigger the assistant load effect
       this.router.navigate(['/'], {
-        queryParams: { assistantId },
+        queryParams: this.binding.queryParamsFor(assistantId),
         queryParamsHandling: 'replace',
       });
       return;
     }
 
     // Navigate from an existing session to a fresh one with the assistant
-    this.router.navigate(['/'], { queryParams: { assistantId } });
+    // (`?project=` when it is a project's harness)
+    this.router.navigate(['/'], { queryParams: this.binding.queryParamsFor(assistantId) });
   }
 
   /**

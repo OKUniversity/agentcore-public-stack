@@ -1590,3 +1590,76 @@ class TestPendingAttachmentsMarker:
         meta = await get_session_metadata("s1", "u1")
         assert meta.pending_attachment_upload_ids == ["up-1", "up-2"]
         assert meta.pending_attachments_at is not None
+
+
+class TestUpdateSessionTitle:
+    """One round trip on the born-static row; the GSI only for legacy SKs."""
+
+    @pytest.mark.asyncio
+    async def test_writes_a_born_static_row(self, sessions_metadata_table):
+        from apis.shared.sessions.metadata import (
+            ensure_session_metadata_exists,
+            get_session_metadata,
+            update_session_title,
+        )
+        await ensure_session_metadata_exists("s1", "u1")
+
+        await update_session_title("s1", "u1", "Biology Syllabus")
+
+        assert (await get_session_metadata("s1", "u1")).title == "Biology Syllabus"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_gsi_for_a_legacy_row(self, sessions_metadata_table):
+        from apis.shared.sessions.metadata import update_session_title
+
+        _put_legacy_row(sessions_metadata_table, "s1", "2026-01-01T00:00:00Z")
+
+        await update_session_title("s1", "u1", "Biology Syllabus")
+
+        items = sessions_metadata_table.scan()["Items"]
+        assert [(i["SK"], i["title"]) for i in items] == [
+            ("S#ACTIVE#2026-01-01T00:00:00Z#s1", "Biology Syllabus")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_missing_row_is_not_created(self, sessions_metadata_table):
+        """The guard is what keeps the keyed write from upserting a ghost row."""
+        from apis.shared.sessions.metadata import update_session_title
+
+        await update_session_title("s1", "u1", "Biology Syllabus")
+
+        assert sessions_metadata_table.scan()["Items"] == []
+
+
+class TestSessionPinning:
+    """Issue #711: pinned conversations live in the sparse PinnedSessionIndex."""
+
+    @pytest.mark.asyncio
+    async def test_pin_lists_session_as_pinned(self, sessions_metadata_table):
+        from apis.shared.sessions.metadata import (
+            ensure_session_metadata_exists,
+            list_pinned_sessions,
+            set_session_pinned,
+        )
+        await ensure_session_metadata_exists("s1", "u1")
+        await ensure_session_metadata_exists("s2", "u1")
+
+        assert await set_session_pinned("s1", "u1", pinned=True) == "ok"
+
+        pinned = await list_pinned_sessions("u1")
+        assert [s.session_id for s, _ in pinned] == ["s1"]
+        assert pinned[0][1]  # pinnedAt timestamp
+
+    @pytest.mark.asyncio
+    async def test_unpin_removes_session_from_pinned(self, sessions_metadata_table):
+        from apis.shared.sessions.metadata import (
+            ensure_session_metadata_exists,
+            list_pinned_sessions,
+            set_session_pinned,
+        )
+        await ensure_session_metadata_exists("s1", "u1")
+        await set_session_pinned("s1", "u1", pinned=True)
+
+        assert await set_session_pinned("s1", "u1", pinned=False) == "ok"
+
+        assert await list_pinned_sessions("u1") == []

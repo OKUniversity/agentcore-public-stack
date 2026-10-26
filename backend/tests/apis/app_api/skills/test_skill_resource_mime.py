@@ -143,8 +143,32 @@ class TestResourceTypePolicy:
         """A quote or CRLF in a legacy filename must not reach a header value."""
         headers = resource_download_headers('a".md\r\nX-Evil: 1')
         value = headers["Content-Disposition"]
-        assert '"' not in value.removeprefix('attachment; filename="').removesuffix('"')
+        ascii_name = value.split('filename="')[1].split('"')[0]
+        assert '"' not in ascii_name
         assert "\r" not in value and "\n" not in value
+        # The RFC 5987 form carries the same bytes percent-encoded, which is
+        # inert ASCII — the quote and CRLF are `%22` and `%0D%0A`, not literals.
+        assert "%22" in value and "%0D%0A" in value
+
+    def test_download_headers_keep_the_extension_of_a_non_ascii_name(self):
+        """A fully non-ASCII name must still download as a usable file.
+
+        The old sanitizer collapsed every character to `_` and then stripped
+        the leading underscores *and the dot*, so `研究ノート.md` was served as
+        a file literally named `md`. The real name now rides `filename*`.
+        """
+        value = resource_download_headers("研究ノート.md")[
+            "Content-Disposition"
+        ]
+        value.encode("latin-1")
+        assert 'filename="download.md"' in value
+        assert "filename*=UTF-8''%E7%A0%94%E7%A9%B6%E3%83%8E%E3%83%BC%E3%83%88.md" in value
+
+    def test_download_headers_still_strip_a_traversal_path(self):
+        """A legacy row's stored path must not suggest itself as a save path."""
+        value = resource_download_headers("../../etc/passwd")["Content-Disposition"]
+        assert 'filename="passwd"' in value
+        assert ".." not in value and "/" not in value
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +390,7 @@ class TestLegacyRowIsNeutralizedOnRead:
         """The owner-tier read route is hardened identically."""
         skill_id = _create_my_skill(author_client, "Legacy Mine")
         ref = _plant_legacy_html_resource(
-            user_skill_service.catalog_service, skill_id
+            user_skill_service.bundle_files, skill_id
         )
         await user_skill_service.repository.update_skill(
             skill_id, {"resources": [ref]}, admin_user_id=author_user.user_id

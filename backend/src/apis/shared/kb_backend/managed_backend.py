@@ -71,6 +71,7 @@ import os
 import weakref
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from apis.shared.kb_backend.docx_revisions import annotated_text
 from apis.shared.kb_backend.protocol import DEFAULT_TOP_K, Chunk, DocumentSource
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,16 @@ RERANKING_MODEL_TYPE = "MANAGED"
 #: The connector all of this platform's managed documents arrive through.
 CONTENT_DATA_SOURCE_TYPE = "CUSTOM"
 
+#: ``TextContentDoc.data`` is capped at 5,242,880 characters. A tracked-changes
+#: document whose annotated text is longer ingests from its S3 location as
+#: before, unannotated.
+MAX_INLINE_TEXT_CHARS = 5_242_880
+
+#: The largest ``.docx`` read to look for tracked changes. Its text is what counts
+#: against the inline cap, and a Word file's size is mostly images, so this only
+#: bounds the memory one read can take.
+MAX_ANNOTATE_SOURCE_BYTES = 25 * 1024 * 1024
+
 #: Requirement 11.5. Isolation-critical filters are restricted to exact-match
 #: operators. ``startsWith`` and ``stringContains`` are prefix/substring matches:
 #: a filter written to isolate ``ast-1`` would also admit ``ast-10``, and the
@@ -100,9 +111,34 @@ ISOLATION_SAFE_FILTER_OPERATORS = frozenset({"equals", "in"})
 #: CUSTOM connector; the metadata key is a documented mirror of it.
 CUSTOM_IDENTIFIER_METADATA_KEY = "x-amz-bedrock-kb-custom-document-identifier"
 
+#: Statuses in ``IngestKnowledgeBaseDocuments``' OWN response that mean Bedrock
+#: refused the document outright. The call succeeds at the HTTP level either way, so
+#: a caller that drops the response cannot tell an accepted document from a refused
+#: one; the refusal then surfaces only as a ``NOT_FOUND`` probe with no reason
+#: attached. Explicit failures only: ``NOT_FOUND`` here has no documented meaning,
+#: so it is logged with its reason but not treated as a refusal.
+INGEST_REJECTED_STATUSES = frozenset({"FAILED", "METADATA_UPDATE_FAILED", "IGNORED"})
+
 
 class ManagedKbError(RuntimeError):
     """A managed knowledge base operation could not be performed."""
+
+
+class ManagedKbDocumentRejected(ManagedKbError):
+    """``IngestKnowledgeBaseDocuments`` accepted the call but refused a document.
+
+    ``rejections`` maps each refused platform document id to Bedrock's
+    ``(status, statusReason)``. Re-submitting the same bytes would be refused
+    again, so callers treat this as terminal for those documents.
+    """
+
+    def __init__(self, rejections: Mapping[str, Tuple[str, Optional[str]]]) -> None:
+        self.rejections = dict(rejections)
+        detail = "; ".join(
+            f"{document_id}: {status} ({reason or 'no reason given'})"
+            for document_id, (status, reason) in self.rejections.items()
+        )
+        super().__init__(f"the knowledge base refused {detail}")
 
 
 class ManagedKbNotProvisioned(ManagedKbError):
@@ -138,6 +174,24 @@ def bedrock_agent_client():
     import boto3
 
     return boto3.client("bedrock-agent", region_name=_region())
+
+
+def read_s3_object(bucket: str, key: str, max_bytes: int) -> Optional[bytes]:
+    """An object's bytes, or ``None`` when it is larger than ``max_bytes``.
+
+    The size is checked from the response headers before the body is read, so an
+    object too large to send inline is never pulled into memory.
+    """
+    import boto3
+
+    response = boto3.client("s3", region_name=_region()).get_object(Bucket=bucket, Key=key)
+    body = response["Body"]
+    try:
+        if response.get("ContentLength", 0) > max_bytes:
+            return None
+        return body.read()
+    finally:
+        body.close()
 
 
 # ── Concurrency bound ────────────────────────────────────────────────────────
@@ -268,10 +322,21 @@ def _inline_attributes(metadata: Mapping[str, Any]) -> List[Dict[str, Any]]:
     ]
 
 
+def _documents_bucket(source: DocumentSource, bucket: Optional[str]) -> str:
+    resolved = bucket or os.environ.get("S3_ASSISTANTS_DOCUMENTS_BUCKET_NAME")
+    if not resolved:
+        raise ManagedKbError(
+            f"document {source.document_id} has an S3 key but no bucket: pass "
+            f"bucket= or set S3_ASSISTANTS_DOCUMENTS_BUCKET_NAME"
+        )
+    return resolved
+
+
 def document_payload(
     source: DocumentSource,
     *,
     bucket: Optional[str] = None,
+    inline_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """One entry of the ``documents`` array.
 
@@ -285,19 +350,23 @@ def document_payload(
     through this process. Falls back to inline text for a source that only has
     chunks, joining them back into a document because managed ingestion does its
     own chunking and pre-chunked input would be re-chunked anyway.
+
+    ``inline_text`` overrides both: a Word document whose tracked changes have
+    been written out (:func:`~apis.shared.kb_backend.docx_revisions.annotated_text`)
+    is sent as that text. Bedrock reading the original from S3 flattens deletions
+    and insertions together, and reading an annotated ``.docx`` rewrites what is
+    inside the markers.
     """
     identifier = {"id": source.document_id}
     custom: Dict[str, Any] = {
         "customDocumentIdentifier": identifier,
     }
 
-    if source.s3_key:
-        resolved = bucket or os.environ.get("S3_ASSISTANTS_DOCUMENTS_BUCKET_NAME")
-        if not resolved:
-            raise ManagedKbError(
-                f"document {source.document_id} has an S3 key but no bucket: pass "
-                f"bucket= or set S3_ASSISTANTS_DOCUMENTS_BUCKET_NAME"
-            )
+    if inline_text is not None:
+        custom["sourceType"] = "IN_LINE"
+        custom["inlineContent"] = {"type": "TEXT", "textContent": {"data": inline_text}}
+    elif source.s3_key:
+        resolved = _documents_bucket(source, bucket)
         custom["sourceType"] = "S3_LOCATION"
         custom["s3Location"] = {"uri": f"s3://{resolved}/{source.s3_key}"}
     elif source.chunks:
@@ -381,11 +450,13 @@ class ManagedKbBackend:
         agent_client=None,
         locator=None,
         bucket: Optional[str] = None,
+        object_reader=None,
     ) -> None:
         self._runtime_client = runtime_client
         self._agent_client = agent_client
         self._locator = locator
         self._bucket = bucket
+        self._object_reader = object_reader or read_s3_object
 
     # ── plumbing ────────────────────────────────────────────────────────────
     def _runtime(self):
@@ -428,6 +499,8 @@ class ManagedKbBackend:
         query: str,
         top_k: int = DEFAULT_TOP_K,
         retrieval_filter: Optional[Mapping[str, Any]] = None,
+        *,
+        record: Optional[Mapping[str, Any]] = None,
     ) -> List[Chunk]:
         """Retrieve up to ``top_k`` chunks, best first.
 
@@ -439,8 +512,15 @@ class ManagedKbBackend:
         The synchronous ``retrieve`` call runs off the event loop (Requirement
         20.7): it was measured at 662–695 ms p50, which is long enough to matter
         to every other coroutine sharing the loop.
+
+        ``record`` is the KB_Record the facade read moments ago to choose this
+        backend. Its ``awsKbId`` is used as-is rather than read a second time (the
+        same row, ~50ms on a turn's critical path); without one, or without an
+        ``awsKbId`` on it, the record is read here as before.
         """
-        aws_kb_id, _ = await self._locate_async(kb_ref)
+        aws_kb_id = (record or {}).get("awsKbId")
+        if not aws_kb_id:
+            aws_kb_id, _ = await self._locate_async(kb_ref)
         client = self._runtime()
 
         payload = {
@@ -502,8 +582,10 @@ class ManagedKbBackend:
 
     # ── ingestion ───────────────────────────────────────────────────────────
     async def ingest(self, kb_ref: str, source: DocumentSource) -> None:
-        """Index one document."""
-        await self.ingest_documents(kb_ref, [source])
+        """Index one document. Raises :class:`ManagedKbDocumentRejected` if refused."""
+        rejected = await self.ingest_documents(kb_ref, [source])
+        if rejected:
+            raise ManagedKbDocumentRejected(rejected)
 
     async def ingest_documents(
         self,
@@ -511,8 +593,14 @@ class ManagedKbBackend:
         sources: Iterable[DocumentSource],
         *,
         batch_size: int = MAX_DOCUMENTS_PER_CALL,
-    ) -> None:
+    ) -> Dict[str, Tuple[str, Optional[str]]]:
         """Index documents with ``IngestKnowledgeBaseDocuments``.
+
+        Returns the documents Bedrock refused in its response, as
+        ``{document_id: (status, statusReason)}`` (:data:`INGEST_REJECTED_STATUSES`),
+        each logged at ERROR. Returned rather than raised so one refused document
+        does not fail a batch whose other documents were accepted; the single-
+        document :meth:`ingest` raises instead.
 
         Batched at 10 and concurrency-bounded at 10 (Requirements 9.3, 9.5).
         ``StartIngestionJob`` is never involved (Requirement 9.2).
@@ -526,7 +614,7 @@ class ManagedKbBackend:
         """
         documents = list(sources)
         if not documents:
-            return
+            return {}
 
         aws_kb_id, aws_data_source_id = await self._locate_async(kb_ref)
         if not aws_data_source_id:
@@ -536,9 +624,15 @@ class ManagedKbBackend:
             )
 
         client = self._agent()
-        payloads = [document_payload(source, bucket=self._bucket) for source in documents]
+        annotated = await asyncio.gather(
+            *(asyncio.to_thread(self._annotated_word_document, source) for source in documents)
+        )
+        payloads = [
+            document_payload(source, bucket=self._bucket, inline_text=inline)
+            for source, inline in zip(documents, annotated)
+        ]
 
-        await self._run_bounded(
+        responses = await self._run_bounded(
             [
                 {
                     "knowledgeBaseId": aws_kb_id,
@@ -550,6 +644,85 @@ class ManagedKbBackend:
             client.ingest_knowledge_base_documents,
             what="IngestKnowledgeBaseDocuments",
         )
+        return ingest_rejections(responses)
+
+    async def document_statuses(
+        self, kb_ref: str, document_ids: Iterable[str]
+    ) -> Dict[str, Tuple[str, Optional[str]]]:
+        """Bedrock's own ``(status, statusReason)`` for each document, ``NOT_FOUND`` when it holds none.
+
+        ``IngestKnowledgeBaseDocuments`` returns once a request is accepted and says
+        nothing about whether indexing finished or failed, so this is the only way
+        to know what a knowledge base actually holds. Batched at the API's limit of
+        10 identifiers. A failed call raises: the caller must not read "could not
+        ask" as "not there".
+        """
+        ids = [document_id for document_id in document_ids if document_id]
+        if not ids:
+            return {}
+        aws_kb_id, aws_data_source_id = await self._locate_async(kb_ref)
+        client = self._agent()
+        statuses: Dict[str, Tuple[str, Optional[str]]] = {
+            document_id: ("NOT_FOUND", None) for document_id in ids
+        }
+        for batch in batched(ids):
+            response = await asyncio.to_thread(
+                client.get_knowledge_base_documents,
+                knowledgeBaseId=aws_kb_id,
+                dataSourceId=aws_data_source_id,
+                documentIdentifiers=[document_identifier(document_id) for document_id in batch],
+            )
+            for detail in response.get("documentDetails") or []:
+                document_id = ((detail.get("identifier") or {}).get("custom") or {}).get("id")
+                if document_id in statuses:
+                    statuses[document_id] = (
+                        str(detail.get("status") or "NOT_FOUND"),
+                        detail.get("statusReason"),
+                    )
+        return statuses
+
+    def _annotated_word_document(self, source: DocumentSource) -> Optional[str]:
+        """The source's Word document as text with tracked changes written out.
+
+        ``None`` — ingest from S3 exactly as before — for anything that is not a
+        ``.docx`` in S3, a document with no tracked changes, annotated text too
+        long to send inline, and any failure along the way: losing the markers
+        is the pre-existing behaviour, while failing the ingestion would lose the
+        document.
+        """
+        if not source.s3_key or not source.filename.lower().endswith(".docx"):
+            return None
+        try:
+            bucket = _documents_bucket(source, self._bucket)
+            original = self._object_reader(bucket, source.s3_key, MAX_ANNOTATE_SOURCE_BYTES)
+            if original is None:
+                logger.warning(
+                    f"document {source.document_id} is too large to check for tracked "
+                    f"changes; ingesting it from S3, where any are flattened"
+                )
+                return None
+            annotated = annotated_text(original)
+        except Exception as exc:
+            logger.warning(
+                f"could not check document {source.document_id} for tracked changes "
+                f"({exc}); ingesting it from S3 unannotated",
+                exc_info=True,
+            )
+            return None
+        if annotated is None:
+            return None
+        if not annotated or len(annotated) > MAX_INLINE_TEXT_CHARS:
+            logger.warning(
+                f"document {source.document_id} has tracked changes but its annotated "
+                f"text ({len(annotated)} chars) cannot be sent inline; ingesting it "
+                f"from S3, where they are flattened"
+            )
+            return None
+        logger.info(
+            f"document {source.document_id} has tracked changes; ingesting its "
+            f"annotated text inline ({len(annotated)} chars)"
+        )
+        return annotated
 
     # ── deletion ────────────────────────────────────────────────────────────
     async def delete_document(self, kb_ref: str, document_id: str) -> None:
@@ -594,8 +767,13 @@ class ManagedKbBackend:
         )
 
     @staticmethod
-    async def _run_bounded(payloads: Sequence[Mapping[str, Any]], operation, *, what: str) -> None:
+    async def _run_bounded(
+        payloads: Sequence[Mapping[str, Any]], operation, *, what: str
+    ) -> List[Any]:
         """Issue each payload off the event loop, at most 10 in flight.
+
+        Returns each call's response, in payload order, so a caller can read the
+        per-document outcome the service reports inside a successful call.
 
         The semaphore is acquired *around* the ``to_thread`` call so the bound
         counts operations in flight at AWS, not coroutines created here — which is
@@ -603,9 +781,9 @@ class ManagedKbBackend:
         """
         semaphore = document_operation_semaphore()
 
-        async def _one(payload: Mapping[str, Any]) -> None:
+        async def _one(payload: Mapping[str, Any]) -> Any:
             async with semaphore:
-                await asyncio.to_thread(lambda: operation(**payload))
+                return await asyncio.to_thread(lambda: operation(**payload))
 
         results = await asyncio.gather(
             *(_one(payload) for payload in payloads), return_exceptions=True
@@ -614,15 +792,51 @@ class ManagedKbBackend:
         if failures:
             logger.error(f"{what}: {len(failures)}/{len(payloads)} batches failed")
             raise failures[0]
+        return list(results)
+
+
+def ingest_rejections(responses: Iterable[Any]) -> Dict[str, Tuple[str, Optional[str]]]:
+    """The documents ``IngestKnowledgeBaseDocuments`` responses refused, logged.
+
+    A ``documentDetails`` entry carrying a ``statusReason`` outside the refused
+    set is logged at WARNING so a status this module does not classify is still
+    visible. A response that is not a mapping (a stubbed client) is skipped.
+    """
+    rejected: Dict[str, Tuple[str, Optional[str]]] = {}
+    for response in responses:
+        if not isinstance(response, Mapping):
+            continue
+        for detail in response.get("documentDetails") or []:
+            status = str(detail.get("status") or "")
+            reason = detail.get("statusReason")
+            document_id = str(
+                ((detail.get("identifier") or {}).get("custom") or {}).get("id") or ""
+            )
+            if status in INGEST_REJECTED_STATUSES:
+                logger.error(
+                    f"IngestKnowledgeBaseDocuments refused document {document_id!r}: "
+                    f"{status} ({reason or 'no reason given'})"
+                )
+                rejected[document_id] = (status, reason)
+            elif reason:
+                logger.warning(
+                    f"IngestKnowledgeBaseDocuments reported document {document_id!r} "
+                    f"as {status}: {reason}"
+                )
+    return rejected
 
 
 __all__ = [
     "CONTENT_DATA_SOURCE_TYPE",
+    "INGEST_REJECTED_STATUSES",
     "ISOLATION_SAFE_FILTER_OPERATORS",
     "MAX_CONCURRENT_DOCUMENT_OPERATIONS",
     "MAX_DOCUMENTS_PER_CALL",
+    "MAX_ANNOTATE_SOURCE_BYTES",
+    "MAX_INLINE_TEXT_CHARS",
     "RERANKING_MODEL_TYPE",
     "ManagedKbBackend",
+    "ManagedKbDocumentRejected",
     "ManagedKbError",
     "ManagedKbNotProvisioned",
     "UnsafeFilterOperator",
@@ -630,6 +844,7 @@ __all__ = [
     "document_identifier",
     "document_operation_semaphore",
     "document_payload",
+    "ingest_rejections",
     "retrieval_configuration",
     "validate_isolation_filter",
 ]

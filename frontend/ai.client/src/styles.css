@@ -263,8 +263,66 @@ html.dark .message-block {
     a:hover {
         color: var(--color-primary-300);
     }
+
+    /* Weight alone barely separates bold from body text on a dark surface,
+       and the assistant bubble's gray-200 body sits too close to white to
+       leave room above it. So response prose steps down to gray-300 while
+       headings and bold step up to white. Inside a link, bold keeps the
+       link's color. */
+    &.text-block {
+        color: var(--color-gray-300);
+    }
+
+    h1, h2, h3, h4, h5, h6,
+    strong {
+        color: var(--color-white);
+    }
+
+    a strong {
+        color: inherit;
+    }
 }
   
+
+/*
+ * Sidebar body entry motion.
+ *
+ * Global rather than component-scoped, and that is the whole point: the chat
+ * navigation and the admin console's navigation swap into the same slot in the
+ * sidebar, so they have to arrive the same way or the swap reads as two
+ * different sidebars. Angular scopes keyframe NAMES per component, so a copy of
+ * this rule in each component would compile to two separately-named animations
+ * that look identical today and drift the first time one is tuned.
+ *
+ * Sections stagger by applying `animation-delay` at the usage site — 0ms for
+ * the first beat, then a 40ms ladder. Deliberately short: the admin nav's six
+ * sections finish at 500ms, and anything longer stops reading as one gesture
+ * and starts reading as a queue.
+ *
+ * `both` fill so a delayed section is invisible until its turn rather than
+ * flashing at full opacity first.
+ */
+.sidenav-body-enter {
+    animation: sidenav-body-enter 280ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes sidenav-body-enter {
+    from {
+        opacity: 0;
+        transform: translateY(6px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .sidenav-body-enter {
+        animation: none;
+    }
+}
 
 /* Ensure body has proper background for dark mode */
 body {

@@ -80,17 +80,11 @@ class EnvVars:
     DYNAMODB_QUOTA_EVENTS_TABLE = "DYNAMODB_QUOTA_EVENTS_TABLE"
 
     # --- Retry Configuration ---
-    RETRY_BOTO_MAX_ATTEMPTS = "RETRY_BOTO_MAX_ATTEMPTS"
-    RETRY_BOTO_MODE = "RETRY_BOTO_MODE"
     RETRY_CONNECT_TIMEOUT = "RETRY_CONNECT_TIMEOUT"
     RETRY_READ_TIMEOUT = "RETRY_READ_TIMEOUT"
     RETRY_SDK_MAX_ATTEMPTS = "RETRY_SDK_MAX_ATTEMPTS"
     RETRY_SDK_INITIAL_DELAY = "RETRY_SDK_INITIAL_DELAY"
     RETRY_SDK_MAX_DELAY = "RETRY_SDK_MAX_DELAY"
-    # Kill switch for retrying Bedrock's transient pre-stream faults
-    # (ServiceUnavailableException et al). Default on; set "false" to fall
-    # back to Strands' stock throttling-only retry.
-    RETRY_TRANSIENT_SERVICE_ERRORS = "RETRY_TRANSIENT_SERVICE_ERRORS"
 
     # --- API Keys ---
     OPENAI_API_KEY = "OPENAI_API_KEY"
@@ -134,6 +128,12 @@ class Defaults:
     """
 
     # --- Model ---
+    # Last resort only. A turn that names no model runs on the user's saved
+    # default, then the catalog's `isDefault` row (inference-api
+    # `_resolve_fallback_model`); this id is reached only when the catalog has
+    # no enabled default. It has no pricing unless the catalog carries a row for
+    # this exact id (prod registers `global.*` ids), so a turn here is unmetered
+    # and emits `UnmeteredModelCall`.
     MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
     CACHING_ENABLED = True
 
@@ -141,7 +141,13 @@ class Defaults:
     AWS_REGION = "us-west-2"
 
     # --- Memory Retrieval ---
-    MEMORY_RELEVANCE_SCORE = 0.7
+    # Retrieved long-term memory records scoring below this are dropped. On a
+    # labelled synthetic eval set in dev, the right record for a natural
+    # question scored a median 0.38-0.44 and unrelated records mostly stayed
+    # under 0.40 (max 0.43): 0.5 kept the right record for 7% of questions,
+    # 0.4 for 59% at 94% precision (docs/specs/memory-baseline-decision.md,
+    # "Relevance cut calibration"). Override with AGENTCORE_MEMORY_RELEVANCE_SCORE.
+    MEMORY_RELEVANCE_SCORE = 0.4
     MEMORY_TOP_K = 10
 
     # --- Compaction ---
@@ -178,8 +184,12 @@ class Defaults:
     # SUMMARY_OVER_BUDGET diagnosis reads.
     COMPACTION_SUMMARY_TOKEN_BUDGET = 8_000
     COMPACTION_SUMMARY_MODEL_ENABLED = True
-    # Same cheap model as the title and tool-batch side-channels.
-    COMPACTION_SUMMARY_MODEL_ID = "us.amazon.nova-micro-v1:0"
+    # Nova 2 Lite, not the Nova Micro the title and tool-batch side-channels
+    # use: on the quality harness Micro kept ~77% of planted facts (58% of
+    # exact identifiers) and Lite ~99% (100%), for ~$0.01 per cut. `us.*`
+    # because dev's SCP denies `global.*`. compress_with_model sends
+    # `temperature` only, so a Claude override works too.
+    COMPACTION_SUMMARY_MODEL_ID = "us.amazon.nova-2-lite-v1:0"
     COMPACTION_DEFERRED_APPLY_ENABLED = True
     # Tool-result offload gate. 4k is well under the 25k compaction floor, so a
     # protected tail of a few big results can no longer hold a session above
@@ -201,14 +211,11 @@ class Defaults:
     DYNAMODB_QUOTA_EVENTS_TABLE = "QuotaEvents"
 
     # --- Retry ---
-    RETRY_BOTO_MAX_ATTEMPTS = 3
-    RETRY_BOTO_MODE = "standard"
     RETRY_CONNECT_TIMEOUT = 5
     RETRY_READ_TIMEOUT = 120
     RETRY_SDK_MAX_ATTEMPTS = 4
     RETRY_SDK_INITIAL_DELAY = 2.0
     RETRY_SDK_MAX_DELAY = 16.0
-    RETRY_TRANSIENT_SERVICE_ERRORS = True
 
     # --- Frontend ---
     FRONTEND_URL = "http://localhost:4200"

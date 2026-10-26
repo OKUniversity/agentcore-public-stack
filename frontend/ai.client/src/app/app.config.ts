@@ -1,5 +1,5 @@
 import { ApplicationConfig, inject, provideAppInitializer, provideBrowserGlobalErrorListeners } from '@angular/core';
-import { provideRouter, withComponentInputBinding } from '@angular/router';
+import { provideRouter, withComponentInputBinding, withNavigationErrorHandler } from '@angular/router';
 
 import { routes } from './app.routes';
 import { provideHttpClient, withInterceptors } from '@angular/common/http';
@@ -11,7 +11,12 @@ import { SessionService } from './auth/session.service';
 import { ThemeService } from './components/topnav/components/theme-toggle/theme.service';
 import { provideBuiltInToolRenderers } from './session/components/message-list/components/tool-use/built-in-renderers';
 import { AnnouncementModalService } from './services/announcements/announcement-modal.service';
+import {
+  provideStaleBuildRecovery,
+  recoverFromStaleChunkNavigation,
+} from './services/app-update/app-update.providers';
 import { ConfigService } from './services/config.service';
+import { RouteScrollService } from './services/route-scroll/route-scroll.service';
 import { durableDownloadUrlFromHref } from './shared/utils/file-download-url';
 import { installLazyMermaid } from './shared/utils/lazy-mermaid';
 import { installKatexMathExtensions } from './shared/utils/katex-math-markdown';
@@ -54,7 +59,15 @@ export const appConfig: ApplicationConfig = {
         deps: [ConfigService],
       },
     }),
-    provideRouter(routes, withComponentInputBinding()),
+    provideRouter(
+      routes,
+      withComponentInputBinding(),
+      // A tab opened before a deploy asks for lazy chunks the deploy deleted.
+      // The navigation becomes a full load of its destination (or a Refresh
+      // prompt when a stream/upload would be cut off, or it already tried).
+      withNavigationErrorHandler(recoverFromStaleChunkNavigation),
+    ),
+    provideStaleBuildRecovery(),
 
     // Bootstrap the BFF cookie session before the first component renders.
     // GET ${appApiUrl}/auth/session — on 401, SessionService sends the browser
@@ -83,6 +96,12 @@ export const appConfig: ApplicationConfig = {
     // app.html because a CDK overlay is not a layout element — and because
     // nothing else would ever inject it. Same pattern as ThemeService above.
     provideAppInitializer(() => { inject(AnnouncementModalService); }),
+
+    // The shell scrolls a container, not the window, so the router's own
+    // scroll restoration never applies. This service starts each newly opened
+    // page at the top and restores a page the user returns to. Started here so
+    // it is listening before the first navigation; nothing else injects it.
+    provideAppInitializer(() => { inject(RouteScrollService); }),
 
     // ngx-markdown's `mermaid` plugin reads the library off the global scope
     // and throws if it isn't there. Publishing a stand-in before the first

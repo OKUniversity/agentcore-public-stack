@@ -45,6 +45,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, Field
 
+from apis.shared.aws_clients import get_client
+
 from .document_read import _open_pdf, _pdf_page_text, docx_paragraphs, document_format_for
 
 logger = logging.getLogger(__name__)
@@ -186,9 +188,15 @@ def _sample_sections(sections: List[DigestSection], limit: int) -> List[DigestSe
     return [sections[int(i * step)] for i in range(limit)]
 
 
-def extract_outline(fmt: str, raw: bytes) -> DocumentDigest:
+#: ``(unit name, unit texts)`` as ``_units_for`` returns them. A caller that has
+#: already extracted a document's units passes them in so the digest does not
+#: parse the document again (the large-document preparation Lambda).
+Units = Tuple[str, List[str]]
+
+
+def extract_outline(fmt: str, raw: bytes, units: Optional[Units] = None) -> DocumentDigest:
     """The deterministic half of the digest (no abstract, no tokens yet)."""
-    unit, texts = _units_for(fmt, raw)
+    unit, texts = units if units is not None else _units_for(fmt, raw)
     sections: List[DigestSection] = []
     tables = figures = chars = 0
     for index, text in enumerate(texts, start=1):
@@ -222,10 +230,7 @@ def extract_outline(fmt: str, raw: bytes) -> DocumentDigest:
     )
 
 
-def text_sample(fmt: str, raw: bytes, limit: int = DOCUMENT_DIGEST_SAMPLE_CHARS) -> str:
-    """Up to ``limit`` characters spread across the document (not just its
-    head), so the abstract sees the middle and the end of a long file."""
-    _, texts = _units_for(fmt, raw)
+def _sample_units(fmt: str, texts: List[str], limit: int) -> str:
     if not texts:
         return ""
     if fmt == "pdf":
@@ -233,6 +238,44 @@ def text_sample(fmt: str, raw: bytes, limit: int = DOCUMENT_DIGEST_SAMPLE_CHARS)
         pieces = [t.strip()[:per_page] for t in texts if t.strip()]
         return "\n\n".join(pieces)[:limit]
     return "\n".join(t for t in texts if t.strip())[:limit]
+
+
+def text_sample(
+    fmt: str, raw: bytes, limit: int = DOCUMENT_DIGEST_SAMPLE_CHARS, units: Optional[Units] = None
+) -> str:
+    """Up to ``limit`` characters spread across the document (not just its
+    head), so the abstract sees the middle and the end of a long file."""
+    _, texts = units if units is not None else _units_for(fmt, raw)
+    return _sample_units(fmt, texts, limit)
+
+
+class DocumentText(BaseModel):
+    """A document's text layer, bounded. ``truncated`` means ``text`` is
+    ``text_sample``'s excerpt, not all of it."""
+
+    text: str
+    truncated: bool
+    unit: str
+    count: int
+
+
+def document_text(fmt: str, raw: bytes, limit: int) -> DocumentText:
+    """The whole text layer when it fits in ``limit`` characters, else
+    ``text_sample``'s ``limit``-character excerpt (spread across a PDF's
+    pages, the head of anything else).
+
+    For a model that reads text only (the attachment fallback in
+    ``inference_api/chat/routes.py``): a short document goes over complete,
+    and a long one as an excerpt, with ``document_read`` left to fetch the
+    exact part. Text only — a scanned PDF has no text layer and comes back
+    empty. Blocking; run it off the loop.
+    """
+    unit, texts = _units_for(fmt, raw)
+    separator = "\n\n" if fmt == "pdf" else "\n"
+    full = separator.join(t.strip() if fmt == "pdf" else t for t in texts if t.strip())
+    if len(full) <= limit:
+        return DocumentText(text=full, truncated=False, unit=unit, count=len(texts))
+    return DocumentText(text=_sample_units(fmt, texts, limit), truncated=True, unit=unit, count=len(texts))
 
 
 # ---------------------------------------------------------------------------
@@ -257,25 +300,40 @@ def _abstract_prompt(outline: DocumentDigest, sample: str) -> str:
     return "\n".join(lines)
 
 
+def _converse(region: str, **kwargs: Any) -> Dict[str, Any]:
+    """Run in a worker thread, so a first-use client build stays off the event loop.
+
+    The client is process-cached: one per upload paid botocore's service-model
+    load (~250ms the first time in a process) and, every time, a fresh
+    connection pool — a new TCP+TLS handshake per abstract.
+    """
+    return get_client("bedrock-runtime", region).converse(**kwargs)
+
+
 async def generate_abstract(outline: DocumentDigest, sample: str, model_id: str = DOCUMENT_DIGEST_MODEL_ID) -> Optional[str]:
     """3–5 sentences from the cheap model, or ``None`` (never raises)."""
     if not sample.strip():
         return None
     try:
-        import boto3
-    except ImportError:  # pragma: no cover
-        return None
-    try:
-        client = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "us-west-2"))
         response = await asyncio.to_thread(
-            client.converse,
+            _converse,
+            os.environ.get("AWS_REGION", "us-west-2"),
             modelId=model_id,
             messages=[{"role": "user", "content": [{"text": _abstract_prompt(outline, sample)}]}],
             system=[{"text": _ABSTRACT_SYSTEM_PROMPT}],
-            inferenceConfig={"temperature": 0.2, "maxTokens": _ABSTRACT_MAX_OUTPUT_TOKENS, "topP": 0.9},
+            # Temperature only: Claude 4.5+ rejects `temperature` and `topP`
+            # together, so a Claude DOCUMENT_DIGEST_MODEL_ID would otherwise
+            # silently drop every abstract.
+            inferenceConfig={"temperature": 0.2, "maxTokens": _ABSTRACT_MAX_OUTPUT_TOKENS},
         )
-        if response.get("stopReason") == "max_tokens":
+        stop_reason = response.get("stopReason")
+        if stop_reason == "max_tokens":
             logger.debug("Document abstract hit the token ceiling; discarding")
+            return None
+        # A guardrail or content-filter stop may carry the refusal as its
+        # text; only a finished generation is an abstract.
+        if stop_reason != "end_turn":
+            logger.debug("Document abstract stopped with stopReason=%s; discarding", stop_reason)
             return None
         text = response["output"]["message"]["content"][0]["text"].strip()
         return re.sub(r"\s+", " ", text) or None
@@ -395,17 +453,24 @@ async def build_digest(
     upload_id: str,
     model_id: str = DOCUMENT_DIGEST_MODEL_ID,
     with_abstract: bool = True,
+    units: Optional[Units] = None,
 ) -> DocumentDigest:
     """Outline + abstract + rendered token estimate. Never raises: an
     extraction failure yields ``status="failed"`` with the exception class
-    name; an abstract failure yields a digest without one."""
+    name; an abstract failure yields a digest without one.
+
+    ``units`` must be exactly what ``_units_for(fmt, raw)`` would return (HTML,
+    for one, is tag-stripped there); when given, ``raw`` is not parsed."""
     started = time.monotonic()
     fmt = document_format_for(mime_type, filename)
     if fmt is None:
         return DocumentDigest(status="failed", error="NotADocument", extractor_ms=0)
     try:
-        outline = await asyncio.to_thread(extract_outline, fmt, raw)
-        sample = await asyncio.to_thread(text_sample, fmt, raw) if with_abstract else ""
+        outline = await asyncio.to_thread(extract_outline, fmt, raw, units)
+        sample = (
+            await asyncio.to_thread(text_sample, fmt, raw, DOCUMENT_DIGEST_SAMPLE_CHARS, units)
+            if with_abstract else ""
+        )
     except Exception as e:  # noqa: BLE001
         logger.warning("Document digest extraction failed (%s)", type(e).__name__, exc_info=True)
         return DocumentDigest(

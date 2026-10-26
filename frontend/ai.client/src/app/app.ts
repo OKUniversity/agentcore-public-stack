@@ -13,8 +13,12 @@ import { TooltipDirective } from './components/tooltip/tooltip.directive';
 import { SessionService } from './auth/session.service';
 import { SessionService as SessionListService } from './session/services/session/session.service';
 import { DockedPaneService } from './session/services/docked-pane/docked-pane.service';
-import { isMinimalChromeRoute } from './shared/utils/route-chrome';
+import { isAdminChromeRoute, isMinimalChromeRoute } from './shared/utils/route-chrome';
 import { BrandingService } from '../branding/branding.service';
+import { FEATURES } from './services/features';
+import { SearchDialogService } from './components/search/search-dialog.service';
+import { KeyboardShortcutsService } from './components/shortcuts/keyboard-shortcuts.service';
+import { shortcutAria, withShortcut } from './components/shortcuts/shortcuts';
 
 @Component({
   selector: 'app-root',
@@ -28,6 +32,9 @@ import { BrandingService } from '../branding/branding.service';
   ],
   templateUrl: './app.html',
   styleUrl: './app.css',
+  host: {
+    '(document:keydown)': 'onDocumentKeydown($event)',
+  },
 })
 export class App {
   protected readonly title = signal('boisestate.ai');
@@ -39,6 +46,15 @@ export class App {
   private dockedPane = inject(DockedPaneService);
   private titleService = inject(Title);
   private branding = inject(BrandingService);
+  private searchDialog = inject(SearchDialogService);
+  private shortcuts = inject(KeyboardShortcutsService);
+  protected readonly conversationSearchOn = inject(FEATURES).conversationSearch;
+  protected readonly searchTooltip = withShortcut('Search', 'search');
+  protected readonly searchShortcutAria = shortcutAria('search');
+  protected readonly newChatTooltip = withShortcut('New chat', 'newConversation');
+  protected readonly newChatShortcutAria = shortcutAria('newConversation');
+  protected readonly expandSidebarTooltip = withShortcut('Expand sidebar', 'toggleSidebar');
+  protected readonly sidebarShortcutAria = shortcutAria('toggleSidebar');
 
   /** Re-read on every completed navigation; the value itself is unused,
    *  it exists so `minimalChrome` recomputes when the route changes. */
@@ -61,6 +77,19 @@ export class App {
   protected readonly minimalChrome = computed(() => {
     this.navigated();
     return isMinimalChromeRoute(this.router.routerState.snapshot.root);
+  });
+
+  /**
+   * True when the active route is inside the admin console.
+   *
+   * The console keeps the sidenav — the nav inside it is swapped for the
+   * admin one — but drops the centred `max-w-7xl` content box. That cap is a
+   * reading width for prose; a cost table or a role matrix read inside it
+   * while a conversation list it cannot use held 18rem to its left.
+   */
+  protected readonly adminChrome = computed(() => {
+    this.navigated();
+    return isAdminChromeRoute(this.router.routerState.snapshot.root);
   });
 
   /**
@@ -110,7 +139,21 @@ export class App {
     }
   }
 
+  protected openSearch(): void {
+    void this.searchDialog.open();
+  }
+
   newChat() {
     this.router.navigate(['']);
+  }
+
+  /**
+   * Every document keydown goes to the shortcut table (`components/shortcuts`):
+   * Cmd/Ctrl+K search, Cmd/Ctrl+Shift+O new conversation, Shift+Esc focus the
+   * composer, Cmd/Ctrl+Shift+S sidebar, Cmd/Ctrl+Shift+C copy the last
+   * response, Cmd/Ctrl+/ this list.
+   */
+  onDocumentKeydown(event: KeyboardEvent): void {
+    this.shortcuts.handle(event, { chromeHidden: this.chromeHidden() });
   }
 }

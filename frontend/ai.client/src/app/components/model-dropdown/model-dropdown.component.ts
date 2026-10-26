@@ -1,5 +1,4 @@
-import { Component, ChangeDetectionStrategy, computed, inject } from '@angular/core';
-import { Router } from '@angular/router';
+import { Component, ChangeDetectionStrategy, computed, inject, input, signal } from '@angular/core';
 import { CdkMenuTrigger, CdkMenu, CdkMenuItem } from '@angular/cdk/menu';
 import { ConnectedPosition } from '@angular/cdk/overlay';
 import { NgIcon, provideIcons } from '@ng-icons/core';
@@ -11,6 +10,7 @@ import {
   effortLevelLabel,
 } from '../../admin/manage-models/models/managed-model.model';
 import { ModelOptionComponent } from './components/model-option.component';
+import { PromptCacheGuardService } from '../../session/services/prompt-cache/prompt-cache-guard.service';
 
 @Component({
   selector: 'app-model-dropdown',
@@ -22,7 +22,8 @@ import { ModelOptionComponent } from './components/model-option.component';
       @if (modelService.agentModelLocked()) {
         <!-- Agent-dictated: the active agent pins this model; the picker is locked. -->
         <div
-          class="flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm/5 text-gray-500 dark:text-gray-400"
+          class="flex items-center rounded-lg text-gray-500 dark:text-gray-400"
+          [class]="lockedClass()"
           title="This agent runs on a fixed model"
         >
           <ng-icon name="heroLockClosed" class="size-3.5 shrink-0" aria-hidden="true" />
@@ -33,21 +34,25 @@ import { ModelOptionComponent } from './components/model-option.component';
         <button
           type="button"
           [cdkMenuTriggerFor]="modelMenu"
-          [cdkMenuPosition]="menuPositions"
-          class="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm/5 text-gray-600 transition-colors hover:bg-gray-100 hover:text-gray-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-primary)] dark:text-gray-400 dark:hover:bg-white/5 dark:hover:text-gray-300"
+          [cdkMenuPosition]="menuPositions()"
+          (cdkMenuOpened)="onMenuOpened()"
+          (cdkMenuClosed)="onMenuClosed()"
+          [class]="triggerSizeClass()"
+          class="group flex items-center rounded-lg text-gray-600 transition-colors hover:bg-gray-200 hover:text-gray-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-primary)] dark:text-gray-400 dark:hover:bg-white/5 dark:hover:text-gray-300"
           aria-label="Select model"
         >
           <span>{{ modelService.selectedModel().modelName || 'Loading...' }}</span>
           @if (activeEffortLabel(); as effort) {
             <!-- The active effort rides in the trigger so it's visible without
                  opening the menu — it changes cost and latency, not just output. -->
-            <span class="text-gray-400 dark:text-gray-500">{{ effort }}</span>
+            <span class="text-gray-500 group-hover:text-gray-600 dark:text-gray-500 dark:group-hover:text-gray-500">{{ effort }}</span>
           }
           <svg
             viewBox="0 0 20 20"
             fill="currentColor"
             aria-hidden="true"
-            class="size-4 transition-transform"
+            class="transition-transform"
+            [class]="size() === 'compact' ? 'size-3.5' : 'size-4'"
             [class.rotate-180]="isMenuOpen()"
           >
             <path
@@ -62,8 +67,6 @@ import { ModelOptionComponent } from './components/model-option.component';
       <ng-template #modelMenu>
         <div
           cdkMenu
-          (closed)="onMenuClosed()"
-          (opened)="onMenuOpened()"
           class="w-72 rounded-md bg-white p-1.5 shadow-lg ring-1 ring-black/5 focus:outline-hidden dark:bg-gray-800 dark:ring-white/10 animate-in fade-in slide-in-from-top-1 duration-200"
           role="menu"
           aria-orientation="vertical"
@@ -105,7 +108,7 @@ import { ModelOptionComponent } from './components/model-option.component';
                 cdkMenuItem
                 [model]="model"
                 [selected]="isSelected(model)"
-                [showNewChatHint]="sessionService.hasCurrentSession()"
+                [successorName]="modelService.modelNameFor(model.replacedBy)"
                 (cdkMenuItemTriggered)="selectModel(model)"
               />
             }
@@ -203,7 +206,7 @@ import { ModelOptionComponent } from './components/model-option.component';
                       cdkMenuItem
                       [model]="model"
                       [selected]="isSelected(model)"
-                      [showNewChatHint]="sessionService.hasCurrentSession()"
+                      [successorName]="modelService.modelNameFor(model.replacedBy)"
                       (cdkMenuItemTriggered)="selectModel(model)"
                     />
                   }
@@ -251,10 +254,14 @@ export class ModelDropdownComponent {
   // Inject services
   protected modelService = inject(ModelService);
   protected sessionService = inject(SessionService);
-  private router = inject(Router);
+  private cacheGuard = inject(PromptCacheGuardService);
 
-  // Internal state
-  protected menuOpen = false;
+  /**
+   * Whether the model menu is open, driving the trigger's chevron. Fed by the
+   * trigger's `cdkMenuOpened` / `cdkMenuClosed` outputs — `CdkMenu` itself has
+   * no `opened` output, so an `(opened)` binding on the panel never fires.
+   */
+  private readonly menuOpen = signal(false);
 
   /** The effort control for the selected model, or null when it offers none. */
   protected readonly effortControl = this.modelService.effortControl;
@@ -265,23 +272,44 @@ export class ModelDropdownComponent {
     return level ? effortLevelLabel(level) : null;
   });
 
-  // Menu positioning - align to bottom-left of trigger
-  protected menuPositions: ConnectedPosition[] = [
-    {
-      originX: 'start',
-      originY: 'bottom',
-      overlayX: 'start',
-      overlayY: 'top',
-      offsetY: 8
-    },
-    {
-      originX: 'start',
-      originY: 'top',
-      overlayX: 'start',
-      overlayY: 'bottom',
-      offsetY: -8
+  /**
+   * `compact` is the picker as it sits in the line beneath a compact composer:
+   * the meta line's type size, and a menu that opens upward from the right,
+   * because that line is the bottom-right corner of the viewport. `default` is
+   * the picker in the empty state's control bar.
+   */
+  readonly size = input<'default' | 'compact'>('default');
+
+  /**
+   * Which way the compact picker's menu prefers to open. Up suits a thread's
+   * composer pinned to the bottom of the viewport; down suits the empty
+   * state's, which sits mid-page with the room beneath it. Either flips when
+   * the preferred side is cramped.
+   */
+  readonly menuOpens = input<'up' | 'down'>('up');
+
+  protected readonly triggerSizeClass = computed(() =>
+    this.size() === 'compact' ? 'gap-1 px-2 py-1 text-xs/5' : 'gap-1.5 px-3 py-1.5 text-sm/5',
+  );
+
+  protected readonly lockedClass = computed(() =>
+    this.size() === 'compact' ? 'gap-1.5 px-2 py-1 text-xs/5' : 'gap-2 px-3 py-1.5 text-sm/5',
+  );
+
+  // Menu positioning - below the trigger's left edge, flipping above when there
+  // is no room; the compact picker anchors to its right edge, above or below
+  // as `menuOpens` prefers.
+  protected readonly menuPositions = computed<ConnectedPosition[]>(() => {
+    if (this.size() === 'compact') {
+      const above: ConnectedPosition = { originX: 'end', originY: 'top', overlayX: 'end', overlayY: 'bottom', offsetY: -8 };
+      const below: ConnectedPosition = { originX: 'end', originY: 'bottom', overlayX: 'end', overlayY: 'top', offsetY: 8 };
+      return this.menuOpens() === 'up' ? [above, below] : [below, above];
     }
-  ];
+    return [
+      { originX: 'start', originY: 'bottom', overlayX: 'start', overlayY: 'top', offsetY: 8 },
+      { originX: 'start', originY: 'top', overlayX: 'start', overlayY: 'bottom', offsetY: -8 },
+    ];
+  });
 
   // Submenus fly out to the right of their parent row, flipping to the left
   // when there isn't room — the picker sits in the composer, which can be
@@ -318,33 +346,56 @@ export class ModelDropdownComponent {
   ];
 
   protected isMenuOpen(): boolean {
-    return this.menuOpen;
+    return this.menuOpen();
   }
 
   protected onMenuOpened(): void {
-    this.menuOpen = true;
+    this.menuOpen.set(true);
   }
 
   protected onMenuClosed(): void {
-    this.menuOpen = false;
+    this.menuOpen.set(false);
   }
 
   protected levelLabel(level: string): string {
     return effortLevelLabel(level);
   }
 
-  protected selectEffort(level: string): void {
+  /**
+   * Change the effort level. The level is part of the request the prompt
+   * cache is keyed on, so in an open conversation the user is asked first
+   * (when the cache is warm and the re-write is worth asking about).
+   */
+  protected async selectEffort(level: string): Promise<void> {
+    const current = this.modelService.selectedEffort();
+    if (level === current) return;
+    if (current && this.sessionService.hasCurrentSession()) {
+      const confirmed = await this.cacheGuard.confirm({
+        kind: 'effort',
+        model: this.modelService.selectedModel(),
+        fromLabel: effortLevelLabel(current),
+        toLabel: effortLevelLabel(level),
+        toLevel: level,
+      });
+      if (!confirmed) return;
+    }
     this.modelService.setEffort(level);
   }
 
-  protected selectModel(model: ManagedModel): void {
-    // If in an active session and selecting a different model, navigate to new chat
-    if (this.sessionService.hasCurrentSession() && !this.isSelected(model)) {
-      this.modelService.setSelectedModel(model);
-      this.router.navigate(['']);
-    } else {
-      this.modelService.setSelectedModel(model);
+  /**
+   * Choose a model. An open conversation continues on the new model in place,
+   * keeping its Agent or project binding. The next message re-processes the
+   * whole conversation on the new model's cache, so the user is asked first
+   * (when the cache is warm and the re-write is worth asking about).
+   */
+  protected async selectModel(model: ManagedModel): Promise<void> {
+    const current = this.modelService.selectedModel();
+    if (current.modelId === model.modelId) return;
+    if (current.modelId && this.sessionService.hasCurrentSession()) {
+      const confirmed = await this.cacheGuard.confirm({ kind: 'model', from: current, to: model });
+      if (!confirmed) return;
     }
+    this.modelService.setSelectedModel(model);
   }
 
   protected isSelected(model: ManagedModel): boolean {

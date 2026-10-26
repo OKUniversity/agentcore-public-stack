@@ -45,6 +45,82 @@ export interface SystemCostSummary {
 
 // ========== Model Usage Summary ==========
 
+/** One AWS service's cost for a period, as Cost Explorer reported it. */
+export interface PlatformServiceCost {
+  serviceName: string;
+  cost: number;
+  /**
+   * `platform` — infrastructure this platform causes (ECS, AgentCore, NAT…).
+   * `inference` — per-token model SKUs; reconciliation only, never summed
+   *               into a total (our own ledger is the source for those).
+   * `excluded`  — another team's resources in the same account, plus
+   *               account-level charges no single application causes
+   *               (Support, the Control Tower governance baseline).
+   *               Returned rather than filtered so an operator can see what
+   *               was held out of the total they are being shown.
+   */
+  category: 'platform' | 'inference' | 'excluded';
+  /** Share of the PLATFORM subtotal, not of the grand total. */
+  percentageOfPlatform: number;
+}
+
+/**
+ * All-in platform cost for a period.
+ *
+ * Mirrors `PlatformCostSummary` in
+ * backend/src/apis/app_api/admin/costs/models.py — a breaking change to
+ * either needs both in the same PR.
+ *
+ * `inferenceCost` comes from our own per-user ledger; `platformCost` comes
+ * from Cost Explorer. `ceInferenceCost` is Cost Explorer's own figure for the
+ * model SKUs and exists ONLY to reconcile the two — it is never added to a
+ * total, and a widening `reconciliationDeltaPercent` means our pricing tables
+ * have drifted from what AWS actually charged.
+ */
+export interface PlatformCostSummary {
+  period: string;
+  /**
+   * False when the daily sync has never run for this period — the feature is
+   * opt-in per environment. Render an explanation, never a zero: "$0.00
+   * platform cost" reads as "the infrastructure is free".
+   */
+  available: boolean;
+
+  inferenceCost: number;
+  platformCost: number;
+  totalCost: number;
+  excludedCost: number;
+
+  platformSharePercent: number;
+
+  activeUsers: number;
+  costPerUser: number;
+  inferenceCostPerUser: number;
+  platformCostPerUser: number;
+
+  ceInferenceCost: number;
+  reconciliationDelta: number;
+  reconciliationDeltaPercent: number;
+
+  services: PlatformServiceCost[];
+
+  /**
+   * `deployment` — filtered to this stack's own resources via its `Project`
+   * tag. `account` — the tag is not activated in the payer account, so these
+   * figures cover everything in the account: a ceiling, not an attribution.
+   * Always label which one the reader is looking at.
+   */
+  scope: 'deployment' | 'account';
+  projectTag: string | null;
+
+  partialMonth: boolean;
+  coverageStart: string | null;
+  coverageEnd: string | null;
+  accountId: string | null;
+  currency: string;
+  syncedAt: string | null;
+}
+
 export interface ModelUsageSummary {
   modelId: string;
   modelName: string;
@@ -108,7 +184,16 @@ export type CacheStatus =
   | 'partial_miss'
   | 'miss_ttl_expired'
   | 'miss_avoidable'
-  | 'uncached';
+  | 'uncached'
+  /**
+   * The call's usage was never reported, so its cache outcome was not
+   * measured — today only an interrupted turn's cut generation, whose
+   * terminal usage event never arrived. Deliberately not a classification:
+   * the tokens on such a row are an attribution (see `usageEstimated`), and a
+   * plausible-looking `first_write` derived from them would send a cache
+   * investigation after a call nobody measured.
+   */
+  | 'estimated';
 
 /** Prompt-cache prefix hashes for one model call. */
 export interface PrefixFingerprints {
@@ -183,6 +268,15 @@ export interface SessionCallRow {
   cachePrefixGapSeconds?: number | null;
   wastedUsd: number;
   /**
+   * Present when this call's usage was estimated rather than reported by the
+   * provider — an interrupted turn's cut generation. A field → method map
+   * (`projection`, `native_count`, `chars_per_token`, `assumed_first_write`,
+   * …), so the tokens and the cost on this row are never mistaken for a
+   * measurement. Such a row's `cacheStatus` is `estimated` and its
+   * `wastedUsd` is zero by construction.
+   */
+  usageEstimated?: Record<string, string> | null;
+  /**
    * Which Agent ran this call, and whether that changed from the call before it (#756).
    *
    * An `@`-mention hands one turn to a different Agent, which genuinely re-writes the
@@ -192,6 +286,12 @@ export interface SessionCallRow {
    */
   turnAgentId?: string | null;
   agentSwitched?: boolean;
+  /**
+   * This call ran on a different model than the call before it. A mid-conversation
+   * model switch keeps the conversation, and each model has its own cache, so the first
+   * call on the new model re-writes the prefix with unchanged fingerprints.
+   */
+  modelSwitched?: boolean;
   prefixFingerprints?: PrefixFingerprints | null;
   /** Context ledger — absent on rows written before it shipped or with diagnostics off. */
   prefixTokens?: PrefixTokens | null;
@@ -243,6 +343,12 @@ export interface SessionCostAnatomy {
    */
   agentSwitchMissCount: number;
   agentSwitchUsd: number;
+  /**
+   * The subset a model switch explains, excluding calls already counted as an Agent
+   * switch, so the two pairs never overlap and both can be subtracted.
+   */
+  modelSwitchMissCount: number;
+  modelSwitchUsd: number;
   /** cacheRead / (cacheRead + cacheWrite); null until any cache activity. */
   cacheEfficiency: number | null;
 }

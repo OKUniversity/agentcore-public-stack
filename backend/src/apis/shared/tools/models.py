@@ -5,12 +5,16 @@ Pydantic models for tool catalog, user tool access, and preferences.
 Integrates with the existing AppRole RBAC system.
 """
 
+import logging
+import re
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Set, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from apis.shared.timestamps import from_iso, to_iso
+
+logger = logging.getLogger(__name__)
 
 # EntityTypeIndex (GSI5) partition value for tool-catalog rows.
 #
@@ -35,6 +39,7 @@ class ToolCategory(str, Enum):
     RESEARCH = "research"
     FINANCE = "finance"
     GATEWAY = "gateway"
+    ACCOUNT = "account"  # Platform self-service tools (whoami, get_my_quota, etc.)
     CUSTOM = "custom"
 
 
@@ -130,6 +135,17 @@ class ToolStatus(str, Enum):
     COMING_SOON = "coming_soon"
 
 
+def is_disabled_status(status: Any) -> bool:
+    """Whether a catalog row's status takes the tool out of service.
+
+    Accepts the enum or its bare string (rows round-trip through DynamoDB as
+    strings); a missing status is active. Only ``disabled`` counts:
+    ``deprecated`` means "being retired" and keeps working for anyone who
+    already has the tool (docs/specs/mcp-server-retirement.md §7).
+    """
+    return getattr(status, "value", status) == ToolStatus.DISABLED.value
+
+
 # =============================================================================
 # External Tool Configuration Models
 # =============================================================================
@@ -143,6 +159,17 @@ class MCPToolEntry(BaseModel):
         default=False,
         description="If true, the agent must request user confirmation before invoking this tool.",
     )
+    always_on: bool = Field(
+        default=False,
+        description=(
+            "If true, this one tool of the server is pinned into every turn's "
+            "effective toolset for users whose roles grant the server, and the "
+            "user cannot turn it off. Enables, never grants. Prefer this over "
+            "flagging the whole server: an always-on server puts every one of "
+            "its tool schemas in the cacheable toolConfig for the life of every "
+            "session. See docs/specs/admin-always-on-tools.md."
+        ),
+    )
     description: Optional[str] = Field(
         None, description="Optional admin-supplied description for this tool"
     )
@@ -151,6 +178,7 @@ class MCPToolEntry(BaseModel):
         return {
             "name": self.name,
             "needsApproval": self.needs_approval,
+            "alwaysOn": self.always_on,
             "description": self.description,
         }
 
@@ -159,6 +187,9 @@ class MCPToolEntry(BaseModel):
         return cls(
             name=data.get("name", ""),
             needs_approval=bool(data.get("needsApproval", False)),
+            # Absent on every row written before always-on shipped, so it reads
+            # back False and the entry behaves exactly as it did.
+            always_on=bool(data.get("alwaysOn", False)),
             description=data.get("description"),
         )
 
@@ -178,6 +209,113 @@ def _parse_mcp_tools(raw: object) -> List[MCPToolEntry]:
         elif isinstance(item, str):
             entries.append(MCPToolEntry(name=item))
     return entries
+
+
+# Static headers an admin may add to every request to an external MCP server
+# (e.g. `X-MCP-Toolsets: issues,context` for GitHub's MCP server). They are
+# stored in plain text on the catalog row and shown on the admin form, so they
+# are configuration, never credentials — secrets belong in `secret_arn`.
+MAX_CUSTOM_HEADERS = 10
+MAX_CUSTOM_HEADER_NAME_LENGTH = 128
+MAX_CUSTOM_HEADER_VALUE_LENGTH = 1024
+
+# Names the transport or an auth mode already owns. Letting a static header
+# set one would either clobber the auth the server checks (Authorization,
+# Cookie, the SigV4 `x-amz-*` set), hijack the MCP session (Mcp-Session-Id,
+# Mcp-Protocol-Version) or corrupt framing (Content-Length, ...).
+RESERVED_CUSTOM_HEADER_NAMES = frozenset(
+    {
+        "accept",
+        "authorization",
+        "connection",
+        "content-length",
+        "content-type",
+        "cookie",
+        "host",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "proxy-authorization",
+        "transfer-encoding",
+    }
+)
+RESERVED_CUSTOM_HEADER_PREFIXES = ("x-amz-",)
+
+# RFC 9110 field-name token, and a value of printable ASCII plus tab — no
+# CR/LF, so a value can never smuggle a second header line.
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_HEADER_VALUE_RE = re.compile(r"^[\t\x20-\x7e]*$")
+
+
+def validate_custom_headers(raw: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Validate and normalize an MCP connector's static custom headers.
+
+    Returns a new dict with stripped names and values, sorted by name so the
+    stored row, the wire request and any cache identity are deterministic.
+    Raises ``ValueError`` (a 422 on a request model) for a reserved or
+    malformed name, a case-insensitive duplicate, an empty or malformed value,
+    or more than ``MAX_CUSTOM_HEADERS`` entries.
+    """
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("customHeaders must be an object of header name to value")
+    if len(raw) > MAX_CUSTOM_HEADERS:
+        raise ValueError(f"At most {MAX_CUSTOM_HEADERS} custom headers are allowed")
+
+    normalized: Dict[str, str] = {}
+    seen: Set[str] = set()
+    for raw_name, raw_value in raw.items():
+        name = str(raw_name).strip()
+        if not name:
+            raise ValueError("Custom header names cannot be empty")
+        if len(name) > MAX_CUSTOM_HEADER_NAME_LENGTH or not _HEADER_NAME_RE.match(name):
+            raise ValueError(f"'{name}' is not a valid HTTP header name")
+        lowered = name.lower()
+        if lowered in RESERVED_CUSTOM_HEADER_NAMES or lowered.startswith(
+            RESERVED_CUSTOM_HEADER_PREFIXES
+        ):
+            raise ValueError(
+                f"'{name}' is set by the MCP transport or its authentication "
+                "and cannot be a custom header"
+            )
+        if lowered in seen:
+            raise ValueError(f"Custom header '{name}' is listed more than once")
+        seen.add(lowered)
+
+        if not isinstance(raw_value, str):
+            raise ValueError(f"Custom header '{name}' must have a text value")
+        value = raw_value.strip()
+        if not value:
+            raise ValueError(f"Custom header '{name}' needs a value")
+        if len(value) > MAX_CUSTOM_HEADER_VALUE_LENGTH or not _HEADER_VALUE_RE.match(value):
+            raise ValueError(
+                f"Custom header '{name}' must be printable ASCII of at most "
+                f"{MAX_CUSTOM_HEADER_VALUE_LENGTH} characters"
+            )
+        normalized[name] = value
+
+    return dict(sorted(normalized.items(), key=lambda item: item[0].lower()))
+
+
+def _stored_custom_headers(raw: object) -> Dict[str, str]:
+    """Read a catalog row's headers, dropping any that no longer validate.
+
+    Rows were validated on write, so this only matters if the rules tighten
+    later (a newly reserved name). Dropping the offending header keeps the
+    rest of the row, and the tool, loadable instead of failing the read.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    kept: Dict[str, Tuple[str, str]] = {}
+    for name, value in raw.items():
+        try:
+            ((clean_name, clean_value),) = validate_custom_headers({name: value}).items()
+        except ValueError as exc:
+            logger.warning("Dropping stored MCP custom header: %s", exc)
+            continue
+        kept.setdefault(clean_name.lower(), (clean_name, clean_value))
+    survivors = sorted(kept.values(), key=lambda item: item[0].lower())
+    return dict(survivors[:MAX_CUSTOM_HEADERS])
 
 
 class MCPServerConfig(BaseModel):
@@ -211,11 +349,19 @@ class MCPServerConfig(BaseModel):
         None,
         description="Secrets Manager ARN for credentials (API key, OAuth client secrets)",
     )
+    custom_headers: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Static headers sent on every request to the server, e.g. "
+        "`X-MCP-Toolsets: issues,context`. Stored and displayed in plain text, so "
+        "NOT for secrets — credentials belong in `secret_arn`. Names the transport "
+        "or auth owns (Authorization, Cookie, Host, Mcp-Session-Id, ...) are refused.",
+    )
 
     # MCP tool discovery
     tools: List[MCPToolEntry] = Field(
         default_factory=list,
         description="Tools available on this MCP server, with per-tool flags. "
+        "When non-empty, only these tools are offered to the model. "
         "Empty means discover at runtime (no per-tool flags applied).",
     )
 
@@ -228,6 +374,11 @@ class MCPServerConfig(BaseModel):
     )
 
     model_config = {"use_enum_values": True}
+
+    @field_validator("custom_headers", mode="before")
+    @classmethod
+    def _validate_custom_headers(cls, value: Any) -> Dict[str, str]:
+        return validate_custom_headers(value)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for DynamoDB storage."""
@@ -242,6 +393,7 @@ class MCPServerConfig(BaseModel):
             "awsRegion": self.aws_region,
             "apiKeyHeader": self.api_key_header,
             "secretArn": self.secret_arn,
+            "customHeaders": dict(self.custom_headers),
             "tools": [entry.to_dict() for entry in self.tools],
             "healthCheckEnabled": self.health_check_enabled,
             "healthCheckIntervalSeconds": self.health_check_interval_seconds,
@@ -259,6 +411,7 @@ class MCPServerConfig(BaseModel):
             aws_region=data.get("awsRegion"),
             api_key_header=data.get("apiKeyHeader"),
             secret_arn=data.get("secretArn"),
+            custom_headers=_stored_custom_headers(data.get("customHeaders")),
             tools=_parse_mcp_tools(data.get("tools", [])),
             health_check_enabled=data.get("healthCheckEnabled", False),
             health_check_interval_seconds=data.get("healthCheckIntervalSeconds", 300),
@@ -630,6 +783,60 @@ class ToolDefinition(BaseModel):
     # Technical metadata
     protocol: ToolProtocol = Field(..., description="How the tool is invoked")
     status: ToolStatus = Field(default=ToolStatus.ACTIVE)
+    retirement_note: Optional[str] = Field(
+        None,
+        description=(
+            "What a user should do instead, shown wherever a non-active tool is "
+            "surfaced (e.g. 'Replaced by Canvas for Faculty', 'No replacement — "
+            "contact OIT'). Free text rather than a replacedBy tool id on purpose: "
+            "a retirement often has no drop-in successor, or splits across several, "
+            "and an id cannot say so. Display only — it never reaches the model's "
+            "toolConfig, so it costs nothing per turn. "
+            "See docs/specs/mcp-server-retirement.md §7."
+        ),
+    )
+    retires_on: Optional[str] = Field(
+        None,
+        description=(
+            "ISO date (YYYY-MM-DD) the tool stops working — i.e. when Stage 3 "
+            "revokes its grant and every Agent binding it starts failing. Display "
+            "only, and advisory: nothing schedules off it, because a retirement is "
+            "driven by the runbook, not by a timer."
+        ),
+    )
+
+    @field_validator("retirement_note", "retires_on", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v: object) -> object:
+        """Treat an empty or whitespace-only value as unset.
+
+        The admin form posts ``""`` for an untouched optional input, and a tool
+        carrying ``retirementNote: ""`` would render an empty reason line rather
+        than none at all.
+        """
+        if isinstance(v, str):
+            v = v.strip()
+            return v or None
+        return v
+
+    @field_validator("retires_on")
+    @classmethod
+    def _validate_retires_on(cls, v: Optional[str]) -> Optional[str]:
+        """Reject anything that is not a plain ISO date.
+
+        Stored as a string rather than a ``date`` because it is displayed, never
+        computed with, and a string round-trips through DynamoDB unchanged. That
+        is exactly why it needs a guard on the way in: without one, "soon" or
+        "9/30/26" would persist happily and reach the SPA as-is.
+        """
+        if v is None:
+            return None
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(f"retiresOn must be an ISO date (YYYY-MM-DD), got '{v}'")
+        return v
+
     requires_oauth_provider: Optional[str] = Field(
         None,
         description="OAuth provider ID if tool requires user OAuth connection (e.g., 'google_workspace')",
@@ -686,6 +893,66 @@ class ToolDefinition(BaseModel):
         default=False,
         description="If true, tool is enabled when user first accesses it",
     )
+    always_on: bool = Field(
+        default=False,
+        description=(
+            "If true, the tool is pinned into every turn's effective toolset "
+            "for users whose roles grant it, and the user cannot turn it off. "
+            "Enables, never grants: a user whose roles do not carry the tool is "
+            "unaffected. See docs/specs/admin-always-on-tools.md."
+        ),
+    )
+    system: bool = Field(
+        default=False,
+        description=(
+            "Provenance flag: a platform-shipped ('system') capability, as "
+            "opposed to an admin-configured tool. A system tool is pinned into "
+            "every turn for users whose roles grant it — like `always_on`, but "
+            "it is part of the app rather than a per-deployment admin knob, so "
+            "it is included regardless of the ADMIN_ALWAYS_ON_TOOLS_ENABLED "
+            "flag. Implies `always_on`. See "
+            ".kiro/specs/platform-self-service/design.md."
+        ),
+    )
+    hidden: bool = Field(
+        default=False,
+        description=(
+            "If true, this tool is excluded from the user-facing Tools panel "
+            "toggle list (GET /tools/), but is still returned in the catalog "
+            "payload flagged `hidden` so the SPA can label a tool-use event in "
+            "the transcript. Used for pure-plumbing system tools (e.g. whoami) "
+            "the user should see the agent using but should not manage. Does "
+            "NOT affect whether the tool is in the model's effective toolset."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _normalize_always_on(self) -> "ToolDefinition":
+        """An always-on (or system) tool is necessarily on by default.
+
+        ``enabled_by_default=False`` + ``always_on=True`` is incoherent — the
+        tool is pinned on for everyone, so "off until the user turns it on"
+        describes nothing. The spec chose two booleans over a three-state enum
+        to avoid migrating every catalog row, request model and SPA model
+        (docs/specs/admin-always-on-tools.md §2.2), and this validator is what
+        pays for that choice: it makes the invalid pair unrepresentable.
+
+        A ``system`` tool is a platform-shipped pin, so it implies ``always_on``
+        (and therefore ``enabled_by_default``). Normalising here means every
+        downstream reader — the effective-set resolver, the panel builder, the
+        freshness snapshot — can trust ``always_on`` alone without also testing
+        ``system``.
+
+        ⚠️ **Load-bearing — do not delete as redundant.** It runs on read as
+        well as write (``mode="after"`` fires for ``from_dynamo_item`` too), so
+        a hand-written DynamoDB item cannot produce the invalid pair either.
+        It retires only when the ``toolEnablement`` enum lands (§10.3).
+        """
+        if self.system:
+            self.always_on = True
+        if self.always_on and not self.enabled_by_default:
+            self.enabled_by_default = True
+        return self
 
     # External tool configuration (protocol-specific)
     mcp_config: Optional[MCPServerConfig] = Field(
@@ -765,11 +1032,16 @@ class ToolDefinition(BaseModel):
             "category": self.category if isinstance(self.category, str) else self.category.value,
             "protocol": self.protocol if isinstance(self.protocol, str) else self.protocol.value,
             "status": self.status if isinstance(self.status, str) else self.status.value,
+            "retirementNote": self.retirement_note,
+            "retiresOn": self.retires_on,
             "requiresOauthProvider": self.requires_oauth_provider,
             "forwardAuthToken": self.forward_auth_token,
             "tokenExchangeAudience": self.token_exchange_audience,
             "isPublic": self.is_public,
             "enabledByDefault": self.enabled_by_default,
+            "alwaysOn": self.always_on,
+            "system": self.system,
+            "hidden": self.hidden,
             "createdAt": to_iso(self.created_at) if self.created_at else None,
             "updatedAt": to_iso(self.updated_at) if self.updated_at else None,
             "createdBy": self.created_by,
@@ -829,11 +1101,23 @@ class ToolDefinition(BaseModel):
             category=item.get("category", ToolCategory.UTILITY),
             protocol=protocol,
             status=item.get("status", ToolStatus.ACTIVE),
+            # Absent on every row written before retirement metadata shipped, so
+            # they read back None and the tool renders exactly as it did.
+            retirement_note=item.get("retirementNote"),
+            retires_on=item.get("retiresOn"),
             requires_oauth_provider=item.get("requiresOauthProvider"),
             forward_auth_token=item.get("forwardAuthToken", False),
             token_exchange_audience=item.get("tokenExchangeAudience"),
             is_public=item.get("isPublic", False),
             enabled_by_default=item.get("enabledByDefault", False),
+            # Absent on every row written before always-on shipped, so it reads
+            # back False and the tool behaves exactly as it did.
+            always_on=item.get("alwaysOn", False),
+            # Absent on every row written before the system tier shipped, so
+            # they read back False and the tool is an ordinary, user-toggleable,
+            # visible tool (backward compatible).
+            system=item.get("system", False),
+            hidden=item.get("hidden", False),
             mcp_config=mcp_config,
             a2a_config=a2a_config,
             mcp_gateway_config=mcp_gateway_config,
@@ -897,6 +1181,14 @@ class UserToolServerTool(BaseModel):
     description: Optional[str] = None
     needs_approval: bool = Field(default=False, alias="needsApproval")
     enabled: bool = True
+    always_on: bool = Field(
+        default=False,
+        alias="alwaysOn",
+        description=(
+            "An admin pinned this individual tool of the server. `enabled` is "
+            "forced True and the picker must render it locked."
+        ),
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -913,6 +1205,11 @@ class UserToolAccess(BaseModel):
     category: ToolCategory
     protocol: ToolProtocol
     status: ToolStatus
+    # What to do instead, and when it stops working. Only ever set on a
+    # non-active tool; the SPA shows them beside the `retiring` badge so the
+    # answer to "then what?" is on the same card as the bad news.
+    retirement_note: Optional[str] = Field(None, alias="retirementNote")
+    retires_on: Optional[str] = Field(None, alias="retiresOn")
     requires_oauth_provider: Optional[str] = Field(None, alias="requiresOauthProvider")
 
     # For MCP-server tools (protocol 'mcp'/'mcp_external'): the individual tools
@@ -929,6 +1226,28 @@ class UserToolAccess(BaseModel):
         description="List of sources that grant access (e.g., ['public', 'power_user', 'researcher'])",
     )
     enabled_by_default: bool = Field(..., alias="enabledByDefault")
+    hidden: bool = Field(
+        default=False,
+        alias="hidden",
+        description=(
+            "This tool is a hidden system capability. The SPA MUST exclude it "
+            "from the Tools panel toggle list, but SHOULD keep it in its "
+            "in-memory tool map so a tool-use event in the transcript can be "
+            "labeled with the tool's display name and icon. See "
+            ".kiro/specs/platform-self-service/design.md."
+        ),
+    )
+    always_on: bool = Field(
+        default=False,
+        alias="alwaysOn",
+        description=(
+            "An admin pinned this tool: it is unioned into every turn and the "
+            "user cannot turn it off. `is_enabled` is forced True. Note this is "
+            "the *effective* lock for THIS user — it is only set when the "
+            "caller's roles actually grant the tool, because always-on enables "
+            "and never grants."
+        ),
+    )
 
     # Current user state
     user_enabled: Optional[bool] = Field(
@@ -973,6 +1292,7 @@ class MCPToolEntryPayload(BaseModel):
 
     name: str
     needs_approval: bool = Field(default=False, alias="needsApproval")
+    always_on: bool = Field(default=False, alias="alwaysOn")
     description: Optional[str] = None
 
     model_config = {"populate_by_name": True}
@@ -981,6 +1301,7 @@ class MCPToolEntryPayload(BaseModel):
         return MCPToolEntry(
             name=self.name,
             needs_approval=self.needs_approval,
+            always_on=self.always_on,
             description=self.description,
         )
 
@@ -989,6 +1310,7 @@ class MCPToolEntryPayload(BaseModel):
         return cls(
             name=entry.name,
             needs_approval=entry.needs_approval,
+            always_on=entry.always_on,
             description=entry.description,
         )
 
@@ -1004,6 +1326,9 @@ class MCPServerConfigRequest(BaseModel):
     aws_region: Optional[str] = Field(None, alias="awsRegion")
     api_key_header: Optional[str] = Field(None, alias="apiKeyHeader")
     secret_arn: Optional[str] = Field(None, alias="secretArn")
+    custom_headers: Dict[str, str] = Field(
+        default_factory=dict, alias="customHeaders"
+    )
     tools: List[MCPToolEntryPayload] = Field(default_factory=list)
     health_check_enabled: bool = Field(default=False, alias="healthCheckEnabled")
     health_check_interval_seconds: int = Field(
@@ -1011,6 +1336,11 @@ class MCPServerConfigRequest(BaseModel):
     )
 
     model_config = {"populate_by_name": True, "use_enum_values": True}
+
+    @field_validator("custom_headers", mode="before")
+    @classmethod
+    def _validate_custom_headers(cls, value: Any) -> Dict[str, str]:
+        return validate_custom_headers(value)
 
     def to_model(self) -> MCPServerConfig:
         """Convert to MCPServerConfig model."""
@@ -1021,6 +1351,7 @@ class MCPServerConfigRequest(BaseModel):
             aws_region=self.aws_region,
             api_key_header=self.api_key_header,
             secret_arn=self.secret_arn,
+            custom_headers=self.custom_headers,
             tools=[entry.to_model() for entry in self.tools],
             health_check_enabled=self.health_check_enabled,
             health_check_interval_seconds=self.health_check_interval_seconds,
@@ -1119,11 +1450,14 @@ class ToolCreateRequest(BaseModel):
     category: ToolCategory = Field(default=ToolCategory.UTILITY)
     protocol: ToolProtocol = Field(default=ToolProtocol.LOCAL)
     status: ToolStatus = Field(default=ToolStatus.ACTIVE)
+    retirement_note: Optional[str] = Field(None, max_length=300, alias="retirementNote")
+    retires_on: Optional[str] = Field(None, alias="retiresOn")
     requires_oauth_provider: Optional[str] = Field(None, alias="requiresOauthProvider")
     forward_auth_token: bool = Field(default=False, alias="forwardAuthToken")
     token_exchange_audience: Optional[str] = Field(None, alias="tokenExchangeAudience")
     is_public: bool = Field(default=False, alias="isPublic")
     enabled_by_default: bool = Field(default=False, alias="enabledByDefault")
+    always_on: bool = Field(default=False, alias="alwaysOn")
 
     # External tool configurations (optional based on protocol)
     mcp_config: Optional[MCPServerConfigRequest] = Field(None, alias="mcpConfig")
@@ -1145,11 +1479,22 @@ class ToolUpdateRequest(BaseModel):
     category: Optional[ToolCategory] = None
     protocol: Optional[ToolProtocol] = None
     status: Optional[ToolStatus] = None
+    # Same partial-update contract as `always_on` below: absent means "leave it
+    # alone", and the admin form posts an explicit "" to clear one (normalised
+    # to None by ToolDefinition's validator).
+    retirement_note: Optional[str] = Field(None, max_length=300, alias="retirementNote")
+    retires_on: Optional[str] = Field(None, alias="retiresOn")
     requires_oauth_provider: Optional[str] = Field(None, alias="requiresOauthProvider")
     forward_auth_token: Optional[bool] = Field(None, alias="forwardAuthToken")
     token_exchange_audience: Optional[str] = Field(None, alias="tokenExchangeAudience")
     is_public: Optional[bool] = Field(None, alias="isPublic")
     enabled_by_default: Optional[bool] = Field(None, alias="enabledByDefault")
+    # ⚠️ Optional with no default value on the wire: the update route dumps with
+    # `model_dump(exclude_unset=True)`, so an older admin client that never
+    # sends this field leaves the stored value alone rather than clearing it.
+    # That partial-update semantic is load-bearing for backward compatibility
+    # (docs/specs/admin-always-on-tools.md §10.1) — do not "simplify" it.
+    always_on: Optional[bool] = Field(None, alias="alwaysOn")
 
     # External tool configurations (optional based on protocol)
     mcp_config: Optional[MCPServerConfigRequest] = Field(None, alias="mcpConfig")
@@ -1209,6 +1554,9 @@ class MCPServerConfigResponse(BaseModel):
     aws_region: Optional[str] = Field(None, alias="awsRegion")
     api_key_header: Optional[str] = Field(None, alias="apiKeyHeader")
     secret_arn: Optional[str] = Field(None, alias="secretArn")
+    custom_headers: Dict[str, str] = Field(
+        default_factory=dict, alias="customHeaders"
+    )
     tools: List[MCPToolEntryPayload] = Field(default_factory=list)
     health_check_enabled: bool = Field(default=False, alias="healthCheckEnabled")
     health_check_interval_seconds: int = Field(
@@ -1231,6 +1579,7 @@ class MCPServerConfigResponse(BaseModel):
             aws_region=config.aws_region,
             api_key_header=config.api_key_header,
             secret_arn=config.secret_arn,
+            custom_headers=dict(config.custom_headers),
             tools=[MCPToolEntryPayload.from_model(entry) for entry in config.tools],
             health_check_enabled=config.health_check_enabled,
             health_check_interval_seconds=config.health_check_interval_seconds,
@@ -1332,12 +1681,15 @@ class AdminToolResponse(BaseModel):
     category: ToolCategory
     protocol: ToolProtocol
     status: ToolStatus
+    retirement_note: Optional[str] = Field(None, alias="retirementNote")
+    retires_on: Optional[str] = Field(None, alias="retiresOn")
     requires_oauth_provider: Optional[str] = Field(None, alias="requiresOauthProvider")
     forward_auth_token: bool = Field(default=False, alias="forwardAuthToken")
     token_exchange_audience: Optional[str] = Field(None, alias="tokenExchangeAudience")
     is_public: bool = Field(..., alias="isPublic")
     allowed_app_roles: List[str] = Field(..., alias="allowedAppRoles")
     enabled_by_default: bool = Field(..., alias="enabledByDefault")
+    always_on: bool = Field(default=False, alias="alwaysOn")
     created_at: str = Field(..., alias="createdAt")
     updated_at: str = Field(..., alias="updatedAt")
     created_by: Optional[str] = Field(None, alias="createdBy")
@@ -1379,12 +1731,15 @@ class AdminToolResponse(BaseModel):
             category=tool.category,
             protocol=tool.protocol,
             status=tool.status,
+            retirement_note=tool.retirement_note,
+            retires_on=tool.retires_on,
             requires_oauth_provider=tool.requires_oauth_provider,
             forward_auth_token=tool.forward_auth_token,
             token_exchange_audience=tool.token_exchange_audience,
             is_public=tool.is_public,
             allowed_app_roles=allowed_roles or tool.allowed_app_roles,
             enabled_by_default=tool.enabled_by_default,
+            always_on=tool.always_on,
             created_at=to_iso(tool.created_at) if tool.created_at else "",
             updated_at=to_iso(tool.updated_at) if tool.updated_at else "",
             created_by=tool.created_by,
@@ -1432,6 +1787,9 @@ class MCPDiscoverRequest(BaseModel):
     aws_region: Optional[str] = Field(None, alias="awsRegion")
     api_key_header: Optional[str] = Field(None, alias="apiKeyHeader")
     secret_arn: Optional[str] = Field(None, alias="secretArn")
+    custom_headers: Dict[str, str] = Field(
+        default_factory=dict, alias="customHeaders"
+    )
     forward_auth_token: bool = Field(default=False, alias="forwardAuthToken")
     token_exchange_audience: Optional[str] = Field(None, alias="tokenExchangeAudience")
     requires_oauth_provider: Optional[str] = Field(
@@ -1439,6 +1797,11 @@ class MCPDiscoverRequest(BaseModel):
     )
 
     model_config = {"populate_by_name": True, "use_enum_values": True}
+
+    @field_validator("custom_headers", mode="before")
+    @classmethod
+    def _validate_custom_headers(cls, value: Any) -> Dict[str, str]:
+        return validate_custom_headers(value)
 
     def to_config(self) -> MCPServerConfig:
         return MCPServerConfig(
@@ -1448,6 +1811,7 @@ class MCPDiscoverRequest(BaseModel):
             aws_region=self.aws_region,
             api_key_header=self.api_key_header,
             secret_arn=self.secret_arn,
+            custom_headers=self.custom_headers,
             tools=[],
         )
 

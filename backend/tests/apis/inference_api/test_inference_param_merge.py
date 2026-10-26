@@ -214,3 +214,88 @@ class TestOmissionMeansUnsupported:
         )
         assert merged == {"max_tokens": 8192, "effort": "medium"}
 
+
+
+class TestKimiK3CuratedSpec:
+    """The curated Kimi K3 spec, exercised against the real guard.
+
+    Every assertion here corresponds to a 400 measured against
+    `us.moonshotai.kimi-k3` in us-west-2 on 2026-09-21. The spec is only worth
+    declaring if the guard actually enforces it before the request goes out —
+    these tests are what connect the two.
+    """
+
+    @staticmethod
+    def _kimi():
+        return _model(
+            temperature=ModelParamSpec(supported=True, min=0, max=1, default=None),
+            top_p=ModelParamSpec(supported=False),
+            max_tokens=ModelParamSpec(supported=True, min=16),
+            reasoning_effort=ModelParamSpec(
+                supported=True,
+                allowed=["none", "low", "medium", "high", "xhigh", "max"],
+                default="medium",
+            ),
+        )
+
+    def test_top_p_is_dropped(self):
+        """Measured 400: "This model accepts 'top_p' only with the value 0.95."
+
+        Declaring it unsupported is worthless unless the guard strips it, so
+        this is the test that makes the declaration mean something.
+        """
+        merged = _merge_inference_params(self._kimi(), {"top_p": 0.9})
+
+        assert "top_p" not in merged
+
+    def test_temperature_survives_where_the_openai_family_would_drop_it(self):
+        """The reason Kimi does not reuse `openaiResponsesParams`: temperature
+        IS accepted here, and inheriting that spec would have stripped it."""
+        merged = _merge_inference_params(self._kimi(), {"temperature": 0.5})
+
+        assert merged["temperature"] == 0.5
+
+    @pytest.mark.parametrize("value,expected", [(2, 1), (1.5, 1), (-0.5, 0), (0.3, 0.3)])
+    def test_temperature_is_clamped_to_the_measured_range(self, value, expected):
+        """Measured 400 on 2: "This model accepts 'temperature' between 0 and 1."
+        Clamping keeps a user slider from killing the turn mid-stream."""
+        merged = _merge_inference_params(self._kimi(), {"temperature": value})
+
+        assert merged["temperature"] == expected
+
+    def test_max_tokens_below_the_floor_is_raised_not_forwarded(self):
+        """Measured 400 on 1: "Expected a value >= 16, but got 1 instead."
+
+        The family's usual `min: 1` would forward a guaranteed 400; the
+        measured floor of 16 turns it into a clamp.
+        """
+        merged = _merge_inference_params(self._kimi(), {"max_tokens": 1})
+
+        assert merged["max_tokens"] == 16
+
+    def test_an_out_of_enum_effort_falls_back_to_medium(self):
+        """The endpoint enumerates its own enum in a 400. Falling back beats
+        erroring mid-stream, and `medium` is what unset already does (~107
+        reasoning tokens measured against medium's ~113)."""
+        merged = _merge_inference_params(self._kimi(), {"reasoning_effort": "turbo"})
+
+        assert merged["reasoning_effort"] == "medium"
+
+    def test_the_effort_default_applies_when_the_request_says_nothing(self):
+        merged = _merge_inference_params(self._kimi(), {})
+
+        assert merged["reasoning_effort"] == "medium"
+
+    def test_none_is_reachable_as_the_cost_lever(self):
+        """`none` measured 0 reasoning tokens — it is the lever if the
+        reasoning spend is ever unwanted, so it must survive the enum gate."""
+        merged = _merge_inference_params(self._kimi(), {"reasoning_effort": "none"})
+
+        assert merged["reasoning_effort"] == "none"
+
+    def test_a_param_the_spec_omits_is_dropped(self):
+        """top_k is not in the Responses param map and not in the spec; the
+        declared spec makes silence mean unsupported."""
+        merged = _merge_inference_params(self._kimi(), {"top_k": 40})
+
+        assert "top_k" not in merged

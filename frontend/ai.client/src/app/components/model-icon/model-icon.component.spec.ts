@@ -24,22 +24,78 @@ describe('resolveModelIcon', () => {
     expect(icon).toEqual({ kind: 'upload', url: '/models/m-1/icon?v=abc' });
   });
 
-  it('prefers an explicit slug over the provider-name guess', () => {
-    const icon = resolveModelIcon({ iconSlug: 'meta', providerName: 'Anthropic' });
+  it('prefers an explicit slug over both guesses', () => {
+    const icon = resolveModelIcon({
+      iconSlug: 'meta',
+      providerName: 'Anthropic',
+      modelId: 'us.anthropic.claude-sonnet-5',
+    });
 
-    expect(icon).toEqual({ kind: 'builtin', slug: 'meta' });
+    expect(icon).toEqual({ kind: 'builtin', slug: 'meta', via: 'slug' });
+  });
+
+  it('prefers the model-family mark over the company mark', () => {
+    // The rule: a vendor that brands its models separately shows that mark.
+    // Every Anthropic model we serve is a Claude, so the starburst wins over
+    // the corporate 'A' even though the provider name matches it too.
+    expect(
+      resolveModelIcon({ providerName: 'Anthropic', modelId: 'us.anthropic.claude-sonnet-4-6' }),
+    ).toEqual({ kind: 'builtin', slug: 'claude', via: 'model' });
+
+    // The CRIS prefix varies per environment and must not change the answer.
+    expect(
+      resolveModelIcon({ providerName: 'Anthropic', modelId: 'global.anthropic.claude-sonnet-5' }),
+    ).toEqual({ kind: 'builtin', slug: 'claude', via: 'model' });
+
+    expect(
+      resolveModelIcon({ providerName: 'Moonshot AI', modelId: 'us.moonshotai.kimi-k3' }),
+    ).toEqual({ kind: 'builtin', slug: 'kimi', via: 'model' });
+
+    expect(
+      resolveModelIcon({ providerName: 'Qwen', modelId: 'qwen.qwen3-coder-30b-a3b-instruct' }),
+    ).toEqual({ kind: 'builtin', slug: 'qwen', via: 'model' });
+  });
+
+  it('falls back to the company mark when the family has none of its own', () => {
+    // OpenAI publishes one mark for the whole GPT fleet — there is no
+    // per-model logo to prefer, so the company one is the right answer.
+    expect(
+      resolveModelIcon({ providerName: 'OpenAI', modelId: 'us.openai.gpt-5.6-sol' }),
+    ).toEqual({ kind: 'builtin', slug: 'openai', via: 'provider' });
   });
 
   it('falls back to matching the provider name', () => {
     expect(resolveModelIcon({ providerName: 'Anthropic' })).toEqual({
       kind: 'builtin',
       slug: 'anthropic',
+      via: 'provider',
     });
     // Case and padding come from a free-text field an admin typed.
     expect(resolveModelIcon({ providerName: '  openai ' })).toEqual({
       kind: 'builtin',
       slug: 'openai',
+      via: 'provider',
     });
+  });
+
+  it('serves Gemma the Google mark, because its own is illegible at tile size', () => {
+    // The one deliberate exception to model-beats-company. Pinned so a future
+    // "Gemma has a logo, why aren't we using it?" change has to read the why.
+    expect(
+      resolveModelIcon({ providerName: 'Google', modelId: 'google.gemma-4-27b-it' }),
+    ).toEqual({ kind: 'builtin', slug: 'google', via: 'model' });
+
+    // Resolves even when the provider name is something the map doesn't carry.
+    expect(
+      resolveModelIcon({ providerName: 'Google DeepMind Research', modelId: 'google.gemma-4-9b' }),
+    ).toEqual({ kind: 'builtin', slug: 'google', via: 'model' });
+  });
+
+  it('keeps the company mark for an Anthropic model that is not a Claude', () => {
+    // Why 'anthropic' survives as a slug rather than being replaced outright.
+    expect(
+      resolveModelIcon({ providerName: 'Anthropic', modelId: 'us.anthropic.some-future-model' }),
+    ).toEqual({ kind: 'builtin', slug: 'anthropic', via: 'provider' });
   });
 
   it('resolves to nothing for a provider we ship no logo for', () => {

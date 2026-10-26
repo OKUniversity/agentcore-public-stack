@@ -52,6 +52,7 @@ class CdpSession:
         self._pending: Dict[int, asyncio.Future] = {}
         self._reader: Optional[asyncio.Task] = None
         self._page_session_id: Optional[str] = None
+        self._target_id: Optional[str] = None
         self._closed = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -93,6 +94,16 @@ class CdpSession:
     # -- protocol ----------------------------------------------------------
 
     async def _read_loop(self) -> None:
+        # The reader ending means the transport is gone, however it ended, so
+        # `_closed` is set in `finally` rather than only by our own `close()`.
+        # A peer-side close is the common case, not an exotic one: handing the
+        # browser to a human disables the automation stream, and the service
+        # closes this socket with a clean 1000 ("Disconnected by admin"). A
+        # clean close ends `async for` *normally* — no exception to catch — so
+        # a session that only tracked local closes stayed "open" forever while
+        # holding a dead socket, and `session_pool.acquire` kept handing that
+        # corpse back instead of reconnecting. Every later browse then failed
+        # for the life of the conversation.
         try:
             async for raw in self._ws:
                 try:
@@ -105,6 +116,7 @@ class CdpSession:
                 future = self._pending.pop(message_id, None)
                 if future is not None and not future.done():
                     future.set_result(message)
+            logger.info("cdp: socket closed by peer")
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - surfaced on the next command
@@ -112,6 +124,12 @@ class CdpSession:
             for future in self._pending.values():
                 if not future.done():
                     future.set_exception(CdpError(f"CDP connection lost: {exc}"))
+            self._pending.clear()
+        finally:
+            self._closed = True
+            for future in self._pending.values():
+                if not future.done():
+                    future.set_exception(CdpError("CDP connection closed"))
             self._pending.clear()
 
     async def command(
@@ -174,6 +192,7 @@ class CdpSession:
             session_scoped=False,
         )
         self._page_session_id = attached["sessionId"]
+        self._target_id = target_id
         await self.command("Page.enable")
         await self.command("Runtime.enable")
 
@@ -233,6 +252,41 @@ class CdpSession:
         bootstraps. Unused today; see `docs/specs/webmcp-host-spa-tools.md`.
         """
         await self.command("Page.addScriptToEvaluateOnNewDocument", {"source": source})
+
+    async def set_window_size(self, width: int, height: int) -> None:
+        """Resize the browser window holding the attached page.
+
+        The AgentCore Browser runs Chrome on a bare X display with no window
+        manager, so the window never follows the screen: maximize is ignored,
+        and fullscreen and F11 do not re-fit it. `Browser.setWindowBounds` is
+        the only thing that does, and the page reflows to it. The window has to
+        be `normal` before its size can be set, hence two calls.
+
+        Browser-scoped and addressed by the page's own target, so it moves the
+        window the agent is driving rather than whichever one is frontmost.
+        """
+        params: Dict[str, Any] = {}
+        if self._target_id:
+            params["targetId"] = self._target_id
+        found = await self.command(
+            "Browser.getWindowForTarget", params, session_scoped=False
+        )
+        window_id = found.get("windowId")
+        if window_id is None:
+            raise CdpError("Browser.getWindowForTarget returned no windowId")
+        await self.command(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": {"windowState": "normal"}},
+            session_scoped=False,
+        )
+        await self.command(
+            "Browser.setWindowBounds",
+            {
+                "windowId": window_id,
+                "bounds": {"left": 0, "top": 0, "width": width, "height": height},
+            },
+            session_scoped=False,
+        )
 
     async def screenshot(self) -> str:
         """Capture the viewport as base64 PNG."""

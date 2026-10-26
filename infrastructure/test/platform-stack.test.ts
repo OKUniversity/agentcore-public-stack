@@ -152,7 +152,9 @@ describe('PlatformStack', () => {
 
   describe('DynamoDB tables', () => {
     it('creates all shared tables', () => {
-      // 28 tables. Was 27 — the agent-templates table was added for the
+      // 29 tables. Was 28 — the projects table was added for Shared Projects
+      // (docs/specs/shared-projects.md §3.1). Before that, 27 → 28: the
+      // agent-templates table was added for the
       // admin-managed Agent Templates catalog (mirrors system-prompts,
       // read by app_api only). Before that: the announcements table was
       // added for the feature-announcement system (admin-authored notices
@@ -165,7 +167,7 @@ describe('PlatformStack', () => {
       // table was decommissioned (the python app uses rag-assistants for
       // both assistant config and document metadata via
       // DYNAMODB_ASSISTANTS_TABLE_NAME).
-      template.resourceCountIs('AWS::DynamoDB::Table', 28);
+      template.resourceCountIs('AWS::DynamoDB::Table', 29);
     });
   });
 
@@ -176,9 +178,13 @@ describe('PlatformStack', () => {
       // memory-spaces (Memory Spaces feature content bucket),
       // shared-conversations (share snapshot-body offload),
       // alb-access-logs (who terminated a connection — SSE disconnect attribution),
+      // frontend-access-logs (what the SPA edge answered on its own — 404'd
+      // chunks never reach the ALB),
       // browser-policy (the Chromium MANAGED policy every browser session
-      // starts with — spec D6)
-      template.resourceCountIs('AWS::S3::Bucket', 11);
+      // starts with — spec D6),
+      // conversation-archive (per-turn transcripts conversation search is
+      // built from — docs/specs/conversation-search.md §4)
+      template.resourceCountIs('AWS::S3::Bucket', 13);
     });
   });
 
@@ -236,9 +242,30 @@ describe('PlatformStack', () => {
       // Raised 49 → 51 for the agent-templates table name + ARN publishes
       // (mirrors the system-prompts name+arn pair; consumed by restore
       // tooling and ad-hoc IAM scoping).
+      //
+      // Raised 51 → 53 for the memory-spaces and skill-resources bucket
+      // name publishes — restore tooling only (S3_BUCKETS / BUCKET_SSM_MAP);
+      // compute still takes both buckets via PlatformComputeRefs.
+      //
+      // Raised 53 → 54 for the conversation-archive bucket name. Runtime
+      // discovery, not restore: the AgentCore Runtime has no env slot left
+      // for the bucket (runtime-env-var-limit.test.ts), so it reads this
+      // parameter under PROJECT_PREFIX, as the artifacts tools do.
+      //
+      // Raised 54 → 55 for the conversation-index consumer's function name.
+      // Deploy-script discovery, the same pattern as every image Lambda:
+      // deploy-image-lambda-one.sh resolves the CDK-generated name from it to
+      // swap in the real image, and skips gracefully until it exists.
+      //
+      // Raised 55 → 56 for the conversation-index reconciler's function name,
+      // the same deploy-script discovery for the image's second function.
+      //
+      // Raised 56 → 57 for the memory-maintenance worker's function name
+      // (Shared Projects 2.6), the same deploy-script discovery. app-api
+      // takes the name through PlatformComputeRefs, not this parameter.
       const params = template.findResources('AWS::SSM::Parameter');
       expect(Object.keys(params).length).toBeGreaterThanOrEqual(30);
-      expect(Object.keys(params).length).toBeLessThanOrEqual(51);
+      expect(Object.keys(params).length).toBeLessThanOrEqual(57);
     });
   });
 

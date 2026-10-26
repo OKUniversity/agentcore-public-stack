@@ -27,7 +27,7 @@ from apis.app_api.shares.service import (
     ShareNotFoundError,
     ShareService,
 )
-from apis.app_api.shares.snapshot_store import ShareSnapshotStore
+from apis.shared.shares.snapshot_store import ShareSnapshotStore
 from apis.shared.auth.models import User
 
 AWS_REGION = "us-east-1"
@@ -73,7 +73,7 @@ def _viewer(email: str = "friend@example.com") -> User:
 
 def _patch_sources(heads: list[dict] | Exception):
     """Patch the three things `create_share` reads."""
-    meta = MagicMock()
+    meta = MagicMock(preferences=None)  # not in a project
     meta.model_dump.return_value = {"title": "Chat"}
     messages = MagicMock(
         messages=[
@@ -89,6 +89,7 @@ def _patch_sources(heads: list[dict] | Exception):
             )
         ]
     )
+    messages.tool_summaries = []
 
     list_service = MagicMock()
     if isinstance(heads, Exception):

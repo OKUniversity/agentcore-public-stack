@@ -228,6 +228,14 @@ export interface ManagedModel {
   cacheWritePricePerMillionTokens?: number | null;
   /** Cache read price per million tokens (in USD) - Bedrock only */
   cacheReadPricePerMillionTokens?: number | null;
+  /**
+   * Speech input price per million tokens (in USD). Speech-to-speech models
+   * only (Nova 2 Sonic): `inputPricePerMillionTokens` is the TEXT rate on
+   * such a model; this is the rate for spoken input, ~10x higher.
+   */
+  speechInputPricePerMillionTokens?: number | null;
+  /** Speech output price per million tokens (in USD). Speech-to-speech models only. */
+  speechOutputPricePerMillionTokens?: number | null;
   /** Knowledge cutoff date for the model */
   knowledgeCutoffDate?: string | null;
   /** Whether this model supports prompt caching (Bedrock only) */
@@ -246,6 +254,16 @@ export interface ManagedModel {
    * no value for it. Read it as `isFeatured !== false`, never `=== true`.
    */
   isFeatured?: boolean;
+  /**
+   * Position in the catalog, lowest first — the order the admin list and the
+   * chat model picker show models in. The backend returns the catalog already
+   * sorted, so clients render it as-is rather than sorting on this.
+   *
+   * Set only by `PUT /admin/managed-models/order` (the admin list's drag and
+   * drop), never through the model form. Absent on a model that has never been
+   * placed; those sort after every ordered model, newest first.
+   */
+  sortOrder?: number | null;
   /**
    * OpenAI-compatible API surface: `chat` (OpenAI Chat Completions, the
    * default) or `responses` (OpenAI Responses API — required by models that
@@ -267,6 +285,19 @@ export interface ManagedModel {
   mantleEndpointPath?: string | null;
   /** Per-model inference parameter capabilities (temperature, top_p, etc.) */
   supportedParams?: SupportedParams | null;
+  /**
+   * Lifecycle (docs/specs/model-retirement.md §7). `deprecated`: pickers refuse
+   * a new selection but leave an existing one alone. `retired`: the backend runs
+   * `replacedBy` in its place, or refuses the turn when there is none. Absent on
+   * rows written before retirement shipped, which reads as `active`.
+   */
+  status?: ModelStatus | null;
+  /** modelId of the successor a retired model is redirected to. */
+  replacedBy?: string | null;
+  /** ISO `YYYY-MM-DD` of the cutover. Display only. */
+  retiresOn?: string | null;
+  /** Free text shown wherever a non-active model is surfaced. Display only. */
+  retirementNote?: string | null;
   /** Date the model was added to the system (ISO string from API) */
   createdAt?: string | Date;
   /** Date the model was last updated (ISO string from API) */
@@ -329,6 +360,14 @@ export interface ManagedModelFormData {
   cacheWritePricePerMillionTokens?: number | null;
   /** Cache read price per million tokens (in USD) - Bedrock only */
   cacheReadPricePerMillionTokens?: number | null;
+  /**
+   * Speech input price per million tokens (in USD). Speech-to-speech models
+   * only (Nova 2 Sonic): `inputPricePerMillionTokens` is the TEXT rate on
+   * such a model; this is the rate for spoken input, ~10x higher.
+   */
+  speechInputPricePerMillionTokens?: number | null;
+  /** Speech output price per million tokens (in USD). Speech-to-speech models only. */
+  speechOutputPricePerMillionTokens?: number | null;
   /** Knowledge cutoff date for the model */
   knowledgeCutoffDate?: string | null;
   /** Whether this model supports prompt caching (Bedrock only) */
@@ -357,7 +396,23 @@ export interface ManagedModelFormData {
   region?: string | null;
   /** Per-model inference parameter capabilities */
   supportedParams?: SupportedParams | null;
+  /** Lifecycle — see `ManagedModel.status`. */
+  status?: ModelStatus;
+  /** `''` clears it on an update; absent leaves it alone. */
+  replacedBy?: string;
+  retiresOn?: string;
+  retirementNote?: string;
 }
+
+/** Model lifecycle states (docs/specs/model-retirement.md §7). */
+export const MODEL_STATUSES = ['active', 'deprecated', 'retired'] as const;
+export type ModelStatus = (typeof MODEL_STATUSES)[number];
+
+export const MODEL_STATUS_LABELS: Record<ModelStatus, string> = {
+  active: 'Active',
+  deprecated: 'Deprecated — no new selections',
+  retired: 'Retired — redirected or refused',
+};
 
 /** Selectable OpenAI-compatible API surfaces for the model form. */
 export const MANTLE_API_MODES = ['chat', 'responses'] as const;

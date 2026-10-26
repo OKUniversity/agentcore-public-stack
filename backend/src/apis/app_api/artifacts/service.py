@@ -28,6 +28,7 @@ from botocore.exceptions import ClientError
 
 from apis.shared.auth import User
 from apis.shared.security.log_sanitize import scrub_log
+from apis.shared.shares import artifact_shares
 
 logger = logging.getLogger(__name__)
 
@@ -487,50 +488,12 @@ class ArtifactListService:
         artifacts, which is the same reason `list_for_session` re-checks
         it per row.
         """
-        table = _table()
-        items: list[dict] = []
-        kwargs: dict = {
-            "IndexName": _SESSION_INDEX,
-            "KeyConditionExpression": Key("GSI1PK").eq(
-                f"SESSION#{session_id}"
-            ),
-            "ScanIndexForward": False,  # GSI1SK embeds updated_at → newest first
-        }
+        from apis.shared.shares.artifacts import session_artifact_heads
+
         try:
-            while True:
-                resp = table.query(**kwargs)
-                items.extend(resp.get("Items", []))
-                last = resp.get("LastEvaluatedKey")
-                if not last:
-                    break
-                kwargs["ExclusiveStartKey"] = last
+            return session_artifact_heads(_table(), user_id=user_id, session_id=session_id)
         except ClientError as exc:
             raise ArtifactQueryError("artifact head query failed") from exc
-
-        heads: list[dict] = []
-        seen: set = set()
-        for item in items:
-            artifact_id = str(item.get("artifact_id", ""))
-            if not artifact_id or item.get("user_id") != user_id:
-                continue
-            if artifact_id in seen:
-                continue
-            seen.add(artifact_id)
-            produced_by = item.get("produced_by_message_index")
-            heads.append(
-                {
-                    "artifact_id": artifact_id,
-                    "version": int(item.get("version", 1)),
-                    "title": str(item.get("title", "")),
-                    "content_type": str(
-                        item.get("content_type", "text/html; charset=utf-8")
-                    ),
-                    "produced_by_message_index": (
-                        int(produced_by) if produced_by is not None else None
-                    ),
-                }
-            )
-        return heads
 
     def list_for_user(self, *, user_id: str) -> list[dict]:
         """Every artifact the user owns, at HEAD, newest-first.
@@ -828,7 +791,9 @@ def get_artifact_content_service() -> ArtifactContentService:
 # drift.
 # ---------------------------------------------------------------------
 
-_SHARE_LOOKUP_SK = "META"
+# The keys and the row writes live in ``apis.shared.shares.artifact_shares``,
+# which the scheduled-runs worker uses too (Shared Projects 3.2d).
+_SHARE_LOOKUP_SK = artifact_shares.SHARE_LOOKUP_SK
 
 # ---------------------------------------------------------------------
 # Recipient fan-out rows ("shared with you")
@@ -950,18 +915,9 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _owner_share_sk(artifact_id: str, version: int, share_id: str) -> str:
-    """Owner-row sort key. The `V#{version:05d}` zero-pad matches the
-    artifact version rows so the two key spaces read consistently."""
-    return f"SHARE#{artifact_id}#V#{version:05d}#{share_id}"
-
-
-def _owner_share_prefix(artifact_id: str) -> str:
-    return f"SHARE#{artifact_id}#V#"
-
-
-def _share_lookup_key(share_id: str) -> dict:
-    return {"PK": f"SHARE#{share_id}", "SK": _SHARE_LOOKUP_SK}
+_owner_share_sk = artifact_shares.owner_share_sk
+_owner_share_prefix = artifact_shares.owner_share_prefix
+_share_lookup_key = artifact_shares.share_lookup_key
 
 
 def _get_share_lookup(share_id: str) -> Optional[dict]:
@@ -1005,7 +961,26 @@ def _check_share_access(share: dict, viewer: User) -> None:
         if viewer_email and viewer_email in allowed:
             return
 
+    if access_level == "project" and share.get("project_id"):
+        # Membership at read time (Shared Projects 3.3): a member removed from
+        # the project loses the output with the rest of it. Any role, on an
+        # active or archived project, as for shared tasks.
+        if _is_project_member(str(share["project_id"]), viewer):
+            return
+
     raise ShareAccessDeniedError("access denied")
+
+
+def _is_project_member(project_id: str, viewer: User) -> bool:
+    """Whether ``viewer`` belongs to ``project_id``. False while Projects is off."""
+    from apis.shared.feature_flags import projects_enabled
+
+    if not projects_enabled():
+        return False
+    from apis.shared.projects.access import resolve_project_role
+
+    _, role = resolve_project_role(project_id, viewer.user_id, viewer.email)
+    return role is not None
 
 
 def _resolve_allowed_emails(
@@ -1045,8 +1020,13 @@ class ArtifactShareService:
         version: int,
         access_level: str,
         allowed_emails: Optional[list[str]],
+        project_id: Optional[str] = None,
     ) -> dict:
         """Create a share for one artifact version.
+
+        ``project_id`` is required for a ``project`` share and resolved by the
+        caller (``project_outputs.require_shareable_project``), which knows the
+        artifact's task and checks membership.
 
         The version row is fetched with a PK built from the *owner's*
         session id, so a caller can only ever share their own artifact —
@@ -1078,6 +1058,10 @@ class ArtifactShareService:
         )
         if resolved is not None:
             attrs["allowed_emails"] = resolved
+        if access_level == "project":
+            if not project_id:
+                raise ValueError("a project share needs its project")
+            attrs["project_id"] = project_id
 
         self._write_share_rows(attrs)
         # After, never before: a fan-out row must never point at a share
@@ -1132,8 +1116,12 @@ class ArtifactShareService:
         owner: User,
         access_level: Optional[str],
         allowed_emails: Optional[list[str]],
+        project_id: Optional[str] = None,
     ) -> dict:
         """Change access level / allowlist on an existing share.
+
+        ``project_id`` is required when a share becomes ``project`` (the caller
+        resolves it); leaving ``project`` drops it.
 
         Rewrites both rows so the owner row and the lookup row the
         recipient path reads can never disagree about who may view."""
@@ -1160,6 +1148,14 @@ class ArtifactShareService:
             # leaving a list that no longer gates anything.
             updated.pop("allowed_emails", None)
 
+        if new_access == "project":
+            if previous.get("access_level") != "project":
+                if not project_id:
+                    raise ValueError("a project share needs its project")
+                updated["project_id"] = project_id
+        else:
+            updated.pop("project_id", None)
+
         updated["version"] = int(updated.get("version", 0))
         updated["updated_at"] = _now_iso()
 
@@ -1175,43 +1171,39 @@ class ArtifactShareService:
         )
         return updated
 
-    def revoke(self, *, share_id: str, owner: User) -> None:
-        """Delete both rows. Effective within one render-token TTL."""
+    def revoke(self, *, share_id: str, owner: User) -> dict:
+        """Delete both rows. Effective within one render-token TTL. Returns the share revoked."""
         share = _get_share_lookup(share_id)
         if not share:
             raise ShareNotFoundError("share not found")
         if share.get("owner_id") != owner.user_id:
             raise NotShareOwnerError("not the share owner")
+        self.delete_share(share)
+        return self._strip_keys(share)
 
+    @staticmethod
+    def _sync_project_outputs(owner_id: str, shares: list) -> None:
+        """Re-list the project Outputs these shares fed (3.3). Never raises."""
+        try:
+            from .project_outputs import sync_outputs
+
+            sync_outputs(owner_id, shares)
+        except Exception:
+            logger.warning("could not sync project outputs", exc_info=True)
+
+    def delete_share(self, share: dict) -> None:
+        """Delete one share's rows, whoever is asking.
+
+        The authorization is the caller's: ``revoke`` checks the owner, and a
+        project editor removing an output (3.3) is checked by the project.
+        """
+        share_id = str(share.get("share_id", ""))
         table = _table()
         # Discovery first, then reachability, then visibility — the same
         # ordering principle as `ArtifactLifecycleService.delete`.
         self._delete_recipient_rows(table, share)
-        owner_sk = _owner_share_sk(
-            str(share.get("artifact_id", "")),
-            int(share.get("version", 0)),
-            share_id,
-        )
         try:
-            table.meta.client.transact_write_items(
-                TransactItems=[
-                    {
-                        "Delete": {
-                            "TableName": table.name,
-                            "Key": {
-                                "PK": f"USER#{share.get('owner_id', '')}",
-                                "SK": owner_sk,
-                            },
-                        }
-                    },
-                    {
-                        "Delete": {
-                            "TableName": table.name,
-                            "Key": _share_lookup_key(share_id),
-                        }
-                    },
-                ]
-            )
+            artifact_shares.delete_share_rows(table, share)
         except ClientError as exc:
             raise ArtifactQueryError("share revoke failed") from exc
         logger.info("revoked artifact share share=%s", scrub_log(share_id))
@@ -1330,25 +1322,8 @@ class ArtifactShareService:
         only — a ConditionCheck item would need `dynamodb:ConditionCheckItem`
         added to the task role, which plain writes do not.
         """
-        table = _table()
-        owner_sk = _owner_share_sk(
-            str(attrs["artifact_id"]),
-            int(attrs["version"]),
-            str(attrs["share_id"]),
-        )
-        owner_row = {
-            **attrs,
-            "PK": f"USER#{attrs['owner_id']}",
-            "SK": owner_sk,
-        }
-        lookup_row = {**attrs, **_share_lookup_key(str(attrs["share_id"]))}
         try:
-            table.meta.client.transact_write_items(
-                TransactItems=[
-                    {"Put": {"TableName": table.name, "Item": owner_row}},
-                    {"Put": {"TableName": table.name, "Item": lookup_row}},
-                ]
-            )
+            artifact_shares.write_share_rows(_table(), attrs)
         except ClientError as exc:
             raise ArtifactQueryError("share write failed") from exc
 
@@ -1438,6 +1413,7 @@ class ArtifactShareService:
                     },
                 )
 
+            self._sync_project_outputs(owner_id, shares)
             logger.info(
                 "revoked %s of %s artifact share(s) for deleted session %s",
                 revoked,
@@ -1502,6 +1478,7 @@ class ArtifactShareService:
                 },
             )
 
+        self._sync_project_outputs(owner_id, shares)
         logger.info(
             "revoked %s of %s artifact share(s) for deleted artifact %s",
             revoked,
@@ -1683,9 +1660,17 @@ class ArtifactShareService:
         ############################################################
         """
         try:
-            return self._retitle_for_artifact(
+            retitled = self._retitle_for_artifact(
                 owner_id=owner_id, artifact_id=artifact_id, title=title
             )
+            # A project's Outputs list carries the title too (3.3).
+            from apis.shared.feature_flags import projects_enabled
+
+            if projects_enabled():
+                self._sync_project_outputs(
+                    owner_id, self.list_for_artifact(owner_id=owner_id, artifact_id=artifact_id)
+                )
+            return retitled
         except RenderTokenConfigError:
             # Artifacts aren't configured here at all — a normal no-op.
             return 0

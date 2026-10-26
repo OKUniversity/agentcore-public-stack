@@ -11,7 +11,10 @@
 #   rag-ingestion | kb-sync-dispatcher | kb-sync-worker |
 #   scheduled-runs-dispatcher | scheduled-runs-worker |
 #   kb-migration-dispatcher | kb-migration-worker |
-#   kb-migration-reconciler | kb-migration-ingestion-consumer
+#   kb-migration-reconciler | kb-migration-ingestion-consumer |
+#   conversation-index-consumer
+#   conversation-index-reconciler | memory-maintenance-worker |
+#   large-document-prepare
 #
 # kb-sync-dispatcher/kb-sync-worker (and scheduled-runs-dispatcher/
 # scheduled-runs-worker) are pairs of Lambda functions sharing a single
@@ -27,7 +30,7 @@ set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
     echo "Usage: $0 <service>" >&2
-    echo "  service: rag-ingestion | kb-sync-dispatcher | kb-sync-worker | scheduled-runs-dispatcher | scheduled-runs-worker | kb-migration-dispatcher | kb-migration-worker | kb-migration-reconciler | kb-migration-ingestion-consumer" >&2
+    echo "  service: rag-ingestion | kb-sync-dispatcher | kb-sync-worker | scheduled-runs-dispatcher | scheduled-runs-worker | kb-migration-dispatcher | kb-migration-worker | kb-migration-reconciler | kb-migration-ingestion-consumer | conversation-index-consumer | conversation-index-reconciler | memory-maintenance-worker | large-document-prepare" >&2
     exit 1
 fi
 
@@ -83,6 +86,16 @@ case "$SERVICE" in
         IMAGE_URI_SSM="/${CDK_PROJECT_PREFIX}/kb-migration/image-tag"
         ECR_REPO_URI="${REGISTRY}/${CDK_PROJECT_PREFIX}-kb-migration"
         ;;
+    conversation-index-consumer)
+        FUNCTION_NAME_SSM="/${CDK_PROJECT_PREFIX}/conversation-index/consumer-function-name"
+        IMAGE_URI_SSM="/${CDK_PROJECT_PREFIX}/conversation-index/image-tag"
+        ECR_REPO_URI="${REGISTRY}/${CDK_PROJECT_PREFIX}-conversation-index"
+        ;;
+    conversation-index-reconciler)
+        FUNCTION_NAME_SSM="/${CDK_PROJECT_PREFIX}/conversation-index/reconciler-function-name"
+        IMAGE_URI_SSM="/${CDK_PROJECT_PREFIX}/conversation-index/image-tag"
+        ECR_REPO_URI="${REGISTRY}/${CDK_PROJECT_PREFIX}-conversation-index"
+        ;;
     scheduled-runs-dispatcher)
         FUNCTION_NAME_SSM="/${CDK_PROJECT_PREFIX}/scheduled-runs/dispatcher-function-name"
         IMAGE_URI_SSM="/${CDK_PROJECT_PREFIX}/scheduled-runs/image-tag"
@@ -93,9 +106,21 @@ case "$SERVICE" in
         IMAGE_URI_SSM="/${CDK_PROJECT_PREFIX}/scheduled-runs/image-tag"
         ECR_REPO_URI="${REGISTRY}/${CDK_PROJECT_PREFIX}-scheduled-runs"
         ;;
+    memory-maintenance-worker)
+        FUNCTION_NAME_SSM="/${CDK_PROJECT_PREFIX}/memory-maintenance/worker-function-name"
+        IMAGE_URI_SSM="/${CDK_PROJECT_PREFIX}/memory-maintenance/image-tag"
+        ECR_REPO_URI="${REGISTRY}/${CDK_PROJECT_PREFIX}-memory-maintenance"
+        ;;
+    large-document-prepare)
+        # Exists only where CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED is on; the
+        # first-deploy grace below skips the swap everywhere else.
+        FUNCTION_NAME_SSM="/${CDK_PROJECT_PREFIX}/large-document-prepare/function-name"
+        IMAGE_URI_SSM="/${CDK_PROJECT_PREFIX}/large-document-prepare/image-tag"
+        ECR_REPO_URI="${REGISTRY}/${CDK_PROJECT_PREFIX}-large-document-prepare"
+        ;;
     *)
         echo "Unknown service: $SERVICE" >&2
-        echo "Expected one of: rag-ingestion | kb-sync-dispatcher | kb-sync-worker | scheduled-runs-dispatcher | scheduled-runs-worker | kb-migration-dispatcher | kb-migration-worker | kb-migration-reconciler | kb-migration-document-reconciler | kb-migration-ingestion-consumer" >&2
+        echo "Expected one of: rag-ingestion | kb-sync-dispatcher | kb-sync-worker | scheduled-runs-dispatcher | scheduled-runs-worker | kb-migration-dispatcher | kb-migration-worker | kb-migration-reconciler | kb-migration-document-reconciler | kb-migration-ingestion-consumer | conversation-index-consumer | conversation-index-reconciler | memory-maintenance-worker | large-document-prepare" >&2
         exit 1
         ;;
 esac

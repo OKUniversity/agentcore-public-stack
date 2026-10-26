@@ -26,6 +26,7 @@ from .models import (
     SessionCostAnatomy,
     SessionProfile,
     UserSessionsResponse,
+    PlatformCostSummary,
 )
 from .service import AdminCostService
 
@@ -218,6 +219,13 @@ async def get_session_cost_anatomy(
     `agentSwitchUsd` are a *subset* of `avoidableMissCount` / `wastedUsd`, never
     deducted from them. Subtract to get unexplained waste — that difference is
     what a prefix-stability regression moves.
+
+    ⚠️ **Check `modelSwitched` too.** A mid-conversation model switch keeps the
+    conversation, and each model has its own cache, so the first call on the new
+    model re-writes the whole prefix with *unchanged* fingerprints and classifies
+    `miss_avoidable`. `modelSwitchMissCount` / `modelSwitchUsd` are the subset it
+    explains, excluding calls already counted as an Agent switch, so subtract
+    both pairs.
 
     Args:
         session_id: Session identifier (any user's session — admin scope)
@@ -487,6 +495,59 @@ async def get_system_summary(
         raise HTTPException(
             status_code=500,
             detail="Failed to retrieve system summary"
+        )
+
+
+@router.get("/platform", response_model=PlatformCostSummary)
+async def get_platform_cost_summary(
+    period: Optional[str] = Query(
+        None,
+        description="Period (YYYY-MM), defaults to current month",
+        pattern=r"^\d{4}-\d{2}$"
+    ),
+    admin_user: User = Depends(require_costs_admin),
+    service: AdminCostService = Depends(get_cost_service)
+):
+    """
+    Get all-in platform cost for a period: our inference ledger plus the
+    AWS infrastructure bill, with a per-service breakdown and the per-user
+    economics both halves imply.
+
+    Reads only pre-synced DynamoDB rows. This endpoint NEVER calls Cost
+    Explorer — CE bills $0.01 per request, so it is synced once a day by
+    infrastructure/lambda-assets/platform-cost-sync and read from here for
+    free. `ce:GetCostAndUsage` is granted to that Lambda's role and
+    deliberately not to app-api's, so this path cannot spend billing dollars
+    however often it is called.
+
+    Returns `available: false` (not an error) when the sync has never run for
+    the period — the feature is opt-in per environment, and an admin opening
+    the tab in an environment where it is off should be told that, not shown
+    a zero.
+
+    Args:
+        period: Period string (YYYY-MM), defaults to current month
+        admin_user: Authenticated admin user
+        service: Admin cost service
+
+    Returns:
+        PlatformCostSummary with the service breakdown and per-user figures
+
+    Raises:
+        HTTPException:
+            - 401 if not authenticated
+            - 403 if user lacks admin role
+            - 500 if server error
+    """
+    logger.info("Admin requesting platform cost summary")
+
+    try:
+        return await service.get_platform_cost_summary(period=period)
+    except Exception as e:
+        logger.error(f"Error getting platform cost summary: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve platform cost summary"
         )
 
 

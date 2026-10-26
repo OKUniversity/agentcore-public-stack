@@ -437,13 +437,15 @@ describe('KbMigrationConstruct — ingestion consumer (task 2.2)', () => {
     });
   });
 
-  it('is triggered by documents-bucket Object Created events under assistants/', () => {
+  it('is triggered by documents-bucket Object Created events under assistants/*/documents/', () => {
+    // Not a bare `assistants/` prefix: that also matches agent icons at
+    // `assistants/{id}/icons/...`, which are not documents.
     t.hasResourceProperties('AWS::Events::Rule', {
       EventPattern: Match.objectLike({
         source: ['aws.s3'],
         'detail-type': ['Object Created'],
         detail: Match.objectLike({
-          object: { key: [{ prefix: 'assistants/' }] },
+          object: { key: [{ wildcard: 'assistants/*/documents/*' }] },
         }),
       }),
       Targets: Match.arrayWith([
@@ -538,6 +540,16 @@ describe('KbMigrationConstruct — flags reach every function', () => {
     const p = lambdaFor(t, HANDLERS.dispatcher);
     expect(env(p).KB_MIGRATION_WORKER_FUNCTION_NAME).toBeDefined();
     expect(env(p).MANAGED_KB_WORKER_FUNCTION_NAME).toBeUndefined();
+  });
+
+  it('gives the worker the ingestion consumer it hands born-managed documents to', () => {
+    // provisioner.py reads KB_MIGRATION_INGESTION_CONSUMER_FUNCTION_NAME.
+    // Without it the worker falls back to ingesting one waiting document per
+    // 15-minute tick, which is the B5 slowdown this wiring exists to remove.
+    const t = synth();
+    const p = lambdaFor(t, HANDLERS.worker);
+    const name = JSON.stringify(env(p).KB_MIGRATION_INGESTION_CONSUMER_FUNCTION_NAME);
+    expect(name).toContain('KbIngestionConsumerLambda');
   });
 
   it('gives the worker the retention window under the name it reads', () => {
@@ -1027,6 +1039,18 @@ describe('KbMigrationConstruct — IAM', () => {
     });
   });
 
+  it('lets the worker invoke the ingestion consumer, and only it', () => {
+    // The born-managed handoff. Scoped to the consumer's ARN: the worker
+    // has no business invoking anything else in the account.
+    const invokes = statementsForRole(t, /KbMigrationWorkerLambdaServiceRole/).filter((s) =>
+      (Array.isArray(s.Action) ? s.Action : [s.Action]).includes('lambda:InvokeFunction'),
+    );
+    expect(invokes).toHaveLength(1);
+    const resources = JSON.stringify(invokes[0].Resource);
+    expect(resources).toContain('KbIngestionConsumerLambda');
+    expect(resources).not.toContain('"*"');
+  });
+
   it('gives the worker and consumer READ-only access to the documents bucket', () => {
     // Source bytes for re-ingestion and the S3 HEAD byte accounting
     // sizes documents with (Requirement 12.3). Nothing here writes user
@@ -1042,6 +1066,24 @@ describe('KbMigrationConstruct — IAM', () => {
     );
     expect(allS3Actions).not.toContain('s3:PutObject');
     expect(allS3Actions).not.toContain('s3:DeleteObject');
+  });
+
+  it('lets the reconciler list and read the documents bucket, read-only', () => {
+    // `refresh_stored_bytes` totals a ListObjectsV2 of each assistant's
+    // documents prefix. Without a grant the listing is AccessDenied on
+    // every run and storedBytes is never re-anchored — which is exactly
+    // what happened until this grant existed.
+    const s3Actions = statementsForRole(t, /KbMigrationReconcilerLambdaServiceRole/).flatMap((s) =>
+      (Array.isArray(s.Action) ? s.Action : [s.Action]).filter(
+        (a): a is string => typeof a === 'string' && a.startsWith('s3:'),
+      ),
+    );
+    expect(s3Actions).toContain('s3:List*');
+    expect(s3Actions).toContain('s3:GetObject*');
+    for (const action of s3Actions) {
+      expect(action.startsWith('s3:Put')).toBe(false);
+      expect(action.startsWith('s3:Delete')).toBe(false);
+    }
   });
 });
 

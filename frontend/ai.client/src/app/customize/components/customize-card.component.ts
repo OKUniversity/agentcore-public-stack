@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, input, output } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, input, output } from '@angular/core';
 import { RouterLink } from '@angular/router';
 
 /** Connection chip shown beside a card's name, or null to draw none. */
@@ -49,6 +49,12 @@ export type CustomizeCardBadge = 'connected' | 'connect' | null;
               {{ name() }}
             }
           </h3>
+          @if (retiring()) {
+            <span
+              class="shrink-0 rounded-sm bg-state-warning-50 px-1.5 font-mono text-[10px]/5 font-medium text-state-warning-700 dark:bg-state-warning-900/30 dark:text-state-warning-300"
+              >retiring</span
+            >
+          }
           @switch (badge()) {
             @case ('connected') {
               <span
@@ -67,16 +73,35 @@ export type CustomizeCardBadge = 'connected' | 'connect' | null;
         <p class="mt-0.5 line-clamp-2 text-xs/5 text-gray-500 dark:text-gray-400">
           {{ description() }}
         </p>
+        @if (locked()) {
+          <p class="mt-1 text-xs/5 font-medium text-gray-600 dark:text-gray-300">
+            {{ lockedReason }}
+          </p>
+        }
+        @if (retiring()) {
+          <p class="mt-1 text-xs/5 font-medium text-state-warning-700 dark:text-state-warning-300">
+            {{ enabled() ? retiringOnReason : retiringOffReason }}{{ retiringDetail() ? ' ' + retiringDetail() : '' }}
+          </p>
+        }
       </div>
 
       <button
         type="button"
         role="switch"
         [attr.aria-checked]="enabled()"
-        [attr.aria-label]="(enabled() ? 'Disable ' : 'Enable ') + name()"
-        [disabled]="pending()"
+        [attr.aria-label]="
+          locked()
+            ? name() + ' is required by your organization and cannot be turned off'
+            : retiringLocked()
+              ? name() + ' is being retired and can no longer be turned on'
+              : (enabled() ? 'Disable ' : 'Enable ') + name()
+        "
+        [attr.aria-disabled]="locked() || retiringLocked() ? 'true' : null"
+        [attr.title]="locked() ? lockedReason : retiringLocked() ? retiringTooltip() : null"
+        [disabled]="pending() || locked() || retiringLocked()"
         (click)="toggled.emit()"
-        class="relative z-10 mt-0.5 inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 disabled:cursor-not-allowed disabled:opacity-50"
+        [class.opacity-50]="pending() && !locked()"
+        class="relative z-10 mt-0.5 inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 disabled:cursor-not-allowed"
         [class]="enabled() ? 'bg-primary-600 dark:bg-primary-500' : 'bg-gray-200 dark:bg-gray-700'"
       >
         <span
@@ -94,6 +119,48 @@ export class CustomizeCardComponent {
   readonly description = input<string>('');
   readonly monogram = input<string>('?');
   readonly enabled = input<boolean>(false);
+  /**
+   * The switch is on and the user cannot change it — an administrator pinned
+   * this capability. Rendered as policy rather than as a disabled control:
+   * full opacity (a greyed switch reads as "broken" or "loading"), a stated
+   * reason on the card, and the reason in the accessible name, because a
+   * `title` tooltip reaches neither touch users nor a screen reader browsing
+   * statically.
+   */
+  readonly locked = input<boolean>(false);
+  protected readonly lockedReason = 'Required by your organization';
+  /**
+   * Being retired: the opposite asymmetry to {@link locked}. Where a locked card
+   * is on and cannot be turned off, a retiring one can be turned off and cannot
+   * be turned back on — so the switch is disabled only while it is already off.
+   * A retiring card that is ON stays a live, fully working control, because the
+   * action we want from the user is exactly that one flip.
+   *
+   * Never a claim that the capability is broken: the backend still grants it and
+   * it still works. See docs/specs/mcp-server-retirement.md §7.
+   */
+  readonly retiring = input<boolean>(false);
+  /**
+   * What to do instead, and when it stops working — already composed into one
+   * sentence by `retirementDetail()` so this component holds no copy rules of
+   * its own. Empty when the admin recorded neither, in which case the card says
+   * only that the capability is going away, which is all we actually know.
+   */
+  readonly retiringDetail = input<string>('');
+  protected readonly retiringOnReason = 'Being retired — turn it off when you can.';
+  protected readonly retiringOffReason = 'Being retired and can no longer be turned on.';
+  /** Retiring AND already off — the one state in which the switch refuses. */
+  protected readonly retiringLocked = computed(() => this.retiring() && !this.enabled());
+  /**
+   * The hover text on a refusing switch. Carries the detail too, since "why
+   * won't this turn on?" and "what do I use instead?" are the same question.
+   * The card body states both regardless, so nothing here is title-only —
+   * a `title` reaches neither touch users nor a statically-browsing reader.
+   */
+  protected readonly retiringTooltip = computed(() => {
+    const detail = this.retiringDetail();
+    return detail ? `${this.retiringOffReason} ${detail}` : this.retiringOffReason;
+  });
   /** In-flight save: the switch stays visually settled but refuses a second click. */
   readonly pending = input<boolean>(false);
   readonly badge = input<CustomizeCardBadge>(null);

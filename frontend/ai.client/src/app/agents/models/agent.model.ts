@@ -13,15 +13,7 @@ export type { AgentListingBlock };
  * Agent shape carries the governed `modelConfig` + uniform `bindings[]`.
  */
 
-export type BindingKind = 'knowledge_base' | 'tool' | 'skill' | 'memory_space';
-
-/** Value stored in a `memory_space` binding's `config`. */
-export interface MemorySpaceBindingConfig {
-  /** Read-only injection vs. read + `memory_*` write tools (D5 gate). */
-  access: 'read' | 'readwrite';
-  /** Entry slugs (or `MEMORY.md`) always hydrated into the prompt. */
-  alwaysLoad?: string[];
-}
+export type BindingKind = 'knowledge_base' | 'tool' | 'skill';
 
 /** Governed single-select model (D3). `modelId` is the Bedrock/provider id. */
 export interface AgentModelConfig {
@@ -62,6 +54,15 @@ export interface AgentBinding {
  * Names, never refs — the backend resolves binding refs to display names so this
  * payload can be rendered to anyone who may see the Agent.
  */
+/** The pinned model's retirement, as `GET /agents/{id}` resolves it. Display names only. */
+export interface AgentModelRetirement {
+  status: 'deprecated' | 'retired';
+  /** The model that answers in its place, when there is one. */
+  successorLabel?: string | null;
+  retiresOn?: string | null;
+  retirementNote?: string | null;
+}
+
 export interface AgentCapability {
   label: string;
   kind: string;
@@ -90,6 +91,14 @@ export interface Agent {
   createdAt: string;
   updatedAt: string;
 
+  /**
+   * Configurable source citations & document download (#111). Optional on the client
+   * type so existing `Agent` fixtures/mocks stay valid; the backend always sends both
+   * (default true), and readers treat absent as true. `allowDocumentDownload` is only
+   * meaningful when `showCitations` is true (citations off ⇒ downloads off).
+   */
+  showCitations?: boolean;
+  allowDocumentDownload?: boolean;
   // Marketplace listing (Phase 1) + the detail read (Phase 3). All are absent on the
   // list route and on an agent that was never submitted.
   tagline?: string;
@@ -104,6 +113,8 @@ export interface Agent {
   /** Resolved on `GET /agents/{id}` only. */
   capabilities?: AgentCapability[];
   modelLabel?: string;
+  /** Set when the pinned model is deprecated or retired (docs/specs/model-retirement.md). */
+  modelRetirement?: AgentModelRetirement | null;
   /** Attribution as the page renders it; `listing.publisherId` is an id and never shown. */
   publisher?: ListingPublisher | null;
   categoryLabel?: string;
@@ -151,6 +162,9 @@ export interface CreateAgentRequest {
   imageUrl?: string;
   modelConfig?: AgentModelConfig;
   bindings?: AgentBinding[];
+  /** #111 — default true when omitted. */
+  showCitations?: boolean;
+  allowDocumentDownload?: boolean;
 }
 
 export interface UpdateAgentRequest {
@@ -165,6 +179,9 @@ export interface UpdateAgentRequest {
   imageUrl?: string;
   modelConfig?: AgentModelConfig;
   bindings?: AgentBinding[];
+  /** #111 — omit to leave the stored value unchanged. */
+  showCitations?: boolean;
+  allowDocumentDownload?: boolean;
 }
 
 export interface AgentsListResponse {

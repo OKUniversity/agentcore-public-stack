@@ -7,6 +7,7 @@ import { AssistantMessageComponent } from './assistant-message.component';
 import { Message, ContentBlock } from '../../../services/models/message.model';
 import { McpAppStateService } from '../../../services/mcp-apps/mcp-app-state.service';
 import { ChatStateService } from '../../../services/chat/chat-state.service';
+import { ToolInsightService } from '../../../services/chat/tool-insight.service';
 import { UiResourceEvent } from '../../../../shared/utils/stream-parser/stream-parser-types';
 
 function makeMessage(content: ContentBlock[]): Message {
@@ -169,6 +170,86 @@ describe('AssistantMessageComponent', () => {
 
       const blocks = component.displayBlocks();
       expect(blocks.length).toBe(0);
+    });
+  });
+
+  describe('tool summaries under an explicit insight key', () => {
+    it('reads summaries seeded under insightSessionId rather than the viewed session', () => {
+      const insights = TestBed.inject(ToolInsightService);
+      TestBed.inject(ChatStateService).setViewedSession(VIEWED_SESSION);
+      insights.seedFromHydration('share:abc', [{ batchId: 'b1', toolUseIds: ['tu-1'], summary: 'Read the notes' }]);
+      fixture.componentRef.setInput('messages', [makeMessage([makeToolBlock('memory_read', { toolUseId: 'tu-1' })])]);
+
+      fixture.detectChanges();
+      expect(component.displayBlocks()[0].group!.batches?.[0]?.summary).toBeUndefined();
+
+      fixture.componentRef.setInput('insightSessionId', 'share:abc');
+      fixture.detectChanges();
+      expect(component.displayBlocks()[0].group!.batches?.[0]?.summary).toBe('Read the notes');
+    });
+  });
+
+  describe('browser page cards', () => {
+    function browse(input: Record<string, unknown>, content: unknown[]): ContentBlock {
+      return makeToolBlock('browse_web', {
+        input,
+        result: { status: 'success', content },
+      });
+    }
+
+    const navigate = () =>
+      browse({ action: 'navigate', url: 'https://a.test/' }, [
+        { text: '✅ Navigated to https://a.test/\nTitle: Home\n\nbody' },
+      ]);
+    const screenshot = () =>
+      browse({ action: 'screenshot' }, [
+        { text: '✅ Screenshot of the current viewport:' },
+        { image: { format: 'png', data: 'AAAA' } },
+      ]);
+
+    function pages() {
+      return component
+        .displayBlocks()
+        .filter((b) => b.type === 'browser_page')
+        .map((b) => b.browserPage!);
+    }
+
+    it('shows a screenshot taken after narration on the page navigated to before it', () => {
+      fixture.componentRef.setInput('messages', [makeMessage([
+        navigate(),
+        makeTextBlock('The page loaded. Taking a screenshot.'),
+        screenshot(),
+        makeTextBlock('Here is what it looks like.'),
+      ])]);
+
+      const cards = pages();
+      expect(cards.length).toBe(2);
+      expect(cards[0].screenshot).toBeNull();
+      expect(cards[1]).toMatchObject({
+        url: 'https://a.test/',
+        title: 'Home',
+        screenshot: 'data:image/png;base64,AAAA',
+      });
+    });
+
+    it('shows one card for navigate and screenshot in one rail', () => {
+      fixture.componentRef.setInput('messages', [makeMessage([navigate(), screenshot()])]);
+
+      const cards = pages();
+      expect(cards.length).toBe(1);
+      expect(cards[0].screenshot).toBe('data:image/png;base64,AAAA');
+    });
+
+    it('adds no card for rails that only read the page or close it', () => {
+      fixture.componentRef.setInput('messages', [makeMessage([
+        navigate(),
+        makeTextBlock('Reading it.'),
+        browse({ action: 'extract_text' }, [{ text: 'Page text' }]),
+        makeTextBlock('Done.'),
+        browse({ action: 'close' }, [{ text: '✅ Browser session closed.' }]),
+      ])]);
+
+      expect(pages().length).toBe(1);
     });
   });
 

@@ -213,6 +213,8 @@ export class CustomizeConnectorsPage {
   private readonly states = signal<Map<string, ConnectState>>(new Map());
 
   constructor() {
+    this.connectorsService.ensureLoaded();
+
     // Flip a provider to `connected` when the /oauth-complete landing page
     // postMessages success. This is the same signal the chat-input banner
     // listens to, so both UIs stay in sync.
@@ -345,8 +347,7 @@ export class CustomizeConnectorsPage {
         this.toast.error('Unexpected response from the server.');
         return;
       }
-      this.consentService.requestConsent(providerId, result.authorizationUrl);
-      this.consentService.openConsentPopup(providerId);
+      void this.consentService.startUserConsent(providerId, result.authorizationUrl);
       this.setState(providerId, 'awaiting');
     } catch (err: unknown) {
       console.error('Consent initiation failed', err);

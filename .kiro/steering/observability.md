@@ -196,9 +196,12 @@ CloudFormation caps a stack at **500 resources**, and this is a deliberate
 single-stack architecture with nowhere to spill. Alarms are the largest
 discretionary consumer.
 
-Measured: **308** resources before this work, **~370** after. A guard in
-`observability-dynamodb-alarms.test.ts` fails the build above 460, so the ceiling
-surfaces while there is still room to react rather than as a failed deploy.
+Measured: **308** resources before this work, **~370** after. The guard is
+`platform-ceilings.test.ts`, which synthesizes the stack twice — with the
+shipped defaults and with every opt-in flag on — and fails the build above a
+margin below 500, so the ceiling surfaces while there is still room to react
+rather than as a failed deploy. It prints both counts on every run; read them
+there rather than keeping a number in prose.
 
 When budget matters, decide with data rather than by covering every documented
 metric. The DynamoDB allocation was cut from 78 alarms to 27 because a live sweep
@@ -219,11 +222,39 @@ hardcodes `retention: logs.RetentionDays.*`.
 The AgentCore Runtime's log group is created by the **AgentCore service**, not
 CloudFormation, so a CDK `LogGroup` cannot set its retention — declaring one
 would collide on create or manage a second, empty group. An `AwsCustomResource`
-calls `logs:PutRetentionPolicy` instead. That API is idempotent *and* creates the
-group if absent, which matters on a first deploy when the runtime exists but has
-never been invoked. There is deliberately **no `onDelete`**: removing the
-retention policy on teardown would revert the group to "keep forever", which is
-the cost problem it fixes.
+calls `logs:PutRetentionPolicy` instead. That API is idempotent but does **not**
+create the group: on a missing group it returns `ResourceNotFoundException` and
+creates nothing. The Runtime's own execution role creates the group on its first
+container start, and on every deploy observed so far that has landed well before
+the custom resource runs. If it ever loses that race, a thrown error would fail
+the custom resource and roll back the whole stack update, so both calls set
+`ignoreErrorCodesMatching: 'ResourceNotFoundException'` and the daily sweep
+below sets retention within a day. With the sweep turned off there is no such
+backstop: the group keeps no retention until CloudFormation re-runs the call
+(only when the retention value or the Runtime id changes), so set it by hand.
+Calling `CreateLogGroup` first was rejected: it would race the Runtime's own
+create the other way round. There is deliberately **no `onDelete`**: removing
+the retention policy on teardown would revert the group to "keep forever", which
+is the cost problem it fixes.
+
+**The replacement trap.** That custom resource only ever sees the *current*
+Runtime. Replacing a Runtime gives it a new id and a new group
+(`<runtime-name>-<new-id>-DEFAULT`); the old group drops out of CDK's view and
+keeps whatever retention it had. Groups orphaned before the custom resource
+existed have none, so they never expire, and they hold conversation text. A
+landing zone that stamps a default retention on every `CreateLogGroup` event
+can also overwrite the deploy-time value a few minutes later, even on the live
+group. `RuntimeLogRetentionSweepConstruct` closes both gaps: a daily Lambda
+lowers every group under `/aws/bedrock-agentcore/runtimes/<runtime-name>-` to
+`logRetentionDays` when its retention is unset or longer. Runtime names cannot
+contain `-`, so that prefix covers every generation of this deployment's Runtime
+and no other deployment's. It never deletes a group; removing an orphaned group
+is an operator's call. Kill switch:
+`CDK_OBSERVABILITY_RUNTIME_LOG_RETENTION_SWEEP_ENABLED=false`, for an account
+whose governance requires longer retention. Turning it off also removes the
+backstop for a live group the deploy-time call found missing. Groups from an
+older naming scheme (a different runtime name) are outside the prefix and need a
+one-off `put-retention-policy`.
 
 ## 10. Subscriptions are not infrastructure-as-code
 
@@ -261,9 +292,9 @@ cannot be quietly reversed.
 | `bedrock-invocation-throttles` | At a model's TPM/RPM quota | Users see chats that never respond. Quota increase. |
 | `agentcore-memory-*` | Memory hot path failing | Users experience an agent that has forgotten the conversation. |
 | `agentcore-gateway-*` | MCP calls failing at the gateway | Agents lose tool access. Check gateway targets. |
-| `ddb-*-throttle` | Named table throttling | On-demand, so this is a hot partition or an account limit. Compare `ReadThrottleEvents` vs `WriteThrottleEvents` on that table. |
+| `ddb-throttle-group-*` | At least one table in the group is throttling | The description lists the group's tables; compare `ReadThrottleEvents` vs `WriteThrottleEvents` across them to find it. On-demand, so this is a hot partition or an account limit. While the alarm stays in ALARM, a second table in the same group starting to throttle sends no new notification. |
 | `ddb-user-errors` | DynamoDB rejecting our requests (4xx) | Application code misusing the API. Account-wide, so use CloudTrail or app logs to find the caller. |
-| `lambda-token-enrichment-errors` | **Silent** degradation | Handler is fail-open: logins still work, but MCP tools are losing user-identity claims. |
+| `lambda-errors-group-*` / `lambda-throttles-group-*` | At least one Lambda in the group is failing or throttled | The description lists the members; each function's own `Errors` / `Throttles` metric shows which one. If it is token-enrichment, that is **silent** degradation: the handler is fail-open, so logins still work but MCP tools are losing user-identity claims. |
 | `dlq-kb-ingestion-not-empty` | Work accepted then failed every retry | Will **not** self-clear. Inspect, fix, then replay or drain. |
 | `prompt-cache-session-partial-miss` | One conversation re-writing its prefix every turn | Use the "Sessions by partial-miss waste" widget to find which session. |
 

@@ -32,8 +32,10 @@ from apis.shared.sessions.feedback import (
 )
 from apis.shared.sessions.messages import get_messages
 from apis.shared.sessions.metadata import (
+    list_pinned_sessions,
     list_user_sessions,
     get_session_metadata,
+    set_session_pinned,
     mark_session_read,
     mark_session_unread,
     remove_pending_interrupts,
@@ -42,10 +44,13 @@ from apis.shared.sessions.metadata import (
     store_session_metadata,
 )
 from .services.session_service import SessionService
+from .services.delete_cascade import SessionDeleteCascade
 from apis.app_api.shares.service import get_share_service
 from apis.app_api.artifacts.service import get_artifact_share_service
+from apis.shared.conversation_archive import delete_session_archive
 from apis.shared.auth.dependencies import get_current_user_from_session
 from apis.shared.feature_flags import (
+    attachment_kb_enabled,
     response_feedback_enabled,
     mid_turn_steering_enabled,
     browser_takeover_enabled,
@@ -106,9 +111,24 @@ async def list_user_sessions_endpoint(
             for session in sessions
         ]
 
+        # Pins ride on the first page so the sidebar gets them without a second
+        # request. A failure here degrades to "no Pinned group", never a failed list.
+        pinned_responses = None
+        if not next_token:
+            try:
+                pinned_responses = [
+                    SessionMetadataResponse.model_validate(
+                        {**session.model_dump(by_alias=True), "pinnedAt": pinned_at}
+                    )
+                    for session, pinned_at in await list_pinned_sessions(user_id)
+                ]
+            except Exception:
+                logger.error("Error listing pinned sessions", exc_info=True)
+
         return SessionsListResponse(
             sessions=session_responses,
-            next_token=next_page_token
+            next_token=next_page_token,
+            pinned=pinned_responses,
         )
 
     except Exception as e:
@@ -211,6 +231,38 @@ async def mark_session_unread_endpoint(
     Requires session-cookie authentication. Returns 204 No Content.
     """
     await mark_session_unread(session_id=session_id, user_id=current_user.user_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.put("/{session_id}/pin", status_code=status.HTTP_204_NO_CONTENT)
+async def pin_session_endpoint(
+    session_id: str,
+    current_user: User = Depends(get_current_user_from_session)
+):
+    """
+    Pin a conversation to the top of the sidebar (issue #711).
+
+    Idempotent: re-pinning moves it to the top of the Pinned group. Returns
+    404 for a session the user doesn't own, and 409 for a project task, which
+    already lists under its project and can't be pinned.
+    """
+    result = await set_session_pinned(session_id, current_user.user_id, pinned=True)
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail="Session not found")
+    if result == "project":
+        raise HTTPException(status_code=409, detail="Project conversations can't be pinned")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete("/{session_id}/pin", status_code=status.HTTP_204_NO_CONTENT)
+async def unpin_session_endpoint(
+    session_id: str,
+    current_user: User = Depends(get_current_user_from_session)
+):
+    """Unpin a conversation. Idempotent; 404 for a session the user doesn't own."""
+    result = await set_session_pinned(session_id, current_user.user_id, pinned=False)
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail="Session not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -448,39 +500,16 @@ async def delete_session_endpoint(
                 detail=f"Session not found: {session_id}"
             )
 
-        # Queue cleanup tasks as background tasks (fire-and-forget)
-        # These don't block the response - cleanup happens after 204 is sent
-
-        # 1. Delete AgentCore Memory content
-        background_tasks.add_task(
-            service.delete_agentcore_memory,
-            session_id,
-            user_id
-        )
-
-        # 2. Cascade delete associated files (S3 objects + metadata)
-        background_tasks.add_task(
-            service.delete_session_files,
-            session_id
-        )
-
-        # 3. Delete share snapshots so share links stop working
-        share_service = get_share_service()
-        background_tasks.add_task(
-            share_service.delete_shares_for_session,
-            session_id
-        )
-
-        # 4. Revoke artifact shares from this session. Artifacts outlive
-        # the chat that produced them, so without this a deleted
-        # conversation leaves live links to its artifacts. Best-effort
-        # and never-raising, like the conversation cascade above — and a
-        # no-op when artifacts aren't enabled for this environment.
-        background_tasks.add_task(
-            get_artifact_share_service().delete_for_session,
-            session_id,
-            user_id
-        )
+        # The cleanups (Memory, files, shares, artifact shares, archived
+        # turns) run as background tasks after the 204 is sent. One cascade
+        # serves this route, bulk delete and the retention pruner, so they
+        # cannot drift apart (services/delete_cascade.py).
+        SessionDeleteCascade(
+            session_service=service,
+            share_service=get_share_service(),
+            artifact_share_service=get_artifact_share_service(),
+            delete_archive=delete_session_archive,
+        ).queue(background_tasks, user_id, session_id)
 
         logger.info("Successfully deleted session")
 
@@ -541,8 +570,12 @@ async def bulk_delete_sessions_endpoint(
 
     try:
         service = SessionService()
-        share_service = get_share_service()
-        artifact_share_service = get_artifact_share_service()
+        cascade = SessionDeleteCascade(
+            session_service=service,
+            share_service=get_share_service(),
+            artifact_share_service=get_artifact_share_service(),
+            delete_archive=delete_session_archive,
+        )
 
         for session_id in session_ids:
             try:
@@ -552,25 +585,7 @@ async def bulk_delete_sessions_endpoint(
                 )
 
                 if deleted:
-                    # Queue cleanup tasks as background tasks
-                    background_tasks.add_task(
-                        service.delete_agentcore_memory,
-                        session_id,
-                        user_id
-                    )
-                    background_tasks.add_task(
-                        service.delete_session_files,
-                        session_id
-                    )
-                    background_tasks.add_task(
-                        share_service.delete_shares_for_session,
-                        session_id
-                    )
-                    background_tasks.add_task(
-                        artifact_share_service.delete_for_session,
-                        session_id,
-                        user_id
-                    )
+                    cascade.queue(background_tasks, user_id, session_id)
                     results.append(BulkDeleteSessionResult(
                         session_id=session_id,
                         success=True,
@@ -615,6 +630,7 @@ async def get_session_messages_endpoint(
     session_id: str,
     limit: Optional[int] = Query(None, ge=1, le=1000, description="Maximum number of messages to return"),
     next_token: Optional[str] = Query(None, description="Pagination token for retrieving the next page of results"),
+    background_tasks: BackgroundTasks = None,
     current_user: User = Depends(get_current_user_from_session)
 ):
     """
@@ -653,6 +669,14 @@ async def get_session_messages_endpoint(
         )
 
         logger.info("Successfully retrieved session messages")
+
+        # Opening a conversation re-indexes its evicted large documents
+        # (large-document spec §4E), after the response and only on the first
+        # page, so a scroll back through history does not re-send.
+        if next_token is None and background_tasks is not None and attachment_kb_enabled():
+            from apis.app_api.files.attachment_reindex import requeue_evicted_attachments
+
+            background_tasks.add_task(requeue_evicted_attachments, session_id, user_id)
 
         return response
 

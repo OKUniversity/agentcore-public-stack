@@ -52,6 +52,16 @@ def _stub_ensure_session_metadata_exists(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_list_pinned_sessions(monkeypatch):
+    """GET /sessions reads the PinnedSessionIndex on its first page. Route tests
+    mock ``list_user_sessions`` and don't provision the table, so pins are empty."""
+    monkeypatch.setattr(
+        "apis.app_api.sessions.routes.list_pinned_sessions",
+        AsyncMock(return_value=[]),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Auto-stub the api-converse profile lookup
 # ---------------------------------------------------------------------------
@@ -261,6 +271,14 @@ def _no_live_infrastructure_reads(monkeypatch):
         ("apis.inference_api.chat.system_prompt_resolver.get_session_metadata", None),
         ("apis.shared.files.document_read.session_has_documents", False),
         ("apis.shared.files.document_read.session_has_tabular_files", False),
+        # The tool-catalog snapshot behind `freshness.get_always_on_tool_ids`.
+        # The invocation path resolves the admin-pinned tool set every turn, so
+        # it reads the catalog where it previously did not — and the resolver is
+        # fail-open, which is precisely the case this fixture's docstring warns
+        # about: swallowed error, assertion still passes, real socket still
+        # opened. An empty catalog pins nothing, which is the default behaviour
+        # a route test should see.
+        ("apis.shared.tools.repository.ToolCatalogRepository.list_tools", []),
         # Converse path: model routing, the rate-limit window, and the quota
         # override lookup. The 429 test drives quota through `get_quota_checker`,
         # which is a different seam, so stubbing these does not weaken it.
@@ -274,6 +292,9 @@ def _no_live_infrastructure_reads(monkeypatch):
         # auth dependency itself, which never reaches this.
         ("apis.shared.rbac.repository.AppRoleRepository.get_roles_for_jwt_role", []),
         ("apis.shared.rbac.repository.AppRoleRepository.get_role", None),
+        # The direct user grant read runs alongside the role lookups on every
+        # cold resolve, so it needs the same stub or it opens a real socket.
+        ("apis.shared.rbac.repository.AppRoleRepository.get_user_grant", None),
         # Agent-detail label resolution.
         ("apis.shared.memory.repository.MemorySpaceRepository.get_space", None),
         # Session delete cascades into artifact share cleanup. Whether it fires

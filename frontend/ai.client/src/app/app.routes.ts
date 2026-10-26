@@ -1,19 +1,29 @@
+import { inject } from '@angular/core';
 import { Routes } from '@angular/router';
 import { authGuard } from './auth/auth.guard';
 import { adminGuard } from './auth/admin.guard';
 import { firstBootGuard } from './auth/first-boot.guard';
 import { legacyMigrationHostGuard } from './shared/utils/legacy-migration-host';
+import { FEATURES } from './services/features';
+
+/** Matches only in a build with Shared Projects on (compile-time; see environments/feature-flags.ts). */
+const projectsEnabled = () => inject(FEATURES).projects;
 
 export const routes: Routes = [
     {
         path: '',
         loadComponent: () => import('./session/session.page').then(m => m.ConversationPage),
         canActivate: [authGuard],
+        // The conversation page positions the scroll container itself (remembered
+        // offset per conversation, latest turn, stick-to-bottom while streaming),
+        // so navigation scroll handling (RouteScrollService) leaves it alone.
+        data: { scroll: 'self' },
     },
     {
         path: 's/:sessionId',
         loadComponent: () => import('./session/session.page').then(m => m.ConversationPage),
         canActivate: [authGuard],
+        data: { scroll: 'self' },
     },
     {
         path: 'auth/first-boot',
@@ -50,6 +60,12 @@ export const routes: Routes = [
         loadComponent: () => import('./admin/admin.layout').then(m => m.AdminLayout),
         canActivate: [adminGuard],
         loadChildren: () => import('./admin/admin.routes').then(m => m.adminRoutes),
+        // Declared once on the parent, and read by `resolveRouteChrome`'s
+        // deepest-declared-wins walk, so every child inherits it without
+        // repeating the flag 30 times. The shell answers it two ways: the
+        // sidenav swaps its body for the admin nav, and the content box drops
+        // its `max-w-7xl` cap so the console's tables get the full width.
+        data: { chrome: 'admin' },
     },
     // ── Assistant deprecation (Designer Phase 5) ────────────────────────────────────
     // There is one noun, and it is Agent (Marketplace D1). The Designer reached parity
@@ -128,6 +144,21 @@ export const routes: Routes = [
     {
         path: 'agents',
         loadComponent: () => import('./agents/agents.page').then(m => m.AgentsPage),
+        canActivate: [authGuard],
+    },
+    {
+        // One project and its settings pages (projects/projects.routes.ts).
+        // `projectsEnabled` keeps every /projects URL unmatched (→ not found) in a
+        // build that has Projects off (src/environments/feature-flags.ts).
+        path: 'projects/:id',
+        loadChildren: () => import('./projects/projects.routes').then(m => m.PROJECT_ROUTES),
+        canMatch: [projectsEnabled],
+        canActivate: [authGuard],
+    },
+    {
+        path: 'projects',
+        loadComponent: () => import('./projects/projects.page').then(m => m.ProjectsPage),
+        canMatch: [projectsEnabled],
         canActivate: [authGuard],
     },
     {

@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { TestBed } from '@angular/core/testing';
 import { signal, computed } from '@angular/core';
-import { Router } from '@angular/router';
 import { ModelDropdownComponent } from './model-dropdown.component';
 import { ModelService } from '../../session/services/model/model.service';
 import { SessionService } from '../../session/services/session/session.service';
+import { PromptCacheGuardService } from '../../session/services/prompt-cache/prompt-cache-guard.service';
 import {
   EffortControl,
   ManagedModel,
@@ -44,6 +44,8 @@ function setup(options: {
   effortControl?: EffortControl | null;
   selectedEffort?: string | null;
   hasSession?: boolean;
+  /** What the prompt-cache guard answers when asked. */
+  confirm?: boolean;
 } = {}) {
   const featured = signal(options.featured ?? [makeModel()]);
   const more = signal(options.more ?? []);
@@ -65,24 +67,26 @@ function setup(options: {
     selectedEffort,
     setSelectedModel,
     setEffort,
+    modelNameFor: vi.fn(() => null),
   };
 
   const sessionService = {
     hasCurrentSession: () => options.hasSession ?? false,
   };
+  const confirm = vi.fn(async () => options.confirm ?? true);
 
   TestBed.resetTestingModule();
   TestBed.configureTestingModule({
     providers: [
       { provide: ModelService, useValue: modelService },
       { provide: SessionService, useValue: sessionService },
-      { provide: Router, useValue: { navigate: vi.fn() } },
+      { provide: PromptCacheGuardService, useValue: { confirm } },
     ],
   });
 
   const fixture = TestBed.createComponent(ModelDropdownComponent);
   fixture.detectChanges();
-  return { fixture, modelService, setSelectedModel, setEffort };
+  return { fixture, modelService, setSelectedModel, setEffort, confirm };
 }
 
 /** Open the picker by clicking its trigger, then flush the overlay render. */
@@ -256,8 +260,8 @@ describe('ModelDropdownComponent', () => {
     expect(itemLabelled('Medium')?.textContent).toContain('Default');
   });
 
-  it('writes the chosen effort level back to the service', () => {
-    const { fixture, setEffort } = setup({
+  it('writes the chosen effort level back to the service', async () => {
+    const { fixture, setEffort, confirm } = setup({
       effortControl: { key: 'effort', levels: ['low', 'high'], defaultLevel: 'low' },
       selectedEffort: 'low',
     });
@@ -266,7 +270,94 @@ describe('ModelDropdownComponent', () => {
     fixture.detectChanges();
     itemLabelled('High')!.click();
 
-    expect(setEffort).toHaveBeenCalledWith('high');
+    await vi.waitFor(() => expect(setEffort).toHaveBeenCalledWith('high'));
+    // No conversation yet, so there is no cache to lose.
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  describe('changing effort in an open conversation', () => {
+    const effort = { key: 'effort', levels: ['low', 'high'], defaultLevel: 'low' };
+
+    function pickEffort(fixture: ReturnType<typeof setup>['fixture'], label: string) {
+      openMenu(fixture);
+      itemLabelled('Effort')!.click();
+      fixture.detectChanges();
+      itemLabelled(label)!.click();
+    }
+
+    it('asks the prompt-cache guard, then applies the level', async () => {
+      const { fixture, setEffort, confirm } = setup({ effortControl: effort, selectedEffort: 'low', hasSession: true });
+      pickEffort(fixture, 'High');
+
+      await vi.waitFor(() => expect(setEffort).toHaveBeenCalledWith('high'));
+      expect(confirm).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'effort', fromLabel: 'Low', toLabel: 'High' }),
+      );
+    });
+
+    it('keeps the current level when the user cancels', async () => {
+      const { fixture, setEffort, confirm } = setup({
+        effortControl: effort,
+        selectedEffort: 'low',
+        hasSession: true,
+        confirm: false,
+      });
+      pickEffort(fixture, 'High');
+
+      await vi.waitFor(() => expect(confirm).toHaveBeenCalled());
+      await Promise.resolve();
+      expect(setEffort).not.toHaveBeenCalled();
+    });
+
+    it('does not ask when re-picking the current level', async () => {
+      const { fixture, setEffort, confirm } = setup({ effortControl: effort, selectedEffort: 'low', hasSession: true });
+      pickEffort(fixture, 'Low');
+      await Promise.resolve();
+
+      expect(confirm).not.toHaveBeenCalled();
+      expect(setEffort).not.toHaveBeenCalled();
+    });
+  });
+
+  it('rotates the trigger chevron while the menu is open', () => {
+    // The open state comes from the trigger's cdkMenuOpened/cdkMenuClosed
+    // outputs. CdkMenu has no `opened` output, so an `(opened)` binding on the
+    // panel compiles to a DOM listener that never fires and the chevron sticks.
+    const { fixture } = setup();
+    const trigger: HTMLButtonElement = fixture.nativeElement.querySelector(
+      'button[aria-label="Select model"]',
+    );
+    const chevron = () => trigger.querySelector('svg')!;
+    expect(chevron().classList).not.toContain('rotate-180');
+
+    trigger.click();
+    fixture.detectChanges();
+    expect(menuItems().length).toBeGreaterThan(0);
+    expect(chevron().classList).toContain('rotate-180');
+
+    // A second click on the trigger toggles the menu closed.
+    trigger.click();
+    fixture.detectChanges();
+    expect(menuItems().length).toBe(0);
+    expect(chevron().classList).not.toContain('rotate-180');
+  });
+
+  it('un-rotates the chevron when choosing a model closes the menu', () => {
+    const { fixture, setSelectedModel } = setup({
+      featured: [
+        makeModel({ id: 'a', modelId: 'a', modelName: 'Alpha' }),
+        makeModel({ id: 'b', modelId: 'b', modelName: 'Beta' }),
+      ],
+    });
+    const chevron = () =>
+      fixture.nativeElement.querySelector('button[aria-label="Select model"] svg') as SVGElement;
+    openMenu(fixture);
+    expect(chevron().classList).toContain('rotate-180');
+
+    itemLabelled('Beta')!.click();
+    fixture.detectChanges();
+    expect(setSelectedModel).toHaveBeenCalled();
+    expect(chevron().classList).not.toContain('rotate-180');
   });
 
   it('locks the picker to a plain label when an agent pins the model', () => {
@@ -276,5 +367,60 @@ describe('ModelDropdownComponent', () => {
 
     expect(fixture.nativeElement.querySelector('button[aria-label="Select model"]')).toBeNull();
     expect(fixture.nativeElement.textContent).toContain('Model One');
+  });
+
+  describe('switching models in an open conversation', () => {
+    const twoModels = [
+      makeModel({ id: 'a', modelId: 'a', modelName: 'Alpha' }),
+      makeModel({ id: 'b', modelId: 'b', modelName: 'Beta' }),
+    ];
+
+    function pick(fixture: ReturnType<typeof setup>['fixture'], name: string) {
+      openMenu(fixture);
+      itemLabelled(name)!.click();
+      fixture.detectChanges();
+    }
+
+    it('continues the conversation on the new model once the guard confirms', async () => {
+      const { fixture, setSelectedModel, confirm } = setup({ featured: twoModels, hasSession: true });
+      pick(fixture, 'Beta');
+
+      await vi.waitFor(() => expect(setSelectedModel).toHaveBeenCalledWith(twoModels[1]));
+      expect(confirm).toHaveBeenCalledWith({ kind: 'model', from: twoModels[0], to: twoModels[1] });
+    });
+
+    it('keeps the current model when the user cancels', async () => {
+      const { fixture, setSelectedModel, confirm } = setup({ featured: twoModels, hasSession: true, confirm: false });
+      pick(fixture, 'Beta');
+
+      await vi.waitFor(() => expect(confirm).toHaveBeenCalled());
+      await Promise.resolve();
+      expect(setSelectedModel).not.toHaveBeenCalled();
+    });
+
+    it('does nothing when re-picking the current model', async () => {
+      const { fixture, setSelectedModel, confirm } = setup({ featured: twoModels, hasSession: true });
+      pick(fixture, 'Alpha');
+      await Promise.resolve();
+
+      expect(confirm).not.toHaveBeenCalled();
+      expect(setSelectedModel).not.toHaveBeenCalled();
+    });
+
+    it('changes the model without asking on a fresh composer', async () => {
+      const { fixture, setSelectedModel, confirm } = setup({ featured: twoModels });
+      pick(fixture, 'Beta');
+
+      await vi.waitFor(() => expect(setSelectedModel).toHaveBeenCalledWith(twoModels[1]));
+      expect(confirm).not.toHaveBeenCalled();
+    });
+
+    it('no longer labels another model as starting a new conversation', () => {
+      const { fixture } = setup({ featured: twoModels, hasSession: true });
+      openMenu(fixture);
+
+      expect(document.querySelector('[role="menu"]')!.textContent).not.toContain('starts a new');
+      expect(itemLabelled('Beta')!.textContent).not.toContain('New');
+    });
   });
 });

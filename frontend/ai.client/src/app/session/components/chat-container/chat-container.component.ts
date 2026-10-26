@@ -9,9 +9,10 @@ import {
   signal,
   viewChild,
 } from '@angular/core';
-import { Message } from '../../services/models/message.model';
+import { NgTemplateOutlet } from '@angular/common';
+import { FolderAttachmentData, Message } from '../../services/models/message.model';
 import { MessageListComponent } from '../message-list/message-list.component';
-import { ChatInputComponent } from '../chat-input/chat-input.component';
+import { ChatInputComponent, ComposerProject } from '../chat-input/chat-input.component';
 import { AnimatedTextComponent } from '../../../components/animated-text';
 import { ParagraphSkeletonComponent } from '../../../components/paragraph-skeleton';
 import { Topnav } from '../../../components/topnav/topnav';
@@ -27,13 +28,16 @@ import {
 } from '../../../agents/components/agent-launch-card.component';
 import {
   AgentGovernance,
-  AssistantIndicatorComponent,
-} from '../assistant-indicator/assistant-indicator.component';
+  AgentIndicatorComponent,
+} from '../agent-indicator/agent-indicator.component';
 import { ModelService } from '../../services/model/model.service';
-import { SessionCostBadgeComponent } from '../session-cost-badge/session-cost-badge.component';
+import { ContextMeterComponent } from '../context-meter/context-meter.component';
 import { VoiceOverlayComponent } from '../voice-overlay';
 import { VoiceChatService } from '../../services/voice';
 import { ChatStateService } from '../../services/chat/chat-state.service';
+import { ProjectsService } from '../../../projects/services/projects.service';
+import { MessageMapService } from '../../services/session/message-map.service';
+import { ExpiredSessionNoticeComponent } from '../expired-session-notice/expired-session-notice.component';
 
 /**
  * Configuration options for ChatContainerComponent.
@@ -68,15 +72,17 @@ export interface ChatContainerConfig {
   selector: 'app-chat-container',
   standalone: true,
   imports: [
+    NgTemplateOutlet,
     MessageListComponent,
     ChatInputComponent,
     AnimatedTextComponent,
     ParagraphSkeletonComponent,
     Topnav,
     AgentLaunchCardComponent,
-    AssistantIndicatorComponent,
-    SessionCostBadgeComponent,
+    AgentIndicatorComponent,
+    ContextMeterComponent,
     VoiceOverlayComponent,
+    ExpiredSessionNoticeComponent,
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './chat-container.component.html',
@@ -98,6 +104,8 @@ export class ChatContainerComponent {
 
   private readonly chatState = inject(ChatStateService);
   private readonly modelService = inject(ModelService);
+  private readonly projectsService = inject(ProjectsService);
+  private readonly messageMap = inject(MessageMapService);
 
   /**
    * What the bound Agent fixes for this conversation, for the indicator.
@@ -148,8 +156,36 @@ export class ChatContainerComponent {
   // Required inputs
   messages = input.required<Message[]>();
   sessionId = input<string | null>(null);
+  /**
+   * Let the composer attach Drive folders (drive-folder spec §4.7). Off unless
+   * the parent sends folders with the turn: the session page does; the agent
+   * preview and the marketplace test drive do not, so they never offer one.
+   */
+  allowFolderAttachments = input<boolean>(false);
+  /**
+   * Offer "Project or folder" beneath the full-page empty state's composer
+   * (docs/specs/composer-project-folder-picker.md). Only the session page sets
+   * it; a thread and the embedded previews never show it.
+   */
+  showScopePicker = input<boolean>(false);
+  /**
+   * The Shared Project this conversation runs in, resolved by the session page
+   * (it resolves the URL's `?project=` before the harness Agent has loaded).
+   * The empty state then shows the greeting, with the composer's placeholder
+   * naming the project, instead of the harness Agent's launch card.
+   */
+  project = input<ComposerProject | null>(null);
 
   // Optional inputs
+
+  /**
+   * Conversation key for composer draft persistence, forwarded to
+   * `app-chat-input` untouched. Null (the default) means this placement
+   * remembers nothing — see the input's own note for why it is not
+   * `sessionId`.
+   */
+  draftKey = input<string | null>(null);
+
   assistant = input<Assistant | null>(null);
 
   /**
@@ -171,6 +207,12 @@ export class ChatContainerComponent {
   // Configuration with defaults
   config = input<Partial<ChatContainerConfig>>({});
 
+  /**
+   * The history on screen came from the conversation archive, so the
+   * composer gives way to a read-only notice (conversation-search §10 q4).
+   */
+  protected readonly isArchiveServed = computed(() => this.messageMap.isArchiveServed(this.sessionId()));
+
   protected readonly resolvedConfig = computed<ChatContainerConfig>(() => ({
     showTopnav: false,
     showEmptyState: true,
@@ -186,7 +228,7 @@ export class ChatContainerComponent {
   // `mentionAgentId` and `invokedSkillIds` ride through untouched: the container is a
   // layout shell, and dropping either field here would silently turn every `@`-mention
   // back into a plain turn, or every `/` skill command into ordinary prose.
-  messageSubmitted = output<{ content: string; timestamp: Date; fileUploadIds?: string[]; mentionAgentId?: string; invokedSkillIds?: string[] }>();
+  messageSubmitted = output<{ content: string; timestamp: Date; fileUploadIds?: string[]; mentionAgentId?: string; invokedSkillIds?: string[]; folders?: FolderAttachmentData[] }>();
   continueRequested = output<void>();
   messageCancelled = output<void>();
   fileAttached = output<File>();
@@ -243,6 +285,15 @@ export class ChatContainerComponent {
 
   // Computed signals
   protected readonly hasMessages = computed(() => this.messages().length > 0);
+  /**
+   * #111: whether the active agent permits source-document download from citations.
+   * Read from the Agent shape first (the Designer surface), falling back to the legacy
+   * Assistant shape, defaulting true so existing agents behave exactly as before.
+   * Passed to <app-message-list> → the citation card to hide its download button.
+   */
+  protected readonly citationsDownloadAllowed = computed(
+    () => this.agent()?.allowDocumentDownload ?? this.assistant()?.allowDocumentDownload ?? true,
+  );
   protected readonly showSkeleton = computed(
     () => this.isLoadingSession() && !this.hasMessages()
   );
@@ -302,6 +353,18 @@ export class ChatContainerComponent {
    *  fixed footer / topnav reserve right-side space so the pane doesn't
    *  cover them. */
   protected readonly artifactPanelOpen = this.dockedPane.isOpen;
+  /**
+   * The crumb's name. A project's harness keeps the name the project was created
+   * with, so a renamed project reads from the project list when the sidebar has
+   * loaded it, and from the harness when it has not.
+   */
+  protected readonly indicatorName = computed(() => {
+    const a = this.assistant();
+    if (!a) return '';
+    if (!a.projectId) return a.name;
+    return this.projectsService.projects$().find(p => p.projectId === a.projectId)?.name ?? a.name;
+  });
+
   protected readonly isAssistantOwner = computed(() => {
     const a = this.assistant();
     if (!a) return false;
@@ -320,8 +383,16 @@ export class ChatContainerComponent {
     this.messageListComponent()?.scrollToLastUserMessage(behavior);
   }
 
+  /**
+   * Anchor one message at the top of the viewport (a search result's turn).
+   * True when the message was rendered and scrolled to.
+   */
+  scrollToMessage(messageId: string, behavior: ScrollBehavior = 'smooth'): boolean {
+    return this.messageListComponent()?.scrollToMessage(messageId, behavior) ?? false;
+  }
+
   // Event handlers
-  onMessageSubmitted(event: { content: string; timestamp: Date; fileUploadIds?: string[]; mentionAgentId?: string; invokedSkillIds?: string[] }) {
+  onMessageSubmitted(event: { content: string; timestamp: Date; fileUploadIds?: string[]; mentionAgentId?: string; invokedSkillIds?: string[]; folders?: FolderAttachmentData[] }) {
     this.messageSubmitted.emit(event);
 
     // Wait for DOM to update (user message to be added) then scroll to it

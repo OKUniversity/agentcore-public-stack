@@ -40,16 +40,18 @@ the page's origin. Notably absent:
   the bytes are readable and inert. This matches spec D5: ``script`` resources
   are stored, listed, and never executed.
 
-Both tiers (admin catalog and user-authored "My Skills") funnel their uploads
-through ``SkillCatalogService.add_resource``, so applying the policy there
-covers both. Enforced by tests/apis/app_api/skills/test_skill_resource_mime.py.
+Both tiers (admin catalog and user-authored "My Skills") and the runtime's
+authoring tools funnel their writes through ``SkillBundleFiles.add_resource``
+(``apis.shared.skills.bundle_files``), so applying the policy there covers all
+of them. Enforced by tests/apis/app_api/skills/test_skill_resource_mime.py.
 """
 
 from __future__ import annotations
 
 import os
-import re
 from typing import Dict, Final
+
+from apis.shared.files.content_disposition import build_content_disposition
 
 # Extension → the media type we store and serve. Every value is inert: no
 # entry is parsed as a scriptable document by any browser. Source-code
@@ -142,6 +144,31 @@ FALLBACK_CONTENT_TYPE: Final[str] = "application/octet-stream"
 #              session. ``frame-ancestors 'none'`` keeps it out of frames.
 #   no-store — these are per-user private files behind a session cookie;
 #              nothing on the path (CloudFront included) should retain them.
+#
+# Which of these the browser actually receives depends on how the response is
+# reached, and BOTH paths are real:
+#
+#   Direct ALB / local dev — the ALB is `internetFacing: true`, and a
+#     localhost:4200 SPA talks to the dev backend directly. There is no edge
+#     policy on this path, so this dict IS the browser's only CSP and
+#     ``sandbox`` is the live control it claims to be.
+#
+#   Behind CloudFront — the `/api/*` behavior's `ApiResponseHeadersPolicy`
+#     (infrastructure/lib/constructs/spa/spa-distribution-construct.ts) sets
+#     its CSP with `override: true`, so it REPLACES this header and the
+#     browser sees `default-src 'none'; frame-ancestors 'none'` without
+#     ``; sandbox``. That is deliberate, not a regression: the edge policy is
+#     an origin-wide backstop covering every `/api/*` response — attachment
+#     bodies and the top-level OAuth login navigation included — where a bare
+#     `sandbox` would force an opaque origin for no real gain, because
+#     `default-src 'none'` already blocks every script that an opaque origin
+#     would be protecting the session from. `infrastructure/test/
+#     api-security-headers.test.ts` pins that string and asserts the omission
+#     is intentional, so the two layers cannot drift silently.
+#
+# Do not "fix" the difference by dropping `override: true`: that would turn
+# the edge backstop into a mere default, letting any future route, middleware
+# or error handler define the CSP for the whole origin.
 RESOURCE_SECURITY_HEADERS: Final[Dict[str, str]] = {
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": (
@@ -151,11 +178,11 @@ RESOURCE_SECURITY_HEADERS: Final[Dict[str, str]] = {
     "Cache-Control": "no-store",
 }
 
-# The upload-side filename guard in ``SkillCatalogService`` already forbids path
+# The upload-side filename guard in ``SkillBundleFiles`` already forbids path
 # separators, so a header value built from a validated filename cannot break
 # out. Belt-and-braces for the read path, which also runs against legacy rows:
-# collapse anything outside the safe set before it reaches a header.
-_HEADER_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+# ``build_content_disposition`` collapses anything outside its safe set before
+# it reaches a header. See :func:`resource_download_headers`.
 
 
 class SkillResourceTypeError(ValueError):
@@ -210,6 +237,28 @@ def resolve_upload_content_type(filename: str) -> str:
     return content_type
 
 
+# Media types whose bytes are text an agent can read or write inline. Shared by
+# the runtime's ``read_skill_file`` (what it returns as text rather than
+# describing) and ``UserSkillService.write_text_file`` (what it will accept as
+# text), so the two cannot disagree about which files are text.
+_TEXT_CONTENT_TYPES: Final[frozenset] = frozenset(
+    {
+        "application/json",
+        "application/xml",
+        "application/yaml",
+        "application/x-yaml",
+        "application/toml",
+        "application/javascript",
+    }
+)
+
+
+def is_text_content_type(content_type: str) -> bool:
+    """True if ``content_type`` is one an agent handles inline as text."""
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    return ct.startswith("text/") or ct in _TEXT_CONTENT_TYPES
+
+
 def safe_download_content_type(filename: str) -> str:
     """The media type to *serve*, re-derived from the filename at read time.
 
@@ -230,10 +279,20 @@ def resource_download_headers(filename: str) -> Dict[str, str]:
     in-app viewer, so nothing legitimate depends on the browser rendering this
     URL as a document — and ``attachment`` is what stops a hand-shared link
     from becoming a top-level document on the SPA's origin.
+
+    The name is reduced to its basename *first* — the read path also runs
+    against legacy rows written before the upload-side separator guard, so a
+    stored ``../../etc/passwd`` must not suggest itself as a save path. What
+    is left goes through the shared builder, which emits the sanitized ASCII
+    ``filename`` plus an RFC 5987 ``filename*``. The ``filename*`` is
+    percent-encoded ASCII, so it cannot break out of the header either, and
+    it changes only the name the browser *saves under* — ``attachment``,
+    ``nosniff`` and the inert CSP above are what keep the bytes from being
+    treated as a document, and none of them depend on the filename.
     """
-    safe_name = _HEADER_SAFE_FILENAME_RE.sub("_", os.path.basename(filename or ""))
-    safe_name = safe_name.strip(" ._") or "resource"
     return {
-        "Content-Disposition": f'attachment; filename="{safe_name}"',
+        "Content-Disposition": build_content_disposition(
+            "attachment", os.path.basename(filename or "") or "resource"
+        ),
         **RESOURCE_SECURITY_HEADERS,
     }

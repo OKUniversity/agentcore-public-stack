@@ -323,7 +323,7 @@ export interface ArtifactEvent {
  *
  * Best-effort by design: a stream that finishes before generation does
  * never emits this event, and the SPA's post-close metadata refresh
- * (ChatHttpService.refreshTitleFromServer) remains the fallback. Never
+ * (ChatHttpService.refreshNewSessionFromServer) remains the fallback. Never
  * carries the "New Conversation" placeholder.
  */
 export interface SessionTitleEvent {
@@ -374,6 +374,26 @@ export interface ModelRetryEvent {
   type: 'model_retry';
   attempt: number;
   delaySeconds: number;
+}
+
+/**
+ * A project's agent is running this turn without part of its setup, because
+ * the member lacks access to it (shared-projects §9.6, degrade-with-notice).
+ *
+ * Emitted before `message_start`. `message` is the ready-made sentence to
+ * show; the structured fields say what was dropped. Not persisted — it
+ * describes this turn's resolution, so it shows on the live turn only.
+ * `projectId` and `unavailableModelId` are omitted when null.
+ */
+export interface AgentNoticeEvent {
+  type: 'agent_notice';
+  sessionId: string;
+  agentId: string;
+  projectId?: string;
+  message: string;
+  unavailableModelId?: string;
+  unavailableTools: string[];
+  unavailableSkills: string[];
 }
 
 /**
@@ -450,6 +470,63 @@ export interface AgentStatusEvent {
  * Gated by `TOOL_SUMMARIES_ENABLED`. Absence means the deterministic line
  * stands — a downgrade in specificity, never a blank.
  */
+/**
+ * Where in a document a cited passage was located
+ * (`docs/specs/source-provenance-verification.md` §5).
+ *
+ * `kind` is the unit the document actually HAS, so a Word document cites a
+ * paragraph and never invents a page. `precision` is always present: an
+ * optional flag whose absence reads as exact is how an estimated position gets
+ * rendered as a confident `p. 234`, so an `estimated` locator is hedged.
+ */
+export interface SourceLocator {
+  kind: 'page' | 'paragraph' | 'line';
+  value: number;
+  precision: 'measured' | 'estimated';
+}
+
+/**
+ * The verdict for one asserted value: is its quoted passage in the document,
+ * and does the value actually appear in that passage?
+ *
+ * The two questions are answered separately on the backend and collapsed into
+ * `state` in exactly one place, so no consumer re-derives it. Treat `state` as
+ * the whole answer — in particular `quote_unsupported` means the passage is
+ * real and the value is NOT in it, which is the hallucination signal and must
+ * never render like a located citation.
+ */
+export interface SourceProvenanceClaim {
+  id: string;
+  state: 'supported' | 'quote_unsupported' | 'unassessed' | 'unverified';
+  /** How the state was reached (`literal`, `no_match`, `enum_field`, …). Measurement, not a verdict. */
+  method: string;
+  /**
+   * The value as the model stated it. Optional: a backend older than the
+   * field sends none, and the renderer falls back to the claim's own label
+   * rather than inventing one.
+   */
+  value?: string;
+  quote: string;
+  locator: SourceLocator | null;
+  uploadId: string;
+  filename: string;
+}
+
+/**
+ * Verdicts for one `verify_sources` call, emitted mid-turn and never
+ * re-streamed — `GET /messages` replays them under `sourceProvenance`.
+ *
+ * Gated by `SOURCE_PROVENANCE_ENABLED` on the backend and
+ * `features.sourceProvenance` here. Absence means no provenance is shown at
+ * all, which is the honest fallback: the SPA must never infer a citation.
+ */
+export interface SourceProvenanceEvent {
+  type: 'source_provenance';
+  sessionId: string;
+  toolUseId: string;
+  claims: SourceProvenanceClaim[];
+}
+
 export interface ToolGroupSummaryEvent {
   type: 'tool_group_summary';
   sessionId: string;
@@ -567,6 +644,8 @@ export interface ToolResultEventData {
       };
     }>;
     status?: 'success' | 'error';
+    /** The tool's MCP `structuredContent`, when it returned one. */
+    structuredContent?: unknown;
   };
 }
 
@@ -598,8 +677,10 @@ export type StreamEventType =
   | 'session_title'
   | 'steering_applied'
   | 'model_retry'
+  | 'agent_notice'
   | 'agent_status'
-  | 'tool_group_summary';
+  | 'tool_group_summary'
+  | 'source_provenance';
 
 /**
  * Union type of all possible event data types
@@ -628,8 +709,10 @@ export type StreamEventData =
   | SessionTitleEvent
   | SteeringAppliedEvent
   | ModelRetryEvent
+  | AgentNoticeEvent
   | AgentStatusEvent
   | ToolGroupSummaryEvent
+  | SourceProvenanceEvent
   | null
   | undefined;
 
@@ -670,6 +753,7 @@ export interface ContentBlockBuilder {
   result?: {
     content: ToolResultContent[];
     status: 'success' | 'error';
+    structuredContent?: unknown;
   };
   status?: 'pending' | 'complete' | 'error';
   isComplete: boolean;

@@ -69,11 +69,20 @@ class Document(BaseModel):
     source_file_id: Optional[str] = Field(None, alias="sourceFileId", description="Provider-side opaque file identifier")
     source_etag: Optional[str] = Field(None, alias="sourceEtag", description="Provider-side version stamp at import time")
     imported_by_user_id: Optional[str] = Field(None, alias="importedByUserId", description="User whose credentials imported the file")
+    # Who put the document here, on every create path (shared-projects §9.5): the
+    # uploader, the importer, or whoever started the crawl or sync that fetched it.
+    # Null on documents created before it was recorded.
+    added_by_user_id: Optional[str] = Field(None, alias="addedByUserId", description="User who added the document")
     # Sync bookkeeping — populated only when the document is covered by a
     # SyncPolicy (scheduled re-index from source).
     content_hash: Optional[str] = Field(None, alias="contentHash", description="SHA-256 of the last-ingested raw bytes (change-detection second gate)")
     last_synced_at: Optional[str] = Field(None, alias="lastSyncedAt", description="ISO 8601 timestamp of last successful sync run")
     sync_policy_id: Optional[str] = Field(None, alias="syncPolicyId", description="Back-pointer to the covering SyncPolicy (UI badges)")
+    removed_from_source: Optional[bool] = Field(
+        None,
+        alias="removedFromSource",
+        description="Set by a drive_folder sync when the file left its folder; the document is kept",
+    )
 
 
 class CreateDocumentRequest(BaseModel):
@@ -120,6 +129,9 @@ class DocumentResponse(BaseModel):
     source_file_id: Optional[str] = Field(None, alias="sourceFileId", description="Provider-side opaque file identifier")
     sync_policy_id: Optional[str] = Field(None, alias="syncPolicyId", description="Back-pointer to the covering SyncPolicy")
     last_synced_at: Optional[str] = Field(None, alias="lastSyncedAt", description="ISO 8601 timestamp of last successful sync run")
+    removed_from_source: Optional[bool] = Field(
+        None, alias="removedFromSource", description="A folder sync found the file no longer in its folder"
+    )
 
 
 class KbUsage(BaseModel):

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from apis.shared import aws_clients
 from apis.shared.files import document_digest as dd
 from tests.shared.test_document_read import build_docx, build_pdf
 
@@ -77,6 +78,32 @@ class TestOutline:
         assert len(dd.text_sample("md", b"x" * 50_000, limit=100)) == 100
 
 
+class TestDocumentText:
+    """The text a TEXT-only model reads in place of an attached document."""
+
+    def test_a_document_that_fits_comes_back_whole(self):
+        out = dd.document_text("pdf", build_pdf(["first page", "second page"]), limit=1_000)
+        assert out.text == "first page\n\nsecond page"
+        assert out.truncated is False
+        assert (out.unit, out.count) == ("page", 2)
+
+    def test_a_long_document_comes_back_as_an_excerpt_within_the_limit(self):
+        pages = [f"page {i} alpha beta gamma delta" for i in range(1, 61)]
+        out = dd.document_text("pdf", build_pdf(pages), limit=400)
+        assert out.truncated is True
+        assert out.text.startswith("page 1 alpha")
+        assert len(out.text) <= 400
+        assert out.count == 60
+
+    def test_docx_and_text_family(self):
+        assert dd.document_text("docx", build_docx(["One", "Two"]), limit=100).text == "One\nTwo"
+        out = dd.document_text("txt", b"a\n\nb", limit=100)
+        assert (out.text, out.unit, out.truncated) == ("a\nb", "line", False)
+
+    def test_a_page_with_no_text_layer_yields_empty_text(self):
+        assert dd.document_text("pdf", build_pdf([""]), limit=100).text == ""
+
+
 class TestRender:
     def _digest(self, sections=3, abstract="An abstract."):
         return dd.DocumentDigest(
@@ -123,7 +150,17 @@ def _bedrock(monkeypatch, text="A crisp abstract.", stop="end_turn", fail=False)
     boto3 = MagicMock()
     boto3.client.return_value = client
     monkeypatch.setitem(__import__("sys").modules, "boto3", boto3)
+    # The client is cached per process; drop the previous fake so this one is built.
+    aws_clients.reset_cached_clients()
     return client
+
+
+@pytest.fixture(autouse=True)
+def _fresh_bedrock_client():
+    """The Bedrock client is cached per process; each test builds its own."""
+    aws_clients.reset_cached_clients()
+    yield
+    aws_clients.reset_cached_clients()
 
 
 class TestAbstract:
@@ -145,6 +182,25 @@ class TestAbstract:
         _bedrock(monkeypatch, fail=True)
         assert await dd.generate_abstract(dd.DocumentDigest(), "text") is None
         assert await dd.generate_abstract(dd.DocumentDigest(), "   ") is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stop", ["guardrail_intervened", "content_filtered", "something_new", None])
+    async def test_a_refused_generation_is_none(self, monkeypatch, stop):
+        """Only a finished generation is an abstract; a refusal's text is not."""
+        _bedrock(monkeypatch, text="Sorry, the model cannot answer this.", stop=stop)
+        assert await dd.generate_abstract(dd.DocumentDigest(), "text") is None
+
+    @pytest.mark.asyncio
+    async def test_abstracts_reuse_one_bedrock_client(self, monkeypatch):
+        """A client per upload paid botocore's model load and a fresh TLS handshake."""
+        client = _bedrock(monkeypatch)
+        factory = __import__("sys").modules["boto3"].client
+
+        for _ in range(3):
+            assert await dd.generate_abstract(dd.DocumentDigest(), "text") == "A crisp abstract."
+
+        assert factory.call_count == 1
+        assert client.converse.call_count == 3
 
 
 class TestBuild:

@@ -10,8 +10,8 @@ quality difference that looks like the engine swap's fault.
 
 The managed backend itself is task 8.3. These tests use a protocol-conforming
 stand-in, which is sufficient and in fact preferable: what is under test is
-whether the *facade* applies ``top_k``, the status filter, the 2,000-character
-cap and the 500-character citation clip to whatever comes back across the seam.
+whether the *facade* applies ``top_k``, the status filter, the per-engine
+context cap and the 500-character citation clip to whatever comes back across the seam.
 A stand-in proves that without letting Bedrock's wire format into the assertion.
 
 Feature: managed-kb-migration
@@ -29,8 +29,10 @@ from apis.shared.assistants.kb_access import granted
 from apis.shared.assistants.rag_service import (
     MANAGED_MAX_CONTEXT_CHARS,
     MAX_CONTEXT_CHARS,
+    RETRIEVED_EXCERPTS_PREAMBLE,
     augment_prompt_with_context,
     resolve_context_cap,
+    search_assistant_knowledgebase_with_cap,
     search_assistant_knowledgebase_with_formatting,
 )
 from apis.shared.kb_backend.protocol import (
@@ -86,8 +88,10 @@ class FakeManagedBackend:
         self._chunks = chunks
         self.calls: List[Dict[str, Any]] = []
 
-    async def search(self, kb_ref: str, query: str, top_k: int = DEFAULT_TOP_K) -> List[Chunk]:
-        self.calls.append({"kb_ref": kb_ref, "query": query, "top_k": top_k})
+    async def search(
+        self, kb_ref: str, query: str, top_k: int = DEFAULT_TOP_K, *, record=None
+    ) -> List[Chunk]:
+        self.calls.append({"kb_ref": kb_ref, "query": query, "top_k": top_k, "record": record})
         return list(self._chunks)
 
     async def ingest(self, kb_ref: str, source) -> None:  # pragma: no cover - unused
@@ -218,16 +222,17 @@ def test_managed_gets_the_eight_thousand_char_cap():
     assert resolve_context_cap(ASSISTANT_ID, record={"retrievalEngine": ENGINE_MANAGED}) == 8000
 
 
-def test_legacy_keeps_the_two_thousand_char_cap():
-    """An absent/legacy record resolves to the historical 2,000 cap, unchanged."""
-    assert resolve_context_cap(ASSISTANT_ID, record={}) == 2000
+def test_legacy_gets_the_twenty_two_thousand_char_cap():
+    """An absent/legacy record resolves to 22,000: five full-size Docling chunks
+    (1,024 cl100k tokens each, plus headings) fit, where 2,000 fit under half of one."""
+    assert resolve_context_cap(ASSISTANT_ID, record={}) == 22000
 
 
 def test_the_managed_and_legacy_caps_are_distinct():
     """Guard against the two caps collapsing to one value — the mutation that
     reintroduces §5.40 by making managed inherit the 2,000 figure again."""
     assert MANAGED_MAX_CONTEXT_CHARS == 8000
-    assert MAX_CONTEXT_CHARS == 2000
+    assert MAX_CONTEXT_CHARS == 22000
     assert MANAGED_MAX_CONTEXT_CHARS != MAX_CONTEXT_CHARS
 
 
@@ -239,6 +244,64 @@ def test_context_cap_keys_on_the_same_kb_record_read_as_the_backend():
     with patch.dict("os.environ", {"DYNAMODB_ASSISTANTS_TABLE_NAME": TABLE_NAME}), boto_patch:
         assert resolve_context_cap(ASSISTANT_ID) == 8000
     assert DEFAULT_TOP_K == 5, "the parity contract pins top_k at 5"
+
+
+def _kb_record_reads(table: MagicMock) -> int:
+    return sum(
+        1 for call in table.get_item.call_args_list if call.kwargs["Key"]["SK"].startswith("KB#")
+    )
+
+
+def test_a_managed_search_reads_the_kb_record_once(managed_kb):
+    """One KB_Record read answers the engine, the backend's ``awsKbId`` and the cap.
+
+    Each of those used to read the same row again on the turn's critical path
+    (~50ms apiece on dev, 2026-10-02). The record the backend receives is the one
+    the facade read, and the cap returned with the results is the managed one.
+    """
+    backend = managed_kb([_managed_chunk("doc-a", 0)])
+    boto_patch, table = _patch_record_and_statuses({"doc-a": "complete"})
+
+    with patch.dict("os.environ", {"DYNAMODB_ASSISTANTS_TABLE_NAME": TABLE_NAME}), boto_patch:
+        results, cap = asyncio.run(
+            search_assistant_knowledgebase_with_cap(ASSISTANT_ID, "q", access=OWNER_ACCESS)
+        )
+
+    assert len(results) == 1
+    assert cap == 8000
+    assert backend.calls[0]["record"] == {"retrievalEngine": ENGINE_MANAGED}
+    assert _kb_record_reads(table) == 1
+
+
+def test_a_legacy_search_reads_the_kb_record_once_and_returns_the_legacy_cap():
+    boto_patch, table = _patch_legacy_record_and_statuses({"doc-a": "complete"})
+    vectors = {
+        "vectors": [
+            {"key": "doc-a#0", "distance": 0.1, "metadata": {"document_id": "doc-a", "text": "t"}}
+        ]
+    }
+    with patch.dict("os.environ", {"DYNAMODB_ASSISTANTS_TABLE_NAME": TABLE_NAME}), boto_patch, patch(
+        "apis.shared.embeddings.bedrock_embeddings.search_assistant_knowledgebase",
+        return_value=vectors,
+    ):
+        results, cap = asyncio.run(
+            search_assistant_knowledgebase_with_cap(ASSISTANT_ID, "q", access=OWNER_ACCESS)
+        )
+
+    assert len(results) == 1
+    assert cap == MAX_CONTEXT_CHARS
+    assert _kb_record_reads(table) == 1
+
+
+def test_a_refused_search_reads_nothing_and_returns_the_legacy_cap():
+    boto_patch, table = _patch_record_and_statuses({})
+    with patch.dict("os.environ", {"DYNAMODB_ASSISTANTS_TABLE_NAME": TABLE_NAME}), boto_patch:
+        results, cap = asyncio.run(
+            search_assistant_knowledgebase_with_cap(ASSISTANT_ID, "q", access=None)
+        )
+
+    assert (results, cap) == ([], MAX_CONTEXT_CHARS)
+    table.get_item.assert_not_called()
 
 
 def test_managed_path_narrows_results_to_top_k(managed_kb):
@@ -394,42 +457,55 @@ def test_citation_excerpt_clip_holds_on_managed_results(managed_kb):
     assert CITATION_EXCERPT_CHARS == 500, "the parity contract pins the clip at 500"
 
 
-# ---------------------------------------------------------------------------
-# Requirement 3.2 — the 2,000-character context cap
+# Requirement 3.2 — the legacy context cap fits top_k full-size chunks
 # ---------------------------------------------------------------------------
 
 
-def test_context_cap_is_two_thousand_characters():
-    """The cap is a named constant pinned at 2,000, on every backend."""
-    assert MAX_CONTEXT_CHARS == 2000
+def test_context_cap_is_pinned():
+    """The legacy cap is a named constant pinned at 22,000, on every backend."""
+    assert MAX_CONTEXT_CHARS == 22000
+
+
+def _context_body(augmented: str) -> str:
+    return augmented.split("---\nUser Question:")[0][len(RETRIEVED_EXCERPTS_PREAMBLE):]
+
+
+def test_five_full_size_docling_chunks_reach_the_model_whole():
+    """Five chunks at Docling's 1,024-token ceiling (~4,300 chars with headings)
+    all fit, untruncated. At the old 2,000 the first was cut and the rest dropped."""
+    chunks = [
+        {"text": f"{i}" * 4300, "distance": -0.9, "metadata": {"document_id": f"doc-{i}"}, "key": f"doc-{i}#0"}
+        for i in range(5)
+    ]
+
+    augmented = augment_prompt_with_context(
+        user_message="q", context_chunks=chunks, max_context_length=MAX_CONTEXT_CHARS
+    )
+
+    for i in range(5):
+        assert augmented.count(str(i)) >= 4300, f"chunk {i} was cut"
+    assert "..." not in _context_body(augmented)
 
 
 def test_context_cap_bounds_augmented_prompt_from_managed_chunks():
     """Managed chunks are capped by the facade exactly as legacy chunks are.
 
-    Five 1,000-character chunks total 5,000 characters of context. The augmented
-    prompt must carry at most 2,000 of them, so the cap is observable as the
-    difference between the prompt's length and the corpus's.
+    Five 10,000-character chunks total 50,000 characters of context. The
+    augmented prompt must carry at most the cap's worth of them.
     """
     chunks = [
-        {"text": "y" * 1000, "distance": -0.9, "metadata": {"document_id": f"doc-{i}"}, "key": f"doc-{i}#0"}
+        {"text": "y" * 10000, "distance": -0.9, "metadata": {"document_id": f"doc-{i}"}, "key": f"doc-{i}#0"}
         for i in range(5)
     ]
     user_message = "what does the corpus say?"
 
     augmented = augment_prompt_with_context(user_message=user_message, context_chunks=chunks)
 
-    context_only = augmented.split("---\nUser Question:")[0]
-    body_length = len(context_only) - len(
-        "The following context is retrieved from the assistant's knowledge base. "
-        "Use this information to answer the user's question accurately and "
-        "comprehensively.\n\n"
-    )
+    body_length = len(_context_body(augmented))
     assert body_length <= MAX_CONTEXT_CHARS + 64, (
-        f"context body is {body_length} chars; the 2,000-character cap is not "
-        f"being applied to managed chunks"
+        f"context body is {body_length} chars; the context cap is not being applied to managed chunks"
     )
-    assert augmented.count("y") < 5000, "all five chunks were included uncapped"
+    assert augmented.count("y") < 50000, "all five chunks were included uncapped"
     assert user_message in augmented
 
 
@@ -439,13 +515,25 @@ def test_context_cap_default_is_not_overridable_by_callers_accidentally():
     Guards against the cap appearing to hold because the text was short: with the
     cap raised, the same corpus produces a longer prompt.
     """
-    chunks = [{"text": "z" * 1000, "metadata": {"document_id": "d"}, "key": "d#0"} for _ in range(5)]
+    chunks = [{"text": "z" * 10000, "metadata": {"document_id": "d"}, "key": "d#0"} for _ in range(5)]
 
     capped = augment_prompt_with_context("q", chunks)
-    raised = augment_prompt_with_context("q", chunks, max_context_length=10000)
+    raised = augment_prompt_with_context("q", chunks, max_context_length=60000)
 
     assert len(raised) > len(capped)
     assert capped.count("z") <= MAX_CONTEXT_CHARS
+
+
+def test_the_preamble_says_the_excerpts_are_partial_and_to_ask_when_ambiguous():
+    """The model is told these are search hits, not the knowledge base, and to ask
+    a clarifying question when they do not settle an ambiguous question."""
+    augmented = augment_prompt_with_context("Can I use AI on my assignment?", [{"text": "Video Post: AI neutral"}])
+
+    assert augmented.startswith(RETRIEVED_EXCERPTS_PREAMBLE)
+    assert "partial" in RETRIEVED_EXCERPTS_PREAMBLE
+    assert "clarifying question" in RETRIEVED_EXCERPTS_PREAMBLE
+    assert "comprehensively" not in augmented
+    assert augmented.endswith("User Question: Can I use AI on my assignment?")
 
 
 # ---------------------------------------------------------------------------

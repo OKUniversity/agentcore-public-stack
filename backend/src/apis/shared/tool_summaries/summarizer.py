@@ -35,6 +35,8 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from apis.shared.aws_clients import get_client
+
 logger = logging.getLogger(__name__)
 
 # Nova Micro: the cheapest Bedrock model that reliably follows a one-line
@@ -52,6 +54,10 @@ _MAX_INPUT_CHARS = 300
 _MAX_RESULT_CHARS = 700
 _MAX_CALLS = 8
 
+# What a call that left an MCP App's form open for the user shows the model
+# in place of its result (``AgentStatusHook`` records ``awaiting``).
+_AWAITING_LINE = "WAITING FOR USER: a form is open for them to submit; nothing done yet"
+
 _SUMMARY_SYSTEM_PROMPT = """You describe what an AI assistant just did, in one short past-tense line.
 
 You are given the tool calls the assistant made and what they returned. Write a single line a non-technical person would understand, naming the specific things that were found.
@@ -62,20 +68,22 @@ Guidelines:
 - Name the specific result: the course, the file, the assignment, the count. That specificity is the entire point.
 - Never mention tool names, parameters, IDs, JSON, or "the API".
 - Never mention that you are an AI or that tools were used.
-- If a call failed, say so plainly: "Couldn't reach Canvas".
+- A call may name the system it belongs to in [brackets]. Refer to a system only by that name, and only when a call carries it. Never guess which system a call belongs to.
+- If a call failed, say so plainly, naming its system from the brackets.
+- A call marked WAITING FOR USER did nothing yet: a form is open for the user to submit. Never say it created, updated or sent anything.
 
 Examples:
-Calls: list_courses -> 3 courses (BIO 101, HIST 210, CS 121)
+Calls: list_courses [Canvas for Faculty] -> 3 courses (BIO 101, HIST 210, CS 121)
 Output: Found 3 active courses
 
-Calls: list_assignments -> 12 assignments; get_assignment_details -> "Syllabus Acknowledgment", 25 pts, due Aug 29
+Calls: list_assignments [Canvas for Faculty] -> 12 assignments; get_assignment_details [Canvas for Faculty] -> "Syllabus Acknowledgment", 25 pts, due Aug 29
 Output: Found the Syllabus Acknowledgment assignment in BIO 101
 
 Calls: search_knowledge_base -> 4 passages about parking permits
 Output: Searched the knowledge base for parking permit rules
 
-Calls: create_rubric -> error: 422 rubric association required
-Output: Couldn't create the rubric — Canvas rejected it"""
+Calls: list_events [Google Calendar] -> 2 events; create_rubric [Canvas for Faculty] -> FAILED: 422 rubric association required
+Output: Found 2 events, but Canvas for Faculty rejected the rubric"""
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -91,9 +99,17 @@ def _build_prompt(calls: List[Dict[str, Any]]) -> str:
     lines: List[str] = []
     for call in calls[:_MAX_CALLS]:
         name = str(call.get("toolName") or "tool")
+        integration = call.get("integration")
+        if integration:
+            name = f"{name} [{integration}]"
         tool_input = _truncate(str(call.get("input") or ""), _MAX_INPUT_CHARS)
         result = _truncate(str(call.get("result") or ""), _MAX_RESULT_CHARS)
-        if not call.get("ok", True):
+        if call.get("awaiting"):
+            # Never the result text: it is an instruction to the agent
+            # ("STOP — do not call any other tools"), and given it a small
+            # model heads the batch as if the write had happened.
+            lines.append(f"{name}({tool_input}) -> {_AWAITING_LINE}")
+        elif not call.get("ok", True):
             lines.append(f"{name}({tool_input}) -> FAILED: {result}")
         else:
             lines.append(f"{name}({tool_input}) -> {result}")
@@ -101,6 +117,48 @@ def _build_prompt(calls: List[Dict[str, Any]]) -> str:
     if overflow > 0:
         lines.append(f"...and {overflow} more call(s)")
     return "Calls:\n" + "\n".join(lines)
+
+
+def _source_names(calls: List[Dict[str, Any]]) -> List[str]:
+    return list(
+        dict.fromkeys(
+            str(c.get("integration") or c.get("toolName") or "a tool") for c in calls
+        )
+    )
+
+
+def _join_names(names: List[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " or " + names[-1]
+
+
+def _awaiting_heading(calls: List[Dict[str, Any]]) -> str:
+    """The heading for a batch whose every call is an App form left open.
+
+    No model involved, for the same reason as ``_failure_heading``, and
+    because the only honest summary of "a form is open, nothing was written"
+    is fixed. Named by catalog display name only: a raw tool name
+    ("issue_write") reads worse than no name at all.
+    """
+    integrations = list(
+        dict.fromkeys(str(c["integration"]) for c in calls if c.get("integration"))
+    )
+    if not integrations:
+        return "Waiting for you to submit the form"
+    return _truncate(
+        f"Waiting for you to submit the form in {_join_names(integrations)}", 90
+    )
+
+
+def _failure_heading(calls: List[Dict[str, Any]]) -> str:
+    """The heading for a batch in which every call failed. No model involved.
+
+    A wrong system name in an error heading sends people to debug the wrong
+    integration, and a small model given a failed call will name one: prod
+    headed a failed GitHub ``search_issues`` "Couldn't reach Canvas". So each
+    source is named by its catalog display name (``integration``), or by the
+    tool's own name when it has none (built-in, or a tool the model invented).
+    """
+    return _truncate(f"Couldn't use {_join_names(_source_names(calls))}", 90)
 
 
 def _unwrap_quotes(summary: str) -> str:
@@ -140,11 +198,24 @@ def _clean(text: str) -> str:
     return summary.rstrip(".").strip()
 
 
+def _converse(region: str, **kwargs: Any) -> Dict[str, Any]:
+    """Run in a worker thread, so a first-use client build stays off the event loop.
+
+    The client is process-cached: one per batch paid botocore's service-model
+    load (~250ms the first time in a process) and, every time, a fresh
+    connection pool — a new TCP+TLS handshake per summary.
+    """
+    return get_client("bedrock-runtime", region).converse(**kwargs)
+
+
 async def summarize_tool_batch(calls: List[Dict[str, Any]]) -> Optional[str]:
     """Summarize one finished tool batch, or return ``None``.
 
     ``calls`` are the bounded records captured by ``AgentStatusHook`` —
-    ``{toolUseId, toolName, input, result, ok, durationMs}``.
+    ``{toolUseId, toolName, input, result, ok, awaiting, durationMs,
+    integration}``. A batch where every call failed is headed
+    deterministically (``_failure_heading``) without a model call, and so is
+    one where every call left an MCP App form open (``_awaiting_heading``).
 
     Returns ``None`` on an empty batch, a disabled flag, a missing Bedrock
     client, a model error, or an empty generation. Every one of those means
@@ -156,27 +227,27 @@ async def summarize_tool_batch(calls: List[Dict[str, Any]]) -> Optional[str]:
     if not calls or not tool_summaries_enabled():
         return None
 
-    try:
-        import boto3
-    except ImportError:  # pragma: no cover - dev without boto3
-        return None
+    if all(c.get("awaiting") for c in calls):
+        return _awaiting_heading(calls)
+    if not any(c.get("ok", True) for c in calls):
+        return _failure_heading(calls)
 
     try:
-        region = os.environ.get("AWS_REGION", "us-west-2")
-        client = boto3.client("bedrock-runtime", region_name=region)
-
         # boto3's converse() is synchronous — awaited inline it would block
         # the event loop for the whole Nova round trip, stalling the agent
         # stream this task runs concurrently with.
         response = await asyncio.to_thread(
-            client.converse,
+            _converse,
+            os.environ.get("AWS_REGION", "us-west-2"),
             modelId=_MODEL_ID,
             messages=[{"role": "user", "content": [{"text": _build_prompt(calls)}]}],
             system=[{"text": _SUMMARY_SYSTEM_PROMPT}],
+            # Temperature only: Claude 4.5+ rejects `temperature` and `topP`
+            # together, which would silently fail every summary if
+            # `_MODEL_ID` ever moved to one.
             inferenceConfig={
                 "temperature": 0.2,
                 "maxTokens": _MAX_OUTPUT_TOKENS,
-                "topP": 0.9,
             },
         )
         # A generation cut off at the token ceiling is a fragment, not a
@@ -185,8 +256,15 @@ async def summarize_tool_batch(calls: List[Dict[str, Any]]) -> Optional[str]:
         # deterministic formatter speak. (Defensive: the dangling quotes seen
         # on dev turned out to be `_unwrap_quotes`, not truncation, but
         # nothing guarded this boundary and a fragment must never persist.)
-        if response.get("stopReason") == "max_tokens":
+        # Any other non-`end_turn` stop (a guardrail or content-filter
+        # refusal, an unknown reason) is dropped too: its text may be the
+        # refusal itself, which is no summary of the batch.
+        stop_reason = response.get("stopReason")
+        if stop_reason == "max_tokens":
             logger.debug("Tool-batch summary hit the token ceiling; discarding")
+            return None
+        if stop_reason != "end_turn":
+            logger.debug("Tool-batch summary stopped with stopReason=%s; discarding", stop_reason)
             return None
 
         summary = _clean(response["output"]["message"]["content"][0]["text"])

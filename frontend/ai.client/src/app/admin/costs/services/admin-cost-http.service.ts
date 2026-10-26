@@ -7,6 +7,7 @@ import {
   TopUserCost,
   SystemCostSummary,
   ModelUsageSummary,
+  PlatformCostSummary,
   TierUsageSummary,
   CostTrend,
   DashboardRequestOptions,
@@ -131,6 +132,24 @@ export class AdminCostHttpService {
     }
 
     return this.http.get<ModelUsageSummary[]>(`${this.baseUrl()}/by-model`, { params });
+  }
+
+  /**
+   * Get all-in platform cost: our inference ledger plus the AWS
+   * infrastructure bill, with a per-service breakdown.
+   *
+   * Reads pre-synced rows only — the backend never calls Cost Explorer on
+   * this path (CE bills $0.01 per request), so this is as cheap as any other
+   * dashboard call and safe to refetch on every period change.
+   */
+  getPlatformCosts(period?: string): Observable<PlatformCostSummary> {
+    let params = new HttpParams();
+
+    if (period) {
+      params = params.set('period', period);
+    }
+
+    return this.http.get<PlatformCostSummary>(`${this.baseUrl()}/platform`, { params });
   }
 
   /**

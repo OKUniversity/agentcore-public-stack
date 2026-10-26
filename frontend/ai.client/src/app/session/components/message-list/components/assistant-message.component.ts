@@ -3,16 +3,22 @@ import { Message, ContentBlock, ToolUseData } from '../../../services/models/mes
 import { ToolUseComponent } from './tool-use';
 import { ToolRailComponent } from './tool-rail';
 import { ToolCallGroup, ToolCallDisplay, ToolCallBatch } from './tool-rail/tool-rail.model';
+import { SourceProvenanceComponent } from './source-provenance/source-provenance.component';
+import { FEATURES } from '../../../../services/features';
+import type { SourceProvenanceClaim } from '../../../../shared/utils/stream-parser';
 import { ReasoningContentComponent } from './reasoning-content';
 import { StreamingTextComponent } from './streaming-text.component';
 import { InlineVisualComponent } from './inline-visual';
 import { OAuthConsentPromptComponent } from './oauth-consent-prompt/oauth-consent-prompt.component';
 import { McpAppFrameComponent } from './tool-use/renderers/mcp-app-frame.component';
+import { BrowserPageCardComponent } from './browser-card/browser-page-card.component';
+import { BrowserPageSummary, browserPageFromCalls } from './browser-card/browser-page';
 import {
   OAuthConsentRequest,
   OAuthConsentService,
 } from '../../../../services/oauth-consent/oauth-consent.service';
 import { McpAppStateService } from '../../../services/mcp-apps/mcp-app-state.service';
+import { isAwaitingUserSubmission } from '../../../services/mcp-apps/awaiting-submission';
 import { ChatStateService } from '../../../services/chat/chat-state.service';
 import { ToolInsightService } from '../../../services/chat/tool-insight.service';
 import type { ToolResultData } from './tool-use/tool-renderer-registry.service';
@@ -117,8 +123,14 @@ interface DisplayBlock {
     | 'promoted_visual'
     | 'mcp_app_frame'
     | 'reasoningContent'
-    | 'oauth_required';
+    | 'oauth_required'
+    | 'browser_page'
+    | 'source_provenance';
   data?: ContentBlock;
+  // For browser page cards: where a rail's browse_web calls left the browser.
+  browserPage?: BrowserPageSummary;
+  // For source-provenance panels: one `verify_sources` call's verdicts.
+  provenance?: readonly SourceProvenanceClaim[];
   // For tool groups (inline rail)
   group?: ToolCallGroup;
   // For promoted visuals
@@ -155,6 +167,8 @@ interface DisplayBlock {
     InlineVisualComponent,
     OAuthConsentPromptComponent,
     McpAppFrameComponent,
+    BrowserPageCardComponent,
+    SourceProvenanceComponent,
   ],
   template: `
     <div class="block-container">
@@ -233,6 +247,25 @@ interface DisplayBlock {
                 [toolInput]="block.toolInput ?? {}"
                 [toolName]="block.toolName ?? ''"
               />
+            </div>
+          }
+          @case ('source_provenance') {
+            <div
+              class="message-block"
+              [style.animation-delay]="$index * 0.1 + 's'"
+            >
+              <app-source-provenance
+                class="flex w-full justify-start"
+                [claims]="block.provenance!"
+              />
+            </div>
+          }
+          @case ('browser_page') {
+            <div
+              class="message-block visual-block"
+              [style.animation-delay]="$index * 0.1 + 's'"
+            >
+              <app-browser-page-card [page]="block.browserPage!" />
             </div>
           }
           @case ('oauth_required') {
@@ -326,10 +359,18 @@ export class AssistantMessageComponent {
    */
   streamingMessageId = input<string | null>(null);
 
+  /**
+   * The key tool insights are looked up under, when it isn't the viewed
+   * session: a shared snapshot seeds its frozen summaries under its own key
+   * (`share:<shareId>`), since nothing there is the viewer's session.
+   */
+  insightSessionId = input<string | null>(null);
+
   private consentService = inject(OAuthConsentService);
   private mcpAppState = inject(McpAppStateService);
   private chatState = inject(ChatStateService);
   private toolInsight = inject(ToolInsightService);
+  private readonly features = inject(FEATURES);
 
   /**
    * Transforms content blocks into display blocks.
@@ -351,7 +392,7 @@ export class AssistantMessageComponent {
     // No viewed session (a preview pane, a fresh tab) means no recorded
     // insights; '' can never match a real session key, so lookups miss
     // cleanly instead of needing a null branch at every call site.
-    const sessionId = this.chatState.viewedSessionId() ?? '';
+    const sessionId = this.insightSessionId() ?? this.chatState.viewedSessionId() ?? '';
     const streamingId = this.streamingMessageId();
     const messageIds = new Set(messages.map((m) => m.id));
 
@@ -364,10 +405,13 @@ export class AssistantMessageComponent {
     const hasPendingInterruptHere = pendingInterruptsHere.length > 0;
     const result: DisplayBlock[] = [];
     let pendingToolCalls: ToolCallDisplay[] = [];
+    let lastBrowserPage: BrowserPageSummary | null = null;
 
     // Read once per recomputation, not per call: these are signal reads, and
     // the computed must re-run when a late-arriving summary lands.
     const insights = this.toolInsight;
+    // Compile-time switch: while off, no panel is built and nothing is read.
+    const provenanceEnabled = this.features.sourceProvenance;
 
     /**
      * Segment a rail's calls by the backend batch that produced them.
@@ -415,6 +459,29 @@ export class AssistantMessageComponent {
           batches: segmentIntoBatches(calls),
         },
       });
+      // The page a rail's browse_web calls reached gets its own card under
+      // the rail, so the user can see where the agent went without opening
+      // the rail. Derived from the results, so it costs nothing on the turn
+      // path and survives a reload. The page carries across rails: narration
+      // between a navigate and a screenshot splits them into two rails.
+      const browserPage = browserPageFromCalls(calls, lastBrowserPage);
+      if (browserPage) {
+        lastBrowserPage = browserPage;
+        result.push({ type: 'browser_page', browserPage });
+      }
+      // Provenance verdicts go UNDER the rail, not inside it: the rail is
+      // collapsed by default and says what the agent did, while these say
+      // whether the answer's values are in the source. A `quote_unsupported`
+      // folded into a collapsed rail is a warning nobody sees.
+      // One panel per verifying call, so two documents never merge.
+      if (provenanceEnabled) {
+        for (const call of calls) {
+          const verdicts = insights.provenanceFor(sessionId, call.id);
+          if (verdicts?.length) {
+            result.push({ type: 'source_provenance', provenance: verdicts });
+          }
+        }
+      }
     };
 
     // Flatten the run. A tool group deliberately spans message boundaries:
@@ -523,7 +590,9 @@ export class AssistantMessageComponent {
           const status: ToolCallDisplay['status'] =
             hasPendingInterruptHere && hasNoResult && baseStatus === 'pending'
               ? 'awaiting_auth'
-              : baseStatus;
+              : isAwaitingUserSubmission(toolUse.result)
+                ? 'awaiting_user'
+                : baseStatus;
           // Duration comes from the runtime's `tool_end` status (measured by
           // the event loop, not inferred from stream arrival times), so it is
           // absent on a reload — deliberately, see ToolInsightService.

@@ -12,6 +12,10 @@ from typing import Any, Dict, Optional, List
 
 from apis.shared.sessions.models import FEEDBACK_REASONS
 from apis.shared.storage.dynamodb_storage import DynamoDBStorage
+from apis.shared.observability.prefix_tokens import (
+    prefix_split_is_plausible,
+    prompt_tokens_from_usage,
+)
 from .diagnoses import (
     CHARS_PER_TOKEN,
     Diagnosis,
@@ -42,6 +46,8 @@ from .models import (
     TopSessionsResponse,
     SystemCostSummary,
     ModelUsageSummary,
+    PlatformCostSummary,
+    PlatformServiceCost,
     TierUsageSummary,
     CostTrend,
     AdminCostDashboard,
@@ -329,11 +335,22 @@ def _call_ledger(record: Dict[str, Any], previous_removed: Optional[int]) -> _Ca
     raw_prefix = record.get("prefixTokens")
     if isinstance(raw_prefix, dict):
         try:
-            ledger.prefix_tokens = PrefixTokens(
-                system=int(raw_prefix.get("system") or 0),
-                tools=int(raw_prefix.get("tools") or 0),
-            )
+            system_tokens = int(raw_prefix.get("system") or 0)
+            tool_tokens = int(raw_prefix.get("tools") or 0)
         except (TypeError, ValueError):
+            system_tokens = tool_tokens = -1
+        # `tools` is a residual between two estimators, so a disagreement
+        # between them lands wholly in it. Rows written before the write-side
+        # guard shipped can claim a static prefix larger than the whole prompt
+        # the provider billed — prod session 7f5f207f reported tools=223,782
+        # against a 55,783-token prompt. Those are dropped here so the page
+        # reads "not tracked" (which it already renders) instead of a number a
+        # reader would size a tool budget from. Nothing is backfilled.
+        if prefix_split_is_plausible(
+            system_tokens, tool_tokens, prompt_tokens_from_usage(record.get("tokenUsage"))
+        ):
+            ledger.prefix_tokens = PrefixTokens(system=system_tokens, tools=tool_tokens)
+        else:
             ledger.prefix_tokens = None
     removed = _as_int(record.get("windowRemovedMessages"))
     if removed is not None:
@@ -613,6 +630,119 @@ class AdminCostService:
             logger.error(f"Error getting system summary: {e}")
             raise
 
+    async def get_platform_cost_summary(
+        self,
+        period: Optional[str] = None
+    ) -> PlatformCostSummary:
+        """
+        Get all-in platform cost for a period, and the per-user economics.
+
+        Combines two sources on purpose, and never adds them twice:
+
+        - INFERENCE from our own ledger (ROLLUP#MONTHLY). It is per-user and
+          per-session where Cost Explorer is per-account only, and on prod's
+          September bill it agreed with CE to within 0.50%.
+        - PLATFORM from Cost Explorer (PLATFORM#MONTHLY, written daily by the
+          sync Lambda). Nothing else can see ECS, AgentCore session hours, NAT
+          egress or CloudWatch ingestion — which on prod was 38.8% of the bill.
+
+        CE's own inference figure is carried as `ce_inference_cost` purely to
+        reconcile the two. It is deliberately NOT part of `total_cost`;
+        including it would double-count every token twice over.
+
+        Returns a summary with `available=False` when the sync has not run,
+        so the UI can say why rather than render a zero that reads as "free".
+        """
+        period = period or self._get_current_period()
+
+        summary = await self.storage.get_platform_cost_summary(period)
+
+        # Our ledger's inference cost + the active-user count come from the
+        # same monthly rollup the rest of the dashboard reads, so every tab
+        # quotes the same inference number.
+        ledger = await self.storage.get_system_summary(
+            period=period, period_type="monthly"
+        ) or {}
+        ledger_inference = float(ledger.get("totalCost") or 0.0)
+        active_users = int(ledger.get("activeUsers") or 0)
+
+        if not summary:
+            logger.info("No platform cost sync found for period; returning unavailable")
+            return PlatformCostSummary(
+                period=period,
+                available=False,
+                inference_cost=ledger_inference,
+                total_cost=ledger_inference,
+                active_users=active_users,
+                cost_per_user=(
+                    ledger_inference / active_users if active_users else 0.0
+                ),
+                inference_cost_per_user=(
+                    ledger_inference / active_users if active_users else 0.0
+                ),
+            )
+
+        platform_cost = float(summary.get("platformCost") or 0.0)
+        ce_inference = float(summary.get("inferenceCost") or 0.0)
+        excluded = float(summary.get("excludedCost") or 0.0)
+
+        total = ledger_inference + platform_cost
+
+        service_rows = await self.storage.get_platform_service_costs(period)
+        services = [
+            PlatformServiceCost(
+                service_name=row.get("serviceName", ""),
+                cost=float(row.get("cost") or 0.0),
+                category=row.get("category", "platform"),
+                # Share of the PLATFORM subtotal, not of the grand total: the
+                # point of this list is which infrastructure line dominates,
+                # and against an inference-heavy total every one of them would
+                # round to a couple of percent.
+                percentage_of_platform=(
+                    round(float(row.get("cost") or 0.0) / platform_cost * 100, 1)
+                    if platform_cost > 0 and row.get("category") == "platform"
+                    else 0.0
+                ),
+            )
+            for row in service_rows
+        ]
+
+        delta = ce_inference - ledger_inference
+
+        return PlatformCostSummary(
+            period=period,
+            available=True,
+            inference_cost=round(ledger_inference, 2),
+            platform_cost=round(platform_cost, 2),
+            total_cost=round(total, 2),
+            excluded_cost=round(excluded, 2),
+            platform_share_percent=(
+                round(platform_cost / total * 100, 1) if total > 0 else 0.0
+            ),
+            active_users=active_users,
+            cost_per_user=round(total / active_users, 4) if active_users else 0.0,
+            inference_cost_per_user=(
+                round(ledger_inference / active_users, 4) if active_users else 0.0
+            ),
+            platform_cost_per_user=(
+                round(platform_cost / active_users, 4) if active_users else 0.0
+            ),
+            ce_inference_cost=round(ce_inference, 2),
+            reconciliation_delta=round(delta, 2),
+            reconciliation_delta_percent=(
+                round(delta / ce_inference * 100, 2) if ce_inference > 0 else 0.0
+            ),
+            services=services,
+            scope=summary.get("scope", "account"),
+            project_tag=summary.get("projectTag") or None,
+            partial_month=bool(summary.get("partialMonth", False)),
+            coverage_start=summary.get("coverageStart"),
+            coverage_end=summary.get("coverageEnd"),
+            account_id=summary.get("accountId"),
+            currency=summary.get("currency", "USD"),
+            synced_at=summary.get("syncedAt"),
+        )
+
     async def get_usage_by_model(
         self,
         period: Optional[str] = None
@@ -881,6 +1011,8 @@ class AdminCostService:
         wasted_usd = 0.0
         agent_switch_misses = 0
         agent_switch_usd = 0.0
+        model_switch_misses = 0
+        model_switch_usd = 0.0
         previous_removed: Optional[int] = None
 
         for record in records:
@@ -905,9 +1037,13 @@ class AdminCostService:
             cache_write = int(token_usage.get("cacheWriteInputTokens") or 0)
             cache_status = record.get("cacheStatus")
             row_wasted = float(record.get("wastedUsd") or 0.0)
+            # An interrupted turn's cut generation: the tokens and cost on this
+            # row are the best estimate of what was billed, not a report.
+            usage_estimated_raw = record.get("usageEstimated")
             # #756 — derived at write time, where the predecessor row was already
             # in hand; read here as a plain projection.
             agent_switched = bool(record.get("agentSwitched"))
+            model_switched = bool(record.get("modelSwitched"))
 
             total_cost += cost
             total_cache_read += cache_read
@@ -918,6 +1054,9 @@ class AdminCostService:
                 if agent_switched:
                     agent_switch_misses += 1
                     agent_switch_usd += row_wasted
+                elif model_switched:
+                    model_switch_misses += 1
+                    model_switch_usd += row_wasted
             elif cache_status == "partial_miss":
                 partial_misses += 1
                 partial_miss_usd += row_wasted
@@ -940,8 +1079,14 @@ class AdminCostService:
                     int(prefix_gap_raw) if prefix_gap_raw is not None else None
                 ),
                 wasted_usd=row_wasted,
+                usage_estimated=(
+                    {str(key): str(value) for key, value in usage_estimated_raw.items()}
+                    if isinstance(usage_estimated_raw, dict) and usage_estimated_raw
+                    else None
+                ),
                 turn_agent_id=record.get("turnAgentId"),
                 agent_switched=agent_switched,
+                model_switched=model_switched,
                 prefix_fingerprints=(
                     PrefixFingerprints(**fingerprints_raw)
                     if isinstance(fingerprints_raw, dict) else None
@@ -976,6 +1121,8 @@ class AdminCostService:
             wasted_usd=round(wasted_usd, 6),
             agent_switch_miss_count=agent_switch_misses,
             agent_switch_usd=round(agent_switch_usd, 6),
+            model_switch_miss_count=model_switch_misses,
+            model_switch_usd=round(model_switch_usd, 6),
             cache_efficiency=cache_efficiency,
         )
 

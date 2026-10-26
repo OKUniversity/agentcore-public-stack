@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { TestBed } from '@angular/core/testing';
 import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
 import { provideHttpClient } from '@angular/common/http';
-import { ModelService } from './model.service';
+import { ModelService, isTextOnlyModel } from './model.service';
 import { ConfigService } from '../../../services/config.service';
 import { UserSettingsService } from '../../../services/user-settings.service';
 import { ManagedModel } from '../../../admin/manage-models/models/managed-model.model';
@@ -14,15 +14,19 @@ describe('ModelService', () => {
   let mockUserSettings: { getSettings: ReturnType<typeof vi.fn> };
 
   const mockModels: ManagedModel[] = [
-    { id: 'm1', modelId: 'claude-haiku', modelName: 'Claude Haiku', provider: 'bedrock', providerName: 'Anthropic', inputModalities: ['TEXT'], outputModalities: ['TEXT'], maxInputTokens: 200000, maxOutputTokens: 4096, allowedAppRoles: [], availableToRoles: [], enabled: true, inputPricePerMillionTokens: 0.25, outputPricePerMillionTokens: 1.25, knowledgeCutoffDate: null, supportsCaching: true, isDefault: false },
-    { id: 'm2', modelId: 'claude-sonnet', modelName: 'Claude Sonnet', provider: 'bedrock', providerName: 'Anthropic', inputModalities: ['TEXT'], outputModalities: ['TEXT'], maxInputTokens: 200000, maxOutputTokens: 4096, allowedAppRoles: [], availableToRoles: [], enabled: true, inputPricePerMillionTokens: 3, outputPricePerMillionTokens: 15, knowledgeCutoffDate: null, supportsCaching: true, isDefault: true },
+    { id: 'm1', modelId: 'claude-haiku', modelName: 'Claude Haiku', provider: 'bedrock', providerName: 'Anthropic', inputModalities: ['TEXT', 'IMAGE'], outputModalities: ['TEXT'], maxInputTokens: 200000, maxOutputTokens: 4096, allowedAppRoles: [], availableToRoles: [], enabled: true, inputPricePerMillionTokens: 0.25, outputPricePerMillionTokens: 1.25, knowledgeCutoffDate: null, supportsCaching: true, isDefault: false },
+    { id: 'm2', modelId: 'claude-sonnet', modelName: 'Claude Sonnet', provider: 'bedrock', providerName: 'Anthropic', inputModalities: ['TEXT', 'IMAGE'], outputModalities: ['TEXT'], maxInputTokens: 200000, maxOutputTokens: 4096, allowedAppRoles: [], availableToRoles: [], enabled: true, inputPricePerMillionTokens: 3, outputPricePerMillionTokens: 15, knowledgeCutoffDate: null, supportsCaching: true, isDefault: true },
   ];
 
   const mockResponse = { models: mockModels, totalCount: 2 };
 
   let sessionStore: Record<string, string> = {};
 
-  async function setup() {
+  // `beforeEach(setup)` hands setup the test context, so the response is a
+  // separate entry point rather than an optional parameter.
+  const setup = () => setupWith(mockResponse);
+
+  async function setupWith(response: { models: ManagedModel[]; totalCount: number }) {
     sessionStore = {};
     vi.stubGlobal('sessionStorage', {
       getItem: vi.fn((k: string) => sessionStore[k] ?? null),
@@ -48,7 +52,7 @@ describe('ModelService', () => {
     httpMock = TestBed.inject(HttpTestingController);
 
     await vi.waitFor(() => {
-      httpMock.expectOne('http://localhost:8000/models').flush(mockResponse);
+      httpMock.expectOne('http://localhost:8000/models').flush(response);
     });
   }
 
@@ -59,6 +63,24 @@ describe('ModelService', () => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     TestBed.resetTestingModule();
+  });
+
+  describe('speech-to-speech rows', () => {
+    it('never reach the picker, even when enabled', async () => {
+      const sonic: ManagedModel = {
+        ...mockModels[0],
+        id: 'm-sonic',
+        modelId: 'amazon.nova-2-sonic-v1:0',
+        modelName: 'Nova 2 Sonic',
+        inputModalities: ['SPEECH', 'TEXT'],
+        outputModalities: ['SPEECH', 'TEXT'],
+        enabled: true,
+      };
+      await setupWith({ models: [...mockModels, sonic], totalCount: 3 });
+      await vi.waitFor(() => {
+        expect(service.availableModels().map((m) => m.modelId)).toEqual(['claude-haiku', 'claude-sonnet']);
+      });
+    });
   });
 
   describe('retired inference-param overrides', () => {
@@ -331,6 +353,31 @@ describe('ModelService', () => {
     });
   });
 
+  describe('effortFor', () => {
+    const withEffort = (modelId: string): ManagedModel => ({
+      ...mockModels[0],
+      modelId,
+      supportedParams: { params: { effort: { supported: true, allowed: ['low', 'high'], default: 'low' } } as never },
+    });
+
+    it("gives each model its own level, not the selected model's", async () => {
+      const opus = withEffort('opus');
+      const sonnet = withEffort('sonnet');
+      await setupWith({ models: [opus, sonnet], totalCount: 2 });
+      service.setSelectedModel(opus);
+      service.setEffort('high');
+
+      expect(service.selectedEffort()).toBe('high');
+      expect(service.effortFor(opus)).toBe('high');
+      expect(service.effortFor(sonnet)).toBe('low');
+    });
+
+    it('is null for a model without an effort control', async () => {
+      await setup();
+      expect(service.effortFor(mockModels[0])).toBeNull();
+    });
+  });
+
   describe('setSelectedModel', () => {
     beforeEach(setup);
 
@@ -374,5 +421,38 @@ describe('ModelService', () => {
     it('should return system default', () => {
       expect(service.getDefaultModel().id).toBe('system-default');
     });
+
+    it('is not text-only — the Haiku fallback reads images', () => {
+      expect(isTextOnlyModel(service.getDefaultModel())).toBe(false);
+    });
+  });
+
+  // #1585 — a newly saved default must replace the tab's existing pick.
+  it('applyUserDefault replaces an existing in-tab pick', async () => {
+    await setup();
+    await vi.waitFor(() => expect(service.availableModels().length).toBe(2));
+    service.setSelectedModelById('claude-sonnet');
+
+    service.applyUserDefault('claude-haiku');
+
+    expect(service.selectedModel().modelId).toBe('claude-haiku');
+    expect(sessionStore['selectedModelId']).toBe('claude-haiku');
+  });
+});
+
+describe('isTextOnlyModel', () => {
+  it('is true for a row declaring TEXT and nothing else', () => {
+    expect(isTextOnlyModel({ inputModalities: ['TEXT'] })).toBe(true);
+    expect(isTextOnlyModel({ inputModalities: [' text ', 'TEXT'] })).toBe(true);
+  });
+
+  it('is false for a Claude row, which declares IMAGE but no DOCUMENT', () => {
+    expect(isTextOnlyModel({ inputModalities: ['TEXT', 'IMAGE'] })).toBe(false);
+  });
+
+  it('is false for an empty or absent list, or no model', () => {
+    expect(isTextOnlyModel({ inputModalities: [] })).toBe(false);
+    expect(isTextOnlyModel({})).toBe(false);
+    expect(isTextOnlyModel(null)).toBe(false);
   });
 });

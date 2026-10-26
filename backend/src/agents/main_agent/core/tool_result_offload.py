@@ -57,12 +57,25 @@ logger = logging.getLogger(__name__)
 # half the gate leaves that margin twice over.
 PREFILTER_RATIO = 0.5
 
-# Tools whose results are never offloaded. ``document_read`` returns the page
-# slice the model just asked for as a native document block; offloading it
-# to S3 and handing back a text preview would undo the read and cost a second
-# round trip (docs/specs/document-context-offload.md §4B). Its own
-# ``max_pages`` cap is the bound.
-OFFLOAD_EXEMPT_TOOLS = frozenset({"document_read"})
+# Tools whose results are never offloaded. Each one's bound is something other
+# than an external payload, and a preview in place of the result would defeat
+# the call.
+#
+# - ``document_read`` returns the page slice the model just asked for as a
+#   native document block; offloading it to S3 and handing back a text preview
+#   would undo the read and cost a second round trip
+#   (docs/specs/document-context-offload.md §4B). Its own ``max_pages`` cap is
+#   the bound.
+# - ``skills`` is the vended Strands ``AgentSkills`` activation tool: its result
+#   is the skill's SKILL.md body, instructions the model must follow verbatim.
+#   A preview plus a retrieval handle quietly degrades skill-following: nothing
+#   makes the model pull the rest before it acts on the head.
+#   The skill author bounds its size; no external payload does.
+#
+# ``read_skill_file`` is deliberately NOT here: reference files run up to
+# 1 MiB of arbitrary text (schemas, data, inert scripts), which is exactly
+# the payload a preview plus pattern/line-range retrieval exists for.
+OFFLOAD_EXEMPT_TOOLS = frozenset({"document_read", "skills"})
 
 
 def tool_result_offload_enabled() -> bool:
@@ -155,6 +168,29 @@ def _offloader_class():
 
     class BoundedToolResultOffloader(_OffloaderMixin, ContextOffloader):  # type: ignore[misc, valid-type]
         pass
+
+    # Carry the base's ``@hook`` registration onto our override.
+    #
+    # ``strands.plugins._discovery`` walks the MRO and, for every name in each
+    # class's ``__dict__``, tests ``getattr(instance, name)`` for the
+    # ``_hook_event_types`` attribute the ``@hook`` decorator writes. The name
+    # resolves through the MRO, so ``_OffloaderMixin``'s undecorated override
+    # answers for ``ContextOffloader``'s decorated method: it fails the
+    # predicate, the name is marked seen, and the callback is never registered.
+    # The plugin still loads and still publishes ``retrieve_offloaded_content``
+    # — it just silently offloads nothing, which is how a 107k-token tool result
+    # reached the prompt in prod with the offloader enabled.
+    #
+    # Copying rather than re-decorating: ``@hook`` infers the event type from
+    # the annotation via ``get_type_hints``, which resolves against the
+    # function's module globals. ``AfterToolCallEvent`` cannot be imported at
+    # this module's scope without pulling in boto3 and the plugin, which is
+    # exactly what the lazy build exists to avoid. Taking the base's value also
+    # tracks upstream if it ever binds the callback to a different event.
+    # ``TestHookRegistration`` guards all of this.
+    _OffloaderMixin._handle_tool_result._hook_event_types = (  # type: ignore[attr-defined]
+        ContextOffloader._handle_tool_result._hook_event_types
+    )
 
     BoundedToolResultOffloader.__name__ = "BoundedToolResultOffloader"
     return BoundedToolResultOffloader

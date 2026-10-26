@@ -12,6 +12,7 @@ import { OAuthConsentPromptComponent } from './components/oauth-consent-prompt/o
 import { ToolApprovalPromptComponent } from './components/tool-approval-prompt/tool-approval-prompt.component';
 import { UserQuestionPromptComponent } from './components/user-question-prompt/user-question-prompt.component';
 import { BrowserLoginPromptComponent } from './components/browser-login-prompt/browser-login-prompt.component';
+import { BrowserPanelComponent } from './components/browser-panel/browser-panel.component';
 import { CompactionSummaryComponent } from './components/compaction-summary/compaction-summary.component';
 import { ArtifactCardComponent } from './components/artifact/artifact-card.component';
 import { ArtifactPanelComponent } from './components/artifact/artifact-panel.component';
@@ -129,6 +130,7 @@ function segmentTurn(messages: readonly Message[]): TurnSegment[] {
     ToolApprovalPromptComponent,
     UserQuestionPromptComponent,
     BrowserLoginPromptComponent,
+    BrowserPanelComponent,
     CompactionSummaryComponent,
     ArtifactCardComponent,
     ArtifactPanelComponent,
@@ -211,6 +213,9 @@ export class MessageListComponent {
   sharedArtifacts = input<SharedConversationArtifact[] | null>(null);
   sharedArtifactShareId = input<string | null>(null);
 
+  /** Passed to each assistant message; see `AssistantMessageComponent.insightSessionId`. */
+  insightSessionId = input<string | null>(null);
+
   /**
    * The published marketplace agent behind this conversation, when there is one — the
    * foot-of-conversation feedback link, and nothing else. Null for plain chat, a legacy
@@ -220,7 +225,9 @@ export class MessageListComponent {
 
   /** The conversation itself, offered to attach to that feedback. */
   sessionId = input<string | null>(null);
-
+  /** #111: whether the active agent permits source-document download from citations.
+   *  Passed straight to the citation card to hide its download button. Default true. */
+  allowDownload = input<boolean>(true);
   /** Bubbled up when the user clicks "Continue" on a max_tokens-truncated
    *  assistant message. The page reuses the normal submit path with a
    *  canned prompt. */
@@ -867,6 +874,18 @@ export class MessageListComponent {
     return groups;
   });
 
+  /** The newest response's segment key: the one Cmd/Ctrl+Shift+C copies. */
+  protected readonly latestResponseKey = computed<string | null>(() => {
+    const turns = this.turns();
+    for (let t = turns.length - 1; t >= 0; t--) {
+      const segments = turns[t].segments;
+      for (let i = segments.length - 1; i >= 0; i--) {
+        if (segments[i].kind === 'assistant') return segments[i].key;
+      }
+    }
+    return null;
+  });
+
   /**
    * Min-height for the LAST turn group, replacing the old fixed
    * viewport-sized bottom spacer. Reserving the space around the turn
@@ -914,14 +933,16 @@ export class MessageListComponent {
    * @param behavior 'smooth' for user-visible animation (submit affordance),
    *   'auto' for instant positioning (navigation restore — animating a jump
    *   across a whole conversation would be noise).
+   * @returns whether the message was rendered and scrolled to.
    */
-  scrollToMessage(messageId: string, behavior: ScrollBehavior = 'smooth'): void {
-    if (!this.isBrowser) return;
+  scrollToMessage(messageId: string, behavior: ScrollBehavior = 'smooth'): boolean {
+    if (!this.isBrowser) return false;
 
     const element = document.getElementById(`message-${messageId}`);
-    if (!element) return;
+    if (!element) return false;
 
     element.scrollIntoView({ behavior, block: 'start' });
+    return true;
   }
 
   /**

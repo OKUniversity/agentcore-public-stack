@@ -34,6 +34,9 @@ import type {
   ToolResultEventData,
   AgentStatusEvent,
   ToolGroupSummaryEvent,
+  SourceProvenanceEvent,
+  SourceProvenanceClaim,
+  SourceLocator,
   QuotaWarningEvent,
   QuotaSessionNoticeEvent,
   QuotaExceededEvent,
@@ -52,6 +55,7 @@ import type {
   SessionTitleEvent,
   SteeringAppliedEvent,
   ModelRetryEvent,
+  AgentNoticeEvent,
 } from './stream-parser-types';
 import type { MetadataEvent } from '../../../session/services/models/content-types';
 
@@ -111,6 +115,7 @@ export interface StreamParserCallbacks {
   // mid-turn, out of band with the content stream, and replaces the
   // deterministic formatter line the rail has been showing.
   onToolGroupSummary?: (data: ToolGroupSummaryEvent) => void;
+  onSourceProvenance?: (data: SourceProvenanceEvent) => void;
 
   // Compaction (backend rolled older turns into a summary on this turn)
   onCompaction?: (data: CompactionEvent) => void;
@@ -143,6 +148,11 @@ export interface StreamParserCallbacks {
   // Advisory only — the turn continues; this exists so the resulting silence
   // reads as "working" instead of "hung".
   onModelRetry?: (data: ModelRetryEvent) => void;
+
+  // A project's agent is running this turn without some of its tools, skills,
+  // model or memory (the member can't use them). Informational: the turn
+  // continues. Arrives before message_start.
+  onAgentNotice?: (data: AgentNoticeEvent) => void;
 
   // Error handling
   onError?: (data: StreamErrorEvent | ConversationalStreamErrorEvent | string) => void;
@@ -780,6 +790,110 @@ export function validateToolGroupSummaryEvent(
   );
 }
 
+const PROVENANCE_STATES = new Set([
+  'supported',
+  'quote_unsupported',
+  'unassessed',
+  'unverified',
+]);
+const LOCATOR_KINDS = new Set(['page', 'paragraph', 'line']);
+const LOCATOR_PRECISIONS = new Set(['measured', 'estimated']);
+
+/**
+ * Validate one claim of a `source_provenance` event.
+ *
+ * An unknown `state` is rejected rather than passed through: every renderer
+ * branches on it, and a state nothing recognises would fall through to
+ * whatever the default arm happens to be — which for a citation badge means
+ * showing something reassuring about a value we know nothing about.
+ *
+ * A locator is accepted only whole. A partial one (a page with no `precision`)
+ * is exactly the shape that renders invented precision, so it is dropped to
+ * `null` — losing the page reference, never faking one.
+ */
+function normalizeProvenanceClaim(raw: unknown): SourceProvenanceClaim | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const claim = raw as Partial<SourceProvenanceClaim>;
+  if (typeof claim.state !== 'string' || !PROVENANCE_STATES.has(claim.state)) {
+    return null;
+  }
+  const loc = claim.locator as Partial<SourceLocator> | null | undefined;
+  const locator: SourceLocator | null =
+    loc &&
+    typeof loc === 'object' &&
+    typeof loc.kind === 'string' &&
+    LOCATOR_KINDS.has(loc.kind) &&
+    typeof loc.value === 'number' &&
+    Number.isFinite(loc.value) &&
+    typeof loc.precision === 'string' &&
+    LOCATOR_PRECISIONS.has(loc.precision)
+      ? { kind: loc.kind as SourceLocator['kind'], value: loc.value, precision: loc.precision as SourceLocator['precision'] }
+      : null;
+  return {
+    id: typeof claim.id === 'string' ? claim.id : '',
+    state: claim.state as SourceProvenanceClaim['state'],
+    method: typeof claim.method === 'string' ? claim.method : '',
+    value: typeof claim.value === 'string' ? claim.value : undefined,
+    quote: typeof claim.quote === 'string' ? claim.quote : '',
+    locator,
+    uploadId: typeof claim.uploadId === 'string' ? claim.uploadId : '',
+    filename: typeof claim.filename === 'string' ? claim.filename : '',
+  };
+}
+
+/**
+ * Validate a `source_provenance` event.
+ *
+ * Claims that do not validate are dropped individually rather than failing the
+ * whole event: losing one verdict degrades to "no provenance shown for that
+ * value", while rejecting the batch would also discard a `quote_unsupported`
+ * sitting beside it — the one verdict that must never go missing quietly.
+ */
+export function validateSourceProvenanceEvent(
+  data: unknown,
+): data is SourceProvenanceEvent {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+  const event = data as Partial<SourceProvenanceEvent>;
+  if (event.type !== 'source_provenance' || !Array.isArray(event.claims)) {
+    return false;
+  }
+  const claims = event.claims
+    .map(normalizeProvenanceClaim)
+    .filter((c): c is SourceProvenanceClaim => c !== null);
+  if (claims.length === 0) {
+    return false;
+  }
+  event.claims = claims;
+  return typeof event.toolUseId === 'string' && event.toolUseId.length > 0;
+}
+
+/**
+ * Validate an `agent_notice` event. `message` is what the user reads, so an
+ * empty one is rejected rather than rendered as a blank notice.
+ */
+export function validateAgentNoticeEvent(data: unknown): data is AgentNoticeEvent {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+
+  const event = data as Partial<AgentNoticeEvent>;
+
+  return (
+    event.type === 'agent_notice' &&
+    typeof event.sessionId === 'string' &&
+    event.sessionId.length > 0 &&
+    typeof event.agentId === 'string' &&
+    typeof event.message === 'string' &&
+    event.message.trim().length > 0 &&
+    Array.isArray(event.unavailableTools) &&
+    Array.isArray(event.unavailableSkills)
+  );
+}
+
 export function validateModelRetryEvent(data: unknown): data is ModelRetryEvent {
   if (!data || typeof data !== 'object') {
     return false;
@@ -1039,11 +1153,27 @@ export function processStreamEvent(
         }
         break;
 
+      case 'agent_notice':
+        if (validateAgentNoticeEvent(data)) {
+          callbacks.onAgentNotice?.(data);
+        } else {
+          callbacks.onParseError?.('agent_notice: invalid data structure');
+        }
+        break;
+
       case 'agent_status':
         if (validateAgentStatusEvent(data)) {
           callbacks.onAgentStatus?.(data);
         } else {
           callbacks.onParseError?.('agent_status: invalid data structure');
+        }
+        break;
+
+      case 'source_provenance':
+        if (validateSourceProvenanceEvent(data)) {
+          callbacks.onSourceProvenance?.(data);
+        } else {
+          callbacks.onParseError?.('source_provenance: invalid data structure');
         }
         break;
 

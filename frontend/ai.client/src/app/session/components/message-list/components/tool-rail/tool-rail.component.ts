@@ -8,7 +8,12 @@ import {
 import { KeyValuePipe } from '@angular/common';
 import { JsonSyntaxHighlightPipe } from '../tool-use/json-syntax-highlight.pipe';
 import { ToolCallGroup, ToolCallDisplay, ToolCallBatch } from './tool-rail.model';
-import { describeToolCall, describeToolGroup } from './tool-summary';
+import {
+  describeToolCall,
+  describeToolGroup,
+  isAwaitingUserCall,
+  isFailedCall,
+} from './tool-summary';
 import { PinScrollToBottomDirective } from './pin-scroll-to-bottom.directive';
 import { ToolResultContent } from '../../../../services/models/message.model';
 
@@ -37,9 +42,6 @@ export class ToolRailComponent {
    * for.
    */
   expandedCallIds = signal<Set<string>>(new Set());
-
-  /** Track which individual tool results are fully expanded (for long results in fallback mode) */
-  expandedResultIds = signal<Set<string>>(new Set());
 
   /**
    * The group's calls segmented by backend batch.
@@ -105,11 +107,20 @@ export class ToolRailComponent {
 
   /** How many calls in the group failed, or null when none did. */
   failureCount = computed(() => {
-    const failures = this.group().calls.filter(
-      c => c.status === 'error' || c.result?.status === 'error',
-    ).length;
+    const failures = this.group().calls.filter(isFailedCall).length;
     return failures > 0 ? failures : null;
   });
+
+  /** Whether a call failed (an App form waiting for the user has not). */
+  callFailed(call: ToolCallDisplay): boolean {
+    return isFailedCall(call);
+  }
+
+  /** The label over a call's raw result. */
+  resultLabel(call: ToolCallDisplay): string {
+    if (isAwaitingUserCall(call)) return 'Waiting for you';
+    return isFailedCall(call) ? 'Error' : 'Result';
+  }
 
   /** The human line for one call inside the expanded rail. */
   describe(call: ToolCallDisplay): string {
@@ -146,31 +157,14 @@ export class ToolRailComponent {
     return this.isGenerating(call) || this.expandedCallIds().has(call.id);
   }
 
-  /** Toggle full result display for a specific tool call */
-  toggleFullResult(callId: string): void {
-    this.expandedResultIds.update(ids => {
-      const next = new Set(ids);
-      if (next.has(callId)) {
-        next.delete(callId);
-      } else {
-        next.add(callId);
-      }
-      return next;
-    });
-  }
-
-  /** Check if a tool call's result is fully expanded */
-  isResultExpanded(callId: string): boolean {
-    return this.expandedResultIds().has(callId);
-  }
-
   /** CSS class for status dot */
   statusDotClass(call: ToolCallDisplay): string {
     switch (call.status) {
       case 'complete':       return 'status-dot bg-state-success-500';
       case 'pending':        return 'status-dot bg-state-warning-400 shimmer';
       case 'error':          return 'status-dot bg-state-danger-500';
-      case 'awaiting_auth':  return 'status-dot bg-primary-500 ring-2 ring-primary-300/40 dark:ring-primary-400/30';
+      case 'awaiting_auth':
+      case 'awaiting_user':  return 'status-dot bg-primary-500 ring-2 ring-primary-300/40 dark:ring-primary-400/30';
       default:               return 'status-dot bg-gray-400';
     }
   }
@@ -188,31 +182,16 @@ export class ToolRailComponent {
     return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
   }
 
-  /** Compact one-line display of tool input params */
+  /** Tool input params, one `key: value` per line */
   formatInput(inputObj: Record<string, unknown>): string {
     return Object.entries(inputObj)
       .map(([k, v]) => `${k}: ${JSON.stringify(v)}`)
-      .join(', ');
-  }
-
-  /** Get combined text from result content array, for truncation */
-  getResultText(call: ToolCallDisplay): string {
-    if (!call.result?.content) return '';
-    return call.result.content
-      .map(item => {
-        if (item.text) return item.text;
-        if (item.json) return JSON.stringify(item.json, null, 2);
-        if (item.image) return '[image]';
-        return '';
-      })
-      .filter(Boolean)
       .join('\n');
   }
 
-  /** Truncate result text for collapsed display */
-  truncateResult(text: string, maxLen = 200): string {
-    if (text.length <= maxLen) return text;
-    return text.substring(0, maxLen) + '...';
+  /** Whether the result carries any text or JSON to show (images render separately). */
+  hasResultBody(call: ToolCallDisplay): boolean {
+    return !!call.result?.content?.some(item => item.text || item.json);
   }
 
   /** Get image items from result content */

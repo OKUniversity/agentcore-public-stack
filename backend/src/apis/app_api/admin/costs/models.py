@@ -55,6 +55,81 @@ class SystemCostSummary(BaseModel):
     last_updated: str = Field(..., alias="lastUpdated")
 
 
+class PlatformServiceCost(BaseModel):
+    """One AWS service's cost for a period, as Cost Explorer reported it."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    service_name: str = Field(..., alias="serviceName")
+    cost: float
+    # "platform" | "inference" | "excluded" — see the sync Lambda's docstring.
+    # `excluded` rows are returned rather than filtered out: an operator can
+    # only trust the platform total if they can see what was held out of it.
+    category: str
+    percentage_of_platform: float = Field(0.0, alias="percentageOfPlatform")
+
+
+class PlatformCostSummary(BaseModel):
+    """All-in platform cost for a period, and the per-user economics it implies.
+
+    Two sources, deliberately not interchangeable:
+
+    - `inference_cost` comes from OUR ledger (the same ROLLUP#MONTHLY row the
+      rest of the dashboard reads), because it is per-user and per-session
+      where Cost Explorer is only per-account.
+    - `platform_cost` comes from Cost Explorer, because nothing else can see
+      ECS, AgentCore session hours, NAT egress or CloudWatch ingestion.
+
+    `ce_inference_cost` is Cost Explorer's own figure for the model SKUs and
+    exists ONLY to reconcile against `inference_cost`. It is never added to a
+    total — doing so would double-count inference. A widening
+    `reconciliation_delta_percent` means our pricing tables have drifted from
+    what AWS actually charged, which CLAUDE.md names as a live risk.
+    """
+    model_config = ConfigDict(populate_by_name=True)
+
+    period: str
+    available: bool
+    """False when the sync has never run (feature off, or `ce:GetCostAndUsage`
+    denied). The UI shows an explanatory empty state rather than a zero, which
+    would read as 'the platform is free'."""
+
+    inference_cost: float = Field(0.0, alias="inferenceCost")
+    platform_cost: float = Field(0.0, alias="platformCost")
+    total_cost: float = Field(0.0, alias="totalCost")
+    excluded_cost: float = Field(0.0, alias="excludedCost")
+
+    platform_share_percent: float = Field(0.0, alias="platformSharePercent")
+
+    active_users: int = Field(0, alias="activeUsers")
+    cost_per_user: float = Field(0.0, alias="costPerUser")
+    inference_cost_per_user: float = Field(0.0, alias="inferenceCostPerUser")
+    platform_cost_per_user: float = Field(0.0, alias="platformCostPerUser")
+
+    ce_inference_cost: float = Field(0.0, alias="ceInferenceCost")
+    reconciliation_delta: float = Field(0.0, alias="reconciliationDelta")
+    reconciliation_delta_percent: float = Field(
+        0.0, alias="reconciliationDeltaPercent"
+    )
+
+    services: List[PlatformServiceCost] = Field(default_factory=list)
+
+    scope: str = "account"
+    """"deployment" when the figures are filtered to this stack's own
+    resources by its `Project` tag; "account" when that tag is not activated
+    in the payer account, so they cover everything in the account. The second
+    is a ceiling, not an attribution, and the UI must say so — an account is
+    not an application, and this stack is open source, so a deployer may well
+    share one with other workloads."""
+    project_tag: Optional[str] = Field(None, alias="projectTag")
+
+    partial_month: bool = Field(False, alias="partialMonth")
+    coverage_start: Optional[str] = Field(None, alias="coverageStart")
+    coverage_end: Optional[str] = Field(None, alias="coverageEnd")
+    account_id: Optional[str] = Field(None, alias="accountId")
+    currency: str = "USD"
+    synced_at: Optional[str] = Field(None, alias="syncedAt")
+
+
 class ModelUsageSummary(BaseModel):
     """Per-model usage summary for analytics."""
     model_config = ConfigDict(populate_by_name=True)
@@ -180,6 +255,13 @@ class SessionCallRow(BaseModel):
         None, alias="cachePrefixGapSeconds"
     )
     wasted_usd: float = Field(0.0, alias="wastedUsd")
+    # Set when this call's usage was estimated rather than reported by the
+    # provider — today only an interrupted turn's cut generation, whose
+    # terminal usage event never arrived. A field -> method map (which figure
+    # came from a native count, from the projection, from the streamed text),
+    # so a reader never mistakes these tokens or this cost for a measurement.
+    # Such a row's `cacheStatus` is `estimated` and its `wastedUsd` is zero.
+    usage_estimated: Optional[Dict[str, str]] = Field(None, alias="usageEstimated")
     # #756 — which Agent ran this call, and whether that changed from the call
     # before it. An `@`-mention (Marketplace D11) hands one turn to a different
     # Agent, which genuinely re-writes the prefix; without this a deliberate swap
@@ -190,6 +272,13 @@ class SessionCallRow(BaseModel):
         False,
         alias="agentSwitched",
         description="This call ran on a different Agent than the previous one — an explained prefix re-write",
+    )
+    # The same for the model: a mid-conversation switch continues the
+    # conversation in place, and each model has its own cache.
+    model_switched: bool = Field(
+        False,
+        alias="modelSwitched",
+        description="This call ran on a different model than the previous one — an explained prefix re-write",
     )
     prefix_fingerprints: Optional[PrefixFingerprints] = Field(
         None, alias="prefixFingerprints"
@@ -246,6 +335,12 @@ class SessionCostAnatomy(BaseModel):
     # which is the number a prefix-stability regression moves.
     agent_switch_miss_count: int = Field(0, alias="agentSwitchMissCount")
     agent_switch_usd: float = Field(0.0, alias="agentSwitchUsd")
+    # The subset a model switch explains, excluding calls already counted as an
+    # Agent switch (an `@`-mention to an Agent that pins its own model sets both
+    # flags). Disjoint from the agent-switch pair, so unexplained waste is
+    # `wastedUsd - agentSwitchUsd - modelSwitchUsd` with nothing subtracted twice.
+    model_switch_miss_count: int = Field(0, alias="modelSwitchMissCount")
+    model_switch_usd: float = Field(0.0, alias="modelSwitchUsd")
     # cacheRead / (cacheRead + cacheWrite) over the session; None until
     # there has been any cache activity.
     cache_efficiency: Optional[float] = Field(None, alias="cacheEfficiency")

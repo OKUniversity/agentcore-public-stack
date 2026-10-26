@@ -7,8 +7,11 @@ import {
   linkedSignal,
 } from '@angular/core';
 import { ConfigService } from '../../services/config.service';
-import { ManagedModel } from '../../admin/manage-models/models/managed-model.model';
-import { builtinIconPath, resolveModelIcon } from '../../admin/manage-models/models/model-icons';
+import {
+  builtinIconPath,
+  ModelIconInput,
+  resolveModelIcon,
+} from '../../admin/manage-models/models/model-icons';
 
 /** The sizes a model avatar renders at: menu row, form row, catalog card. */
 export type ModelIconSize = 20 | 24 | 28 | 40;
@@ -108,9 +111,7 @@ export class ModelIconComponent {
    * model (the admin form's live preview, a curated template) can render one
    * without inventing the rest of a `ManagedModel`.
    */
-  readonly model = input.required<
-    Pick<ManagedModel, 'iconUrl' | 'iconSlug' | 'providerName'> & { modelName?: string }
-  >();
+  readonly model = input.required<ModelIconInput & { modelName?: string }>();
   readonly size = input<ModelIconSize>(24);
   /** Empty (the default) marks the tile decorative, for rows that already name the model. */
   readonly alt = input<string>('');

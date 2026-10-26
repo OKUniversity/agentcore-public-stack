@@ -187,6 +187,7 @@ async def admin_create_tool(
             token_exchange_audience=request.token_exchange_audience,
             is_public=request.is_public,
             enabled_by_default=request.enabled_by_default,
+            always_on=request.always_on,
             mcp_config=mcp_config,
             a2a_config=a2a_config,
             mcp_gateway_config=mcp_gateway_config,

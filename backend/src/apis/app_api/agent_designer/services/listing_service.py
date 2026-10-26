@@ -10,9 +10,7 @@ Three rules are enforced here and nowhere else:
 * **Submission is the disclosure point (D7).** Publishing an Agent effectively publishes
   the contents of every skill its author wrote and bound, because Skills v2 resolves a
   ``skill`` binding on ``skill.owner_id == agent.owner_id``. The author is shown that list
-  before a reviewer's time is spent, and a ``memory_space`` binding blocks submission
-  outright — a memory space is personal data that re-resolution will deny to every other
-  viewer, so a published agent bound to one is a guaranteed failure for everyone.
+  before a reviewer's time is spent.
 * **Approval is the only door into the store (D2).** ``in_review → published`` is the sole
   edge that writes a directory key, and only ``require_admin`` routes reach it.
 * **Admins own presentation, authors own behavior (D13).** The patch path can reach
@@ -47,6 +45,8 @@ from apis.shared.assistants.version_diff import (
     behavior_changed,
     changed_fields,
     instructions_diff,
+    wire_field_name,
+    wire_value,
 )
 from apis.shared.assistants.version_repository import (
     create_version,
@@ -78,11 +78,11 @@ from apis.shared.assistants.publishers import (
 )
 from apis.shared.assistants.service import (
     _get_assistant_cloud_without_ownership_check,
+    is_project_harness,
     resolve_assistant_permission,
 )
 from apis.shared.auth.models import User
 from apis.shared.feature_flags import skills_enabled
-from apis.shared.memory.service import MemorySpaceService
 from apis.shared.security.log_sanitize import scrub_log
 from apis.shared.skills.repository import get_skill_catalog_repository
 from apis.shared.timestamps import utc_now_iso
@@ -184,43 +184,10 @@ async def _load_any(agent_id: str) -> Assistant:
 
 
 # ── D7 disclosure ────────────────────────────────────────────────────────────────────
-async def _memory_space_block_reason(assistant: Assistant, user: User) -> Optional[str]:
-    """The D7.2 blocking message for a ``memory_space`` binding, or ``None`` if clear.
-
-    Split from the raising path so ``preflight_listing`` can *show* the block without
-    attempting the transition. One function decides, two callers present it — a second
-    copy of this rule in the SPA would be the thing that eventually disagrees.
-    """
-    bound = [b for b in effective_bindings(assistant) if b.kind == "memory_space"]
-    if not bound:
-        return None
-
-    # Resolve a human name for the message. The id alone tells the author nothing.
-    label = bound[0].ref
-    try:
-        spaces = MemorySpaceService().list_spaces_for_user(user.user_id, user.email)
-        by_id = {space.space_id: space.name for space, _role in spaces}
-        label = by_id.get(bound[0].ref, bound[0].ref)
-    except Exception:
-        logger.warning("Could not resolve memory space name for submission block", exc_info=True)
-
-    return (
-        f"This agent can't be published while it's bound to the memory space “{label}”. "
-        "A memory space is personal data — it won't resolve for anyone else, so the agent "
-        "would fail for every person who ran it. Remove the binding and submit again."
-    )
-
-
-async def _memory_space_block(assistant: Assistant, user: User) -> None:
-    """Block submission on any ``memory_space`` binding, naming the space (D7.2).
-
-    Not a warning. A memory space is personal data; Designer D5's run-time re-resolve
-    already denies it to anyone who lacks access, so publishing an agent bound to one
-    ships a listing that cannot work for a single other person.
-    """
-    reason = await _memory_space_block_reason(assistant, user)
-    if reason:
-        raise ListingError(reason, status_code=400)
+PROJECT_HARNESS_LISTING_MESSAGE = (
+    "This agent belongs to a project and can't be published. "
+    "To share it beyond the project, create a separate agent."
+)
 
 
 def _visibility_block_reason(assistant: Assistant) -> Optional[str]:
@@ -232,8 +199,7 @@ def _visibility_block_reason(assistant: Assistant) -> Optional[str]:
     published SHARED or PRIVATE Agent is not a "team listing"; it is a tile shown to
     everyone that nobody but the author can open, and every pin against it 404s.
 
-    Split from the raising path for the same reason as ``_memory_space_block_reason``:
-    ``preflight_listing`` shows it, ``submit_listing`` enforces it, and one function
+    Split from the raising path so that ``preflight_listing`` shows it, ``submit_listing`` enforces it, and one function
     decides so the dialog and the transition cannot drift apart.
     """
     if assistant.visibility == "PUBLIC":
@@ -272,13 +238,17 @@ def _visibility_block(assistant: Assistant, *, consented: bool) -> None:
         raise ListingError(reason, status_code=400)
 
 
-async def _exposed_skills(assistant: Assistant) -> List[SkillExposure]:
-    """Skills the author wrote that publication makes readable (D7.1).
+async def exposed_skills(assistant: Assistant) -> List[SkillExposure]:
+    """Skills the author wrote that reaching this Agent makes readable (D7.1).
 
     Matches the invoke-through rule exactly: a ``skill`` binding resolves when
     ``skill.owner_id == agent.owner_id``, so those — and only those — are the skills whose
-    contents publication exposes. Skills the author merely has access to belong to someone
-    else and are not the author's to disclose.
+    contents anyone who can run the Agent can read. Skills the author merely has access to
+    belong to someone else and are not the author's to disclose.
+
+    Two disclosures read this, and both must: the marketplace submit dialog (publication)
+    and the share dialog (``share_disclosure``). They are one rule asked at two widths, so a
+    second copy would be a second answer to "what does widening this Agent give away?".
     """
     refs = [b.ref for b in effective_bindings(assistant) if b.kind == "skill"]
     if not refs or not skills_enabled():
@@ -359,12 +329,14 @@ async def preflight_listing(
     assistant = await _load_for_author(agent_id, user)
     reachability = _reachability(assistant)
     requires_public = _visibility_block_reason(assistant) is not None
-    block_reason = await _memory_space_block_reason(assistant, user)
+    # A project's harness is never publishable (shared-projects §3.2): its access is the
+    # project's membership, and a listing would hand it to everyone.
+    block_reason = PROJECT_HARNESS_LISTING_MESSAGE if is_project_harness(assistant) else None
     # An agent that cannot be published at all is not first walked through a
     # skill-exposure confirmation.
     if block_reason:
         return [], block_reason, reachability, requires_public
-    return await _exposed_skills(assistant), None, reachability, requires_public
+    return await exposed_skills(assistant), None, reachability, requires_public
 
 
 async def submit_listing(
@@ -382,6 +354,8 @@ async def submit_listing(
     for the whole review; only approval swaps it.
     """
     assistant = await _load_for_author(agent_id, user)
+    if is_project_harness(assistant):
+        raise ListingError(PROJECT_HARNESS_LISTING_MESSAGE, status_code=400)
     await _validate_category(request.category)
 
     try:
@@ -391,9 +365,8 @@ async def submit_listing(
 
     # Order matters: block before disclosing. An author whose agent cannot be published
     # at all should not first be walked through a skill-exposure confirmation.
-    await _memory_space_block(assistant, user)
     _visibility_block(assistant, consented=request.make_public)
-    exposed = await _exposed_skills(assistant)
+    exposed = await exposed_skills(assistant)
     publisher_id = await _resolve_proposed_publisher(
         user,
         request.publisher_id,
@@ -1101,21 +1074,6 @@ async def patch_listing_presentation(
 # ── admin reads ──────────────────────────────────────────────────────────────────────
 # camelCase for the wire, so the SPA reads the same field names it already knows from
 # ``AgentResponse``. Snake_case would leak the storage attribute names into the UI.
-_DIFF_FIELD_ALIASES = {
-    "model_settings": "modelConfig",
-    "icon_key": "iconKey",
-    "publisher_id": "publisherId",
-}
-
-
-def _wire_value(value):
-    """Serialize a snapshot value for the diff payload, keeping ``None`` distinct from ``[]``."""
-    if isinstance(value, list):
-        return [_wire_value(item) for item in value]
-    dump = getattr(value, "model_dump", None)
-    return dump(by_alias=True) if dump else value
-
-
 async def diff_pending_version(agent_id: str) -> AgentVersionDiffResponse:
     """What the pending submission changes against what is published (§6.1).
 
@@ -1168,9 +1126,9 @@ async def diff_pending_version(agent_id: str) -> AgentVersionDiffResponse:
 
     changes = [
         VersionFieldChange(
-            field=_DIFF_FIELD_ALIASES.get(field, field),
-            before=_wire_value(before),
-            after=_wire_value(after),
+            field=wire_field_name(field),
+            before=wire_value(before),
+            after=wire_value(after),
             behavior=field in ("instructions", "bindings", "model_settings"),
         )
         for field, before, after in changed_fields(published, pending)
@@ -1208,8 +1166,7 @@ async def read_submission_for_review(agent_id: str, admin: User) -> AdminSubmiss
     ``AdminSubmissionReview.snapshot_unavailable`` for why that is reported rather than
     refused.
 
-    ``admin`` is threaded through only to resolve **memory-space labels**, which have no
-    unfiltered name lookup (see ``agent_detail._memory_labels``). It is not an access
+    ``admin`` is threaded through to resolve capability labels. It is not an access
     decision — the route's ``admin.marketplace`` scope already made that one — and nothing
     here filters by what this particular admin can reach.
     """

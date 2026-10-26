@@ -80,23 +80,23 @@
   max-width: 720px;
   margin-left: auto;
   margin-right: auto;
-  padding-left: 1rem;
-  padding-right: 1rem;
+  /* No side padding on phones: the app shell's content box already insets
+     by 1rem there, so adding another 1rem here (plus the assistant card's
+     own padding) left messages ~3rem from the screen edge while the fixed
+     composer sat at 1rem. From sm up the shell's inset grows and this
+     restores the original gutter. */
+  padding-left: 0;
+  padding-right: 0;
   padding-top: 3rem; /* Clear the fixed header (4rem) + small gap */
   padding-bottom: 7.5rem; /* Space for fixed input */
   min-width: 0;
 }
 
-/* Assistant indicator wrapper - positioned above chat input */
-.assistant-indicator-input-wrapper {
-  display: flex;
-  justify-content: center;
-  padding-bottom: 0.75rem;
-}
-
-/* Embedded mode indicator - same styling */
-.assistant-indicator-input-wrapper.embedded {
-  padding-bottom: 0.5rem;
+@media (min-width: 640px) {
+  .chat-messages-container.full-page {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
 }
 
 /* Sidenav-aware positioning for lg screens */
@@ -203,6 +203,14 @@
   height: 2rem;
   pointer-events: none;
   background: linear-gradient(to top, var(--color-gray-50), transparent);
+}
+
+/* A compact composer ends in its cost/model meta line, whose 32px row already
+   leaves slack beneath the text; the full 1rem on top of that reads as a gap
+   twice the one between the shell and the line. */
+.chat-input-footer.full-page.compact,
+.chat-input-footer.embedded.compact {
+  padding-bottom: 0.5rem;
 }
 
 /* Keep the composer on the same 720px measure as the messages above it. */

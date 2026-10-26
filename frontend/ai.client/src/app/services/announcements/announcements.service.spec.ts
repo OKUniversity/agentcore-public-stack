@@ -6,9 +6,11 @@ import {
 } from '@angular/common/http/testing';
 import { provideHttpClient } from '@angular/common/http';
 import { signal } from '@angular/core';
-import { AnnouncementsService } from './announcements.service';
+import { ACK_RETRY_DELAY_MS, AnnouncementsService } from './announcements.service';
+import { SUPPRESS_ERROR_TOAST } from '../../auth/error.interceptor';
 import { Announcement, AnnouncementFeed } from './announcement.model';
 import { ConfigService } from '../config.service';
+import { SessionService } from '../../auth/session.service';
 
 const API = 'http://localhost:8000';
 const FEED_URL = `${API}/announcements/`;
@@ -46,8 +48,10 @@ function makeFeed(overrides: Partial<AnnouncementFeed> = {}): AnnouncementFeed {
 describe('AnnouncementsService', () => {
   let service: AnnouncementsService;
   let httpMock: HttpTestingController;
+  let isAuthenticated: ReturnType<typeof signal<boolean>>;
 
   beforeEach(() => {
+    isAuthenticated = signal(true);
     TestBed.resetTestingModule();
     TestBed.configureTestingModule({
       providers: [
@@ -57,6 +61,7 @@ describe('AnnouncementsService', () => {
         // DI-token override rather than vi.mock, per house convention —
         // vi.mock pollutes across spec files.
         { provide: ConfigService, useValue: { appApiUrl: signal(API) } },
+        { provide: SessionService, useValue: { isAuthenticated } },
       ],
     });
     service = TestBed.inject(AnnouncementsService);
@@ -86,6 +91,29 @@ describe('AnnouncementsService', () => {
       expect(service.feedResource.isLoading()).toBe(false);
     });
   }
+
+  describe('session gate', () => {
+    it('requests nothing while there is no session', async () => {
+      isAuthenticated.set(false);
+      TestBed.tick();
+      await Promise.resolve();
+
+      httpMock.expectNone(FEED_URL);
+      expect(service.feedResource.status()).toBe('idle');
+      expect(service.panelItems()).toEqual([]);
+    });
+
+    it('fetches once the session bootstrap has a user', async () => {
+      isAuthenticated.set(false);
+      TestBed.tick();
+      httpMock.expectNone(FEED_URL);
+
+      isAuthenticated.set(true);
+      TestBed.tick();
+      await vi.waitFor(() => httpMock.expectOne(FEED_URL).flush(makeFeed()));
+      await vi.waitFor(() => expect(service.panelItems().length).toBe(1));
+    });
+  });
 
   describe('feed', () => {
     it('exposes what the server sent', async () => {
@@ -123,6 +151,16 @@ describe('AnnouncementsService', () => {
       expect(service.panelItems()).toEqual([]);
       expect(service.unreadCount()).toBe(0);
       expect(service.hasUnread()).toBe(false);
+    });
+
+    it('opts out of the global error toast', async () => {
+      service.feedResource.reload();
+      service.panelItems();
+      await vi.waitFor(() => {
+        const req = httpMock.expectOne(FEED_URL);
+        expect(req.request.context.get(SUPPRESS_ERROR_TOAST)).toBe(true);
+        req.flush(makeFeed());
+      });
     });
   });
 
@@ -227,6 +265,87 @@ describe('AnnouncementsService', () => {
 
       // No caller should have to remember to catch this.
       await expect(done).resolves.toBe(false);
+    });
+
+    it('opts out of the global error toast', async () => {
+      // A status-0 network drop on mobile surfaced as "An error occurred"
+      // even though the failure is swallowed here by design (§D7).
+      await loadFeed();
+
+      const done = service.ack('a1', 'acknowledged', 'modal');
+      await vi.waitFor(() => {
+        const req = httpMock.expectOne(`${API}/announcements/a1/ack`);
+        expect(req.request.context.get(SUPPRESS_ERROR_TOAST)).toBe(true);
+        req.flush('nope', { status: 500, statusText: 'Server Error' });
+      });
+
+      expect(await done).toBe(false);
+    });
+
+    describe('retry', () => {
+      const ACK_URL = `${API}/announcements/a1/ack`;
+      const networkDrop = (req: ReturnType<HttpTestingController['expectOne']>) =>
+        req.error(new ProgressEvent('error'), { status: 0, statusText: 'Unknown Error' });
+
+      afterEach(() => vi.useRealTimers());
+
+      it('retries once after a network drop and reports success', async () => {
+        await loadFeed();
+        vi.useFakeTimers();
+
+        const done = service.ack('a1', 'acknowledged', 'modal');
+        networkDrop(httpMock.expectOne(ACK_URL));
+
+        // Nothing is resent until the delay has elapsed.
+        httpMock.expectNone(ACK_URL);
+        await vi.advanceTimersByTimeAsync(ACK_RETRY_DELAY_MS);
+
+        const retried = httpMock.expectOne(ACK_URL);
+        expect(retried.request.body).toEqual({ action: 'acknowledged', surface: 'modal' });
+        retried.flush(null);
+
+        expect(await done).toBe(true);
+      });
+
+      it('retries a gateway 503', async () => {
+        await loadFeed();
+        vi.useFakeTimers();
+
+        const done = service.ack('a1', 'acknowledged', 'modal');
+        httpMock
+          .expectOne(ACK_URL)
+          .flush('nope', { status: 503, statusText: 'Service Unavailable' });
+        await vi.advanceTimersByTimeAsync(ACK_RETRY_DELAY_MS);
+        httpMock.expectOne(ACK_URL).flush(null);
+
+        expect(await done).toBe(true);
+      });
+
+      it('gives up after the one retry', async () => {
+        await loadFeed();
+        vi.useFakeTimers();
+
+        const done = service.ack('a1', 'acknowledged', 'modal');
+        networkDrop(httpMock.expectOne(ACK_URL));
+        await vi.advanceTimersByTimeAsync(ACK_RETRY_DELAY_MS);
+        networkDrop(httpMock.expectOne(ACK_URL));
+        await vi.advanceTimersByTimeAsync(ACK_RETRY_DELAY_MS * 5);
+
+        httpMock.expectNone(ACK_URL);
+        expect(await done).toBe(false);
+      });
+
+      it('does not retry a 4xx', async () => {
+        await loadFeed();
+        vi.useFakeTimers();
+
+        const done = service.ack('a1', 'acknowledged', 'modal');
+        httpMock.expectOne(ACK_URL).flush('nope', { status: 404, statusText: 'Not Found' });
+        await vi.advanceTimersByTimeAsync(ACK_RETRY_DELAY_MS * 5);
+
+        httpMock.expectNone(ACK_URL);
+        expect(await done).toBe(false);
+      });
     });
 
     it('a local dismissal hides the modal too', async () => {

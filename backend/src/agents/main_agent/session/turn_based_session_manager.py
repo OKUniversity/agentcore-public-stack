@@ -28,14 +28,18 @@ tokens truncation saves.
 Based on: https://github.com/aws-samples/sample-strands-agent-with-agentcore
 """
 
+import asyncio
 import copy
 import json
 import logging
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
 
 from agents.main_agent.config.constants import Defaults, EnvVars
+from apis.shared.observability.build_stages import mark_stage
 
 from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
 from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig
@@ -45,6 +49,8 @@ from .compaction_policy import CompactionPolicy, choose_checkpoint
 from .compaction_summary import bound_summary
 
 if TYPE_CHECKING:
+    from concurrent.futures import ThreadPoolExecutor
+
     from strands.agent.agent import Agent
 
 logger = logging.getLogger(__name__)
@@ -56,6 +62,33 @@ MEMORY_RETRIEVAL_TIMEOUT_DEFAULT = 2.0
 # Attempts per retrieval, including the first. 1 = never retry a throttle.
 MEMORY_RETRIEVAL_MAX_ATTEMPTS_ENV = "MEMORY_RETRIEVAL_MAX_ATTEMPTS"
 MEMORY_RETRIEVAL_MAX_ATTEMPTS_DEFAULT = 1
+# RetrieveMemoryRecords rejects a searchQuery longer than this
+# (ValidationException), which dropped retrieval for long pasted messages.
+MEMORY_RETRIEVAL_QUERY_MAX_CHARS = 10_000
+_MEMORY_RETRIEVAL_THROTTLE_CODES = ("ThrottlingException", "TooManyRequestsException", "ServiceQuotaExceededException")
+# Serializes replacing the retrieval client: boto3 client creation on the
+# default session is not thread-safe, and the namespaces retrieve in parallel.
+_RETRIEVAL_CLIENT_LOCK = threading.Lock()
+
+
+_LTM_PREFETCH_POOL: Optional["ThreadPoolExecutor"] = None
+_LTM_PREFETCH_POOL_LOCK = threading.Lock()
+
+
+def _ltm_prefetch_pool() -> "ThreadPoolExecutor":
+    """The process-wide pool the long-term-memory prefetch runs on.
+
+    Small on purpose: one lookup per user message, and every conversation runs
+    in its own Runtime process. Created on first use, never per turn.
+    """
+    global _LTM_PREFETCH_POOL
+    if _LTM_PREFETCH_POOL is None:
+        with _LTM_PREFETCH_POOL_LOCK:
+            if _LTM_PREFETCH_POOL is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                _LTM_PREFETCH_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ltm-prefetch")
+    return _LTM_PREFETCH_POOL
 
 
 def memory_retrieval_timeout_seconds() -> float:
@@ -76,6 +109,19 @@ def memory_retrieval_max_attempts() -> int:
     except ValueError:
         value = MEMORY_RETRIEVAL_MAX_ATTEMPTS_DEFAULT
     return value if value >= 1 else MEMORY_RETRIEVAL_MAX_ATTEMPTS_DEFAULT
+
+
+def memory_retrieval_query(text: str) -> str:
+    """The user's text, cut to what ``RetrieveMemoryRecords`` accepts.
+
+    Counts UTF-16 code units, not code points: that is never more than the
+    service's own count, so an emoji-heavy message cannot slip past the cap.
+    """
+    encoded = text.encode("utf-16-le")
+    limit = MEMORY_RETRIEVAL_QUERY_MAX_CHARS * 2
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-16-le", errors="ignore")
 
 #: Compaction decisions the per-call ledger will record. Reserved kinds exist
 #: so a scheduling policy can report them without a schema change.
@@ -108,6 +154,45 @@ def _approx_tokens(text: Any) -> int:
         return 0
 
 
+class _SkipExtractionClient:
+    """This manager's view of the data-plane client: every event skips extraction.
+
+    Every write the SDK makes (conversational events through
+    ``MemoryClient.create_event``, blob and agent-state events directly) ends
+    in ``memory_client.gmdp_client.create_event``. With shared clients on, that
+    client is the PROCESS-WIDE one (``ClientReusingSession`` hands every
+    manager the same instance), so patching it, as the share fork does on its
+    private client, would switch extraction off for every user's chats in the
+    container. A per-manager proxy around it scopes the change to this manager.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def create_event(self, **kwargs: Any) -> Any:
+        kwargs.setdefault("extractionMode", "SKIP")
+        return self._client.create_event(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+def _is_bidi_agent(agent: Any) -> bool:
+    """True for the voice path's ``BidiAgent``.
+
+    Since strands-agents 1.56 a ``BidiAgent`` drives the *ordinary* session
+    hooks (``AgentInitializedEvent`` -> ``initialize``, ``MessageAddedEvent``
+    -> ``append_message`` / ``retrieve_customer_context``) instead of the
+    dedicated Bidi callbacks it used before, so every override here now sees
+    voice agents too. The text-only work in them must not run for voice.
+    """
+    try:
+        from strands.bidi import BidiAgent
+    except ImportError:
+        return False
+    return isinstance(agent, BidiAgent)
+
+
 class TurnBasedSessionManager(AgentCoreMemorySessionManager):
     """
     Session manager with token-based context compaction.
@@ -135,6 +220,8 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         compaction_config: Optional[CompactionConfig] = None,
         user_id: Optional[str] = None,
         summarization_strategy_id: Optional[str] = None,
+        memory_retrieval: bool = True,
+        memory_extraction: bool = True,
         **kwargs: Any,
     ):
         """
@@ -146,12 +233,24 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             compaction_config: Compaction configuration (None = disabled)
             user_id: User ID for DynamoDB session lookup
             summarization_strategy_id: Strategy ID for LTM summary retrieval
+            memory_retrieval: False means nothing is retrieved into messages
+                (Agent conversations and the "off" memory mode).
+            memory_extraction: False means every event written skips long-term
+                extraction (``_SkipExtractionClient``), so the conversation never
+                becomes facts about the user (Agent conversations, "read only"
+                and "off"). Compaction then has no extracted summary for the
+                session and uses ``_generate_fallback_summary``.
         """
         super().__init__(
             agentcore_memory_config=agentcore_memory_config,
             region_name=region_name,
             **kwargs,
         )
+
+        self.memory_retrieval = memory_retrieval
+        self.memory_extraction = memory_extraction
+        if not memory_extraction:
+            self.memory_client.gmdp_client = _SkipExtractionClient(self.memory_client.gmdp_client)
 
         self.user_id = user_id
         self.region_name = region_name
@@ -180,6 +279,15 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         # persisted at turn end so the next head-of-turn can tell whether the
         # cached prefix is already invalid (spec §3.5).
         self._current_prefix_key: Optional[str] = None
+        # When the previous turn ended, as read BEFORE anything at this turn's
+        # head saves compaction state. Every save stamps ``updated_at``, so a
+        # head-of-turn decision that re-reads it after an earlier save (the
+        # restore's truncation-anchor advance, or a parked cut's own apply)
+        # sees a gap of ~0s and waits on a cache that is already cold.
+        # ``_restore_turn_stamp`` is captured by the restore slice;
+        # ``_turn_start_stamp`` is the one every head-of-turn decision reads.
+        self._restore_turn_stamp: Optional[str] = None
+        self._turn_start_stamp: Optional[str] = None
 
         # Session control
         self.cancelled = False
@@ -243,6 +351,12 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         docs/specs/load-test-assessment-2026-09.md §1 fix 3. One attempt and
         a short timeout: a throttle costs one failed request and the turn
         simply runs without long-term context, which is what a miss means.
+
+        One attempt also means a dead pooled connection is never retried. A
+        cached agent keeps this client between turns, and after ~6 minutes
+        idle its connections are silently dropped on the network path; the
+        next request fails within milliseconds. That is handled separately,
+        by :meth:`_replace_retrieval_client`, not by boto retries.
         """
         if getattr(self, "_retrieval_client", None) is None:
             import boto3
@@ -260,6 +374,128 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             )
         return self._retrieval_client
 
+    def _replace_retrieval_client(self, stale: Any) -> Any:
+        """Swap out a client whose pooled connection went dead, and return a
+        fresh one.
+
+        A new client, not a boto retry on the old one: the old pool can hold
+        further idle connections that are just as dead, and a retry could
+        draw one. Namespaces fail in parallel on the same client, so only
+        the first caller replaces it; the rest get that replacement.
+        """
+        with _RETRIEVAL_CLIENT_LOCK:
+            if getattr(self, "_retrieval_client", None) is stale:
+                self._retrieval_client = None
+            return self._get_retrieval_client()
+
+    def register_hooks(self, registry: Any, **kwargs: Any) -> None:
+        """The SDK's wiring, plus a long-term-memory prefetch ahead of it.
+
+        Registered FIRST on purpose: Strands runs a hook's callbacks one at a
+        time in registration order, so ``_prefetch_customer_context`` runs
+        before the SDK's persist callback and the lookup's round trip overlaps
+        the two writes the SDK awaits (docs/specs/turn-path-ttft.md P4a).
+
+        Also persists voice transcripts on ``MessageUpdatedEvent`` — see
+        ``_persist_bidi_message_update``.
+        """
+        from strands.hooks import MessageAddedEvent, MessageUpdatedEvent
+
+        registry.add_callback(MessageAddedEvent, self._prefetch_customer_context)
+        super().register_hooks(registry, **kwargs)
+        registry.add_callback(MessageUpdatedEvent, self._persist_bidi_message_update)
+
+    async def _persist_bidi_message_update(self, event: Any) -> None:
+        """Persist a voice transcript once the BidiAgent fills it in.
+
+        Since strands-agents 1.57 a ``BidiAgent`` appends each transcript to
+        history EMPTY when it starts (``MessageAddedEvent``) and replaces it
+        with the text when it stops — or with the partial text if the response
+        is cut off — through ``MessageUpdatedEvent``, exactly once per message.
+        Through 1.55 the message was appended only when final, already
+        carrying its text. Nothing in the SDK's session wiring (or
+        bedrock-agentcore's) listens for the update, and ``append_message``
+        skips the empty shell, so without this every spoken turn and every
+        assistant reply was dropped: voice worked live and saved only typed
+        input.
+
+        Only a ``BidiAgent`` fires this event today; the guard keeps it that
+        way if text agents start to. The write is offloaded so the boto3 call
+        never blocks the voice event loop.
+        """
+        if not _is_bidi_agent(event.agent):
+            return
+        await asyncio.to_thread(self.append_message, event.message, event.agent)
+
+    def _retrieval_query_for(self, messages: Any) -> Optional[str]:
+        """The lookup's query for the last message, or None if it gets none.
+
+        One eligibility rule for the prefetch and the inline path: a user
+        message whose first block is text, with retrieval configured.
+        """
+        if not messages or messages[-1].get("role") != "user":
+            return None
+        content = messages[-1].get("content")
+        if not content or "text" not in content[0]:
+            return None
+        if not getattr(self, "memory_retrieval", True):
+            return None
+        if not getattr(self.config, "retrieval_config", None):
+            return None
+        return memory_retrieval_query(messages[-1]["content"][0]["text"])
+
+    def _prefetch_customer_context(self, event: Any) -> None:
+        """Start the lookup for the message just added, and return at once.
+
+        Reads only the query string; never touches the message. The result is
+        applied later, by ``retrieve_customer_context``, at the same point in
+        the callback sequence as without the prefetch — after the SDK has
+        persisted the message — so persisted bytes cannot change.
+        """
+        self._ltm_prefetch = None
+        try:
+            from apis.shared.feature_flags import memory_retrieval_prefetch_enabled
+
+            if not memory_retrieval_prefetch_enabled() or self.cancelled:
+                return
+            # retrieve_customer_context never consumes a lookup for the voice
+            # BidiAgent, so starting one would pay for a retrieval per
+            # transcript and throw it away.
+            if _is_bidi_agent(event.agent):
+                return
+            messages = event.agent.messages
+            query = self._retrieval_query_for(messages)
+            if query is None:
+                return
+            future = _ltm_prefetch_pool().submit(self._fetch_customer_context, query)
+            self._ltm_prefetch = (messages[-1], future, time.perf_counter())
+        except Exception:  # noqa: BLE001 - the inline path still runs
+            logger.debug("Memory retrieval prefetch skipped", exc_info=True)
+
+    def _take_prefetched_context(self, message: Any) -> Optional[List[str]]:
+        """The prefetched items for ``message``, or None to fetch inline.
+
+        Matched by object identity: a prefetch started for any other message
+        (a turn that died between the two callbacks) is discarded, never
+        applied to this one.
+        """
+        pending, self._ltm_prefetch = getattr(self, "_ltm_prefetch", None), None
+        if pending is None or pending[0] is not message:
+            return None
+        _, future, started = pending
+        waited_from = time.perf_counter()
+        try:
+            items = future.result(timeout=2 * memory_retrieval_timeout_seconds() + 1)
+        except Exception as e:  # noqa: BLE001 - a miss, not a failed turn
+            logger.warning("memory retrieval prefetch failed: %s: %s", type(e).__name__, e)
+            items = []
+        logger.info(
+            "memory retrieval prefetch waitedMs=%d lookupMs=%d",
+            (time.perf_counter() - waited_from) * 1000,
+            (time.perf_counter() - started) * 1000,
+        )
+        return items
+
     def retrieve_customer_context(self, event: Any) -> None:
         """Retrieve long-term memory for the last user message and prepend it.
 
@@ -270,34 +506,76 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         differs, see :meth:`_get_retrieval_client`. Registered by the SDK's
         ``register_hooks`` in both sync and async mode via
         ``self.retrieve_customer_context``, so the override is picked up.
+
+        Uses the lookup ``_prefetch_customer_context`` started for this same
+        message when there is one, and fetches inline otherwise.
         """
+        # Mirrors bedrock-agentcore 1.23.1's own guard: voice transcripts are
+        # not queries, and LTM context spliced into a live Bidi history would
+        # be persisted into the voice agent's messages.
+        if _is_bidi_agent(event.agent):
+            return None
         messages = event.agent.messages
-        if not messages or messages[-1].get("role") != "user":
+        query = self._retrieval_query_for(messages)
+        if query is None:
             return None
-        content = messages[-1].get("content")
-        if not content or "text" not in content[0]:
-            return None
+        items = self._take_prefetched_context(messages[-1])
+        if items is None:
+            items = self._fetch_customer_context(query)
+        if items:
+            tag = getattr(self.config, "context_tag", "user_context")
+            messages[-1]["content"].insert(0, {"text": f"<{tag}>{chr(10).join(items)}</{tag}>"})
+            logger.info("Retrieved %s customer context items", len(items))
+        return None
+
+    def _fetch_customer_context(self, user_query: str) -> List[str]:
+        """Every namespace's context items for ``user_query``. Never raises.
+
+        The network half of the lookup, safe to run on any thread: it reads
+        the query and the config and returns text; it never touches a message.
+        """
         retrieval_config = getattr(self.config, "retrieval_config", None)
         if not retrieval_config:
-            return None
-
-        user_query = messages[-1]["content"][0]["text"]
-        client = self._get_retrieval_client()
+            return []
 
         def retrieve_for_namespace(namespace: str, cfg: Any) -> List[str]:
+            from botocore.exceptions import ConnectionClosedError, SSLError
+
             resolved = namespace.format(
                 actorId=self.config.actor_id,
                 sessionId=self.config.session_id,
                 memoryStrategyId=getattr(cfg, "strategy_id", None) or "",
             )
-            response = client.retrieve_memory_records(
-                memoryId=self.config.memory_id,
-                namespacePath=resolved,
-                searchCriteria={"searchQuery": user_query, "topK": cfg.top_k},
-            )
+            request = {
+                "memoryId": self.config.memory_id,
+                "namespacePath": resolved,
+                "searchCriteria": {"searchQuery": user_query, "topK": cfg.top_k},
+            }
+            try:
+                response = client.retrieve_memory_records(**request)
+            except (ConnectionClosedError, SSLError) as e:
+                # Dead pooled connection: retry once, at once, on a fresh
+                # client. Throttles are ClientErrors and still get no retry.
+                started = time.monotonic()
+                response = self._replace_retrieval_client(client).retrieve_memory_records(**request)
+                logger.info(
+                    "memory retrieval reconnected namespace=%s after %s in %dms",
+                    namespace, type(e).__name__, (time.monotonic() - started) * 1000,
+                )
             records = response.get("memoryRecordSummaries", [])
-            if getattr(cfg, "relevance_score", None):
-                records = [r for r in records if r.get("score", 0.0) >= cfg.relevance_score]
+            returned = len(records)
+            top = max((r.get("score", 0.0) for r in records), default=None)
+            cut = getattr(cfg, "relevance_score", None)
+            if cut:
+                records = [r for r in records if r.get("score", 0.0) >= cut]
+            # Scores only, from the response in hand: the namespace TEMPLATE
+            # (never the resolved actor id) and no record text, so runtime logs
+            # carry no user identifiers or memory content. Feeds relevance-cut
+            # calibration (scripts/memory-audit `inventory`).
+            logger.info(
+                "memory retrieval scores namespace=%s top=%s returned=%d kept=%d cut=%s",
+                namespace, "none" if top is None else f"{top:.3f}", returned, len(records), cut,
+            )
             items: List[str] = []
             for record in records:
                 text = (record.get("content") or {}).get("text", "") if isinstance(record, dict) else ""
@@ -306,10 +584,11 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
                     items.append(text)
             return items
 
+        all_context: List[str] = []
         try:
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            all_context: List[str] = []
+            client = self._get_retrieval_client()
             with ThreadPoolExecutor() as executor:
                 futures = {
                     executor.submit(retrieve_for_namespace, ns, cfg): ns
@@ -319,24 +598,34 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
                     try:
                         all_context.extend(future.result())
                     except Exception as e:  # noqa: BLE001 - one namespace failing must not sink the rest
-                        code = getattr(e, "response", {}).get("Error", {}).get("Code") if hasattr(e, "response") else None
-                        if code in ("ThrottlingException", "TooManyRequestsException", "ServiceQuotaExceededException"):
+                        # botocore's ConnectionClosedError and ReadTimeoutError
+                        # carry `response = None`, so guard the lookup; raising
+                        # here would discard every namespace's results.
+                        error = getattr(e, "response", None)
+                        code = error.get("Error", {}).get("Code") if isinstance(error, dict) else None
+                        if code in _MEMORY_RETRIEVAL_THROTTLE_CODES:
                             logger.info(
                                 "memory retrieval throttled namespace=%s; turn proceeds without long-term context",
                                 futures[future],
                             )
                         else:
-                            logger.warning("memory retrieval failed namespace=%s: %s", futures[future], e)
-
-            if all_context:
-                tag = getattr(self.config, "context_tag", "user_context")
-                event.agent.messages[-1]["content"].insert(
-                    0, {"text": f"<{tag}>{chr(10).join(all_context)}</{tag}>"}
-                )
-                logger.info("Retrieved %s customer context items", len(all_context))
+                            logger.warning(
+                                "memory retrieval failed namespace=%s: %s: %s", futures[future], type(e).__name__, e
+                            )
         except Exception as e:  # noqa: BLE001 - retrieval must never break a turn
             logger.error("Failed to retrieve customer context: %s", e)
-        return None
+        return all_context
+
+    def read_session(self, session_id: str, **kwargs: Any) -> Any:
+        """The SDK's session read, preceded by a build-stage mark.
+
+        The SDK constructor builds its boto3 clients and then calls this, so the
+        mark splits ``agent_build.session_mgr`` into client setup
+        (``session_mgr_clients``) and the network calls that follow. A no-op
+        outside a turn's build.
+        """
+        mark_stage("session_mgr_clients")
+        return super().read_session(session_id, **kwargs)
 
     def initialize(self, agent: "Agent", **kwargs: Any) -> None:
         """
@@ -347,7 +636,21 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         2. Let the SDK restore agent state and load messages from AgentCore Memory
         3. Apply compaction (checkpoint + truncation) on the loaded messages
         """
+        # Splits `agent_build.finalize`: everything before this is Strands'
+        # own Agent construction (tool registration, including MCP
+        # `load_tools`); everything after is the session restore.
+        mark_stage("strands_agent")
         logger.info(f"TurnBasedSessionManager.initialize() called for agent_id={agent.agent_id}")
+
+        # A voice BidiAgent reaches here since strands-agents 1.56 (it used to
+        # take the SDK's separate initialize_bidi_agent path). Restore it the
+        # same way that path did and stop: everything below is text-chat
+        # history processing, and the compaction state it reads is keyed on the
+        # session, so applying the text agent's checkpoint to the voice
+        # agent's own message list would slice the wrong history.
+        if _is_bidi_agent(agent):
+            super().initialize(agent, **kwargs)
+            return
 
         # Let the SDK handle all session restore logic:
         # - read/create agent in session repository
@@ -507,6 +810,9 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
 
         # Load compaction state from DynamoDB
         self.compaction_state = self._load_compaction_state()
+        # The previous turn's stamp, before the anchor advance below re-stamps
+        # it; ``apply_pending_compaction`` reads the gap from this.
+        self._restore_turn_stamp = self.compaction_state.updated_at
 
         # Cache valid cutoff indices (user text messages, not tool results)
         self._valid_cutoff_indices = self._find_valid_cutoff_indices(all_messages)
@@ -661,11 +967,14 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
 
         The cost-diagnostics ledger (``record_compaction_event`` /
         ``drain_compaction_events`` + ``ContextLedgerHook``) lands whatever is
-        recorded here on the NEXT model call's ``C#`` cost row as
-        ``compactionEvents``, next to ``windowRemovedMessages`` and the prefix
-        token split — the evidence the summary cap and the scheduling rule are
-        judged on. Resolved by attribute so this is a no-op on a build without
-        the ledger; fields are ints. Never raises.
+        recorded here on a ``C#`` cost row as ``compactionEvents``, next to
+        ``windowRemovedMessages`` and the prefix token split — the evidence the
+        summary cap and the scheduling rule are judged on. Head-of-turn
+        decisions land on the next model call; post-turn ones (from
+        ``update_after_turn``) on the turn's last call, via
+        ``ContextLedgerHook.record_post_turn_events``. Resolved by attribute
+        so this is a no-op on a build without the ledger; fields are ints.
+        Never raises.
         """
         recorder = getattr(self, "record_compaction_event", None)
         if not callable(recorder):
@@ -837,7 +1146,11 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
     # ------------------------------------------------------------------
 
     def record_compaction_event(self, kind: str, **fields: Any) -> None:
-        """Queue a compaction decision for the next model call's cost row.
+        """Queue a compaction decision for a model call's cost row.
+
+        Drained onto the next model call by ``ContextLedgerHook``, or — for a
+        decision ``update_after_turn`` takes after the turn's last call — onto
+        that last call by ``ContextLedgerHook.record_post_turn_events``.
 
         ``kind`` is one of the ``COMPACTION_EVENT_KINDS`` — ``applied`` (the
         restore-time slice ran), ``checkpoint`` (a new checkpoint was cut
@@ -1075,6 +1388,9 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         # cache-gap decision when compaction (whose state stamps updated_at
         # every turn) is off. Stamped before the early return on purpose.
         self._last_turn_completed_at = datetime.now(timezone.utc).isoformat()
+        # The head-of-turn stamps belong to the turn that just ended.
+        self._restore_turn_stamp = None
+        self._turn_start_stamp = None
 
         if not self.compaction_config or not self.compaction_config.enabled:
             return None
@@ -1246,6 +1562,7 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             model_enabled=self.compaction_config.summary_model_enabled,
             model_id=self.compaction_config.summary_model_id,
             region=self.region_name,
+            extract_enabled=self.compaction_config.summary_extract_enabled,
         )
         summary = bounded.text
 
@@ -1289,8 +1606,10 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         self._emit_compaction_metrics(state, policy, forced, retained_estimate, bounded, deferred)
         # Routed through the defensive seam rather than calling the recorder
         # directly: same no-op-without-a-ledger contract as every other cut
-        # decision. Queued when the cut is *decided* — when ``deferred`` the
-        # bytes do not move until ``apply_pending_compaction`` runs.
+        # decision. Queued when the cut is *decided* and attached to this
+        # turn's last call (the one whose input triggered it) — when
+        # ``deferred`` the bytes do not move until ``apply_pending_compaction``
+        # runs, which records its own ``applied``.
         self._record_ledger_event(
             "checkpoint",
             checkpoint=new_checkpoint,
@@ -1343,7 +1662,16 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
 
         Otherwise the cut keeps waiting (``compaction_pending_waiting``). Returns
         the reason applied, or ``None``. Never raises.
+
+        The gap is measured from the previous turn's stamp as it stood before
+        this turn's head saved anything (``_turn_start_stamp``), and that
+        stamp is left for ``apply_document_offload``, which runs next.
         """
+        # Consumed every turn, so a stamp from a turn that never reached here
+        # cannot make a later, genuinely warm turn look cold.
+        restore_stamp = getattr(self, "_restore_turn_stamp", None)
+        self._restore_turn_stamp = None
+        self._turn_start_stamp = None
         if not self.compaction_config or not self.compaction_config.enabled:
             return None
         try:
@@ -1352,15 +1680,17 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             if state is None:
                 return None
 
+            turn_stamp = restore_stamp or state.updated_at
+            self._turn_start_stamp = turn_stamp
             previous_key = state.last_prefix_key
             self._current_prefix_key = prefix_key
             if state.pending_checkpoint is None:
                 return None
 
             config = self.compaction_config
-            gap_seconds = self._seconds_since(state.updated_at)
+            gap_seconds = self._seconds_since(turn_stamp)
             reason: Optional[str] = None
-            if self._cache_window_expired(state.updated_at, config.cache_ttl_seconds):
+            if self._cache_window_expired(turn_stamp, config.cache_ttl_seconds):
                 reason = "cache_expired"
             elif prefix_key and previous_key and prefix_key != previous_key:
                 reason = "prefix_changed"
@@ -1546,7 +1876,14 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         config = self.compaction_config
         state = self.compaction_state if (config and config.enabled) else None
         ttl = config.cache_ttl_seconds if config else Defaults.COMPACTION_CACHE_TTL_SECONDS
-        last_turn_at = (state.updated_at if state else None) or getattr(self, "_last_turn_completed_at", None)
+        # This turn's start stamp first: ``apply_pending_compaction`` runs
+        # just before this and, when it applies a cut, re-stamps
+        # ``updated_at`` — reading that would call a cold cache warm.
+        last_turn_at = (
+            getattr(self, "_turn_start_stamp", None)
+            or (state.updated_at if state else None)
+            or getattr(self, "_last_turn_completed_at", None)
+        )
         gap = self._seconds_since(last_turn_at)
         if self._cache_window_expired(last_turn_at, ttl):
             return "cache_expired", gap
@@ -1606,9 +1943,15 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             last = last.replace(tzinfo=timezone.utc)
         return int((datetime.now(timezone.utc) - last).total_seconds())
 
-    @staticmethod
-    def _emit_emf(metrics: Dict[str, Any], properties: Dict[str, Any], units: Optional[Dict[str, str]] = None) -> None:
+    def _emit_emf(self, metrics: Dict[str, Any], properties: Dict[str, Any], units: Optional[Dict[str, str]] = None) -> None:
         """One content-free EMF record in ``AgentCoreStack/Compaction``. Never raises.
+
+        Every record carries the conversation's ``sessionId`` as a log
+        property, the way the prompt-cache records do — never a dimension,
+        which would mint a metric stream per conversation. Without it, the
+        2026-09-25 prod readout had to join cuts to sessions by matching input
+        tokens within ±30 min. Numbers and identifiers only; no conversation
+        content reaches these records.
 
         ``PROMPT_CACHE_OBSERVABILITY_ENABLED=false`` silences it with the rest
         of the cost observability layer.
@@ -1619,7 +1962,13 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
 
             if not prompt_cache_observability_enabled():
                 return
-            emit_emf_metrics("AgentCoreStack/Compaction", metrics=metrics, properties=properties, units=units or {})
+            session_id = getattr(getattr(self, "config", None), "session_id", None)
+            emit_emf_metrics(
+                "AgentCoreStack/Compaction",
+                metrics=metrics,
+                properties={**properties, "sessionId": session_id},
+                units=units or {},
+            )
         except Exception as e:  # noqa: BLE001
             logger.debug("Compaction EMF skipped: %s", e)
 
@@ -1759,10 +2108,25 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         sanitized: List[Dict] = []
         dropped_blocks = 0
         dropped_messages = 0
+        replaced_media = 0
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
             original = msg.get("content", [])
+            if isinstance(original, list):
+                repaired = None
+                for i, block in enumerate(original):
+                    if not isinstance(block, dict) or not (
+                        "document" in block or "image" in block or "toolResult" in block
+                    ):
+                        continue
+                    fixed = self._replace_sourceless_media(block)
+                    if fixed is not block:
+                        repaired = repaired or list(original)
+                        repaired[i] = fixed
+                        replaced_media += 1
+                if repaired is not None:
+                    msg = {**msg, "content": repaired}
             cleaned = self._filter_empty_text(msg)
             content = cleaned.get("content", [])
             if isinstance(original, list) and isinstance(content, list):
@@ -1778,7 +2142,57 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
                 "empty message(s) from restored history for session %s",
                 dropped_blocks, dropped_messages, self.config.session_id,
             )
+        if replaced_media:
+            logger.warning(
+                "Restore sanitize: replaced %d image/document block(s) with no "
+                "source in restored history for session %s",
+                replaced_media, self.config.session_id,
+            )
         return sanitized
+
+    @staticmethod
+    def _media_unavailable_text(key: str, media: Any) -> str:
+        name = media.get("name") if isinstance(media, dict) else None
+        label = f'{key} "{name}"' if name else key
+        return f"[{label.capitalize()} is not available in this conversation]"
+
+    @classmethod
+    def _replace_sourceless_media(cls, block: Any) -> Any:
+        """Turn an image/document block with no ``source`` into a text placeholder.
+
+        Bedrock requires ``source`` on both ("Missing required parameter in
+        messages[0].content[1].document: \"source\""), so one such block in
+        restored history fails every turn. Shared-conversation forks wrote them
+        before the export learned to drop them: the snapshot carries the
+        display shape (``format``/``name``/``data``), not the Converse one.
+        Checks top-level blocks and those nested in a ``toolResult``.
+
+        Returns ``block`` itself when nothing changed, so a healthy history is
+        not copied — and, being a pure function of the stored block, the
+        replacement is identical on every restore (prompt-cache contract).
+        """
+        if not isinstance(block, dict):
+            return block
+        for key in ("document", "image"):
+            if key in block:
+                source = block[key].get("source") if isinstance(block[key], dict) else None
+                if isinstance(source, dict) and source:
+                    return block
+                return {"text": cls._media_unavailable_text(key, block[key])}
+        tool_result = block.get("toolResult")
+        items = tool_result.get("content") if isinstance(tool_result, dict) else None
+        if not isinstance(items, list):
+            return block
+        repaired = None
+        for i, item in enumerate(items):
+            if isinstance(item, dict) and ("document" in item or "image" in item):
+                fixed = cls._replace_sourceless_media(item)
+                if fixed is not item:
+                    repaired = repaired or list(items)
+                    repaired[i] = fixed
+        if repaired is None:
+            return block
+        return {**block, "toolResult": {**tool_result, "content": repaired}}
 
     def _strip_document_bytes(self, messages: List[Dict]) -> List[Dict]:
         """Replace document content blocks' inline bytes with their digest — or,

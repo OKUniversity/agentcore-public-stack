@@ -6,20 +6,23 @@
     class="chat-topnav-wrapper"
     [class.sidenav-expanded]="!isSidenavCollapsed()"
     [class.artifact-pane-open]="artifactPanelOpen()">
-    <app-topnav
-      [assistant]="assistant()"
-      [agentGovernance]="agentGovernance()"
-      [isAssistantOwner]="isAssistantOwner()"
-      [isLoadingAssistant]="isLoadingAssistant()"
-      (assistantNewSession)="onAssistantNewSession()"
-      (assistantEdit)="onAssistantEdit()"
-      (assistantShare)="onAssistantShare()" />
+    <app-topnav>
+      <!-- The bound agent, as a breadcrumb before the conversation title: the
+           conversation lives inside the agent. Only once there are messages —
+           the empty state already introduces the agent with its launch card. -->
+      @if (hasMessages() && (assistant() || isLoadingAssistant())) {
+        <div topnavCrumb class="flex min-w-0 shrink-[4] items-center gap-x-1.5">
+          <ng-container *ngTemplateOutlet="agentIndicator" />
+          <span aria-hidden="true" class="text-gray-300 dark:text-gray-600">/</span>
+        </div>
+      }
+    </app-topnav>
   </div>
 }
 
 <!-- Skeleton loading state -->
 @if (showSkeleton()) {
-  <div class="relative pb-30 pt-16 max-w-[720px] mx-auto px-4 py-6 min-w-0">
+  <div class="relative pb-30 pt-16 max-w-[720px] mx-auto sm:px-4 py-6 min-w-0">
     <div class="min-w-0 animate-fade-in">
       <app-paragraph-skeleton />
     </div>
@@ -68,6 +71,8 @@
           [showAnnouncements]="showAnnouncements()"
           [announcementPlacement]="announcementPlacement()"
           [sessionId]="sessionId()"
+          [allowFolderAttachments]="allowFolderAttachments()"
+          [draftKey]="draftKey()"
           [isChatLoading]="isChatLoading()"
           [showFileControls]="resolvedConfig().showFileControls"
           [showVoiceControl]="resolvedConfig().showVoiceControl"
@@ -79,8 +84,11 @@
       </div>
     </div>
   } @else {
-    <!-- Full-page mode: original layout -->
-    @if (isLoadingAssistant()) {
+    <!-- Full-page mode: original layout. A project task takes the greeting
+         layout below, its composer naming the project, never the launch
+         card or its skeleton: the harness Agent is the project's machinery,
+         not something the person chose to talk to. -->
+    @if (isLoadingAssistant() && !project()) {
       <!-- Agent is loading: skeleton in the launch card's own shape, so the real card
            lands in place rather than re-flowing a centered layout into a left-aligned one. -->
       <div
@@ -127,6 +135,9 @@
             [showAnnouncements]="showAnnouncements()"
           [announcementPlacement]="announcementPlacement()"
             [sessionId]="sessionId()"
+            [allowFolderAttachments]="allowFolderAttachments()"
+            [showScopePicker]="showScopePicker()"
+            [draftKey]="draftKey()"
             [isChatLoading]="isChatLoading()"
             [showFileControls]="resolvedConfig().showFileControls"
           [showVoiceControl]="resolvedConfig().showVoiceControl"
@@ -137,7 +148,7 @@
           </app-chat-input>
         </div>
       </div>
-    } @else if (assistant()) {
+    } @else if (assistant() && !project()) {
       <!-- Assistant selected: show only assistant card with fixed input at bottom -->
       <div
         class="chat-container-empty full-page"
@@ -175,6 +186,9 @@
             [showAnnouncements]="showAnnouncements()"
           [announcementPlacement]="announcementPlacement()"
             [sessionId]="sessionId()"
+            [allowFolderAttachments]="allowFolderAttachments()"
+            [showScopePicker]="showScopePicker()"
+            [draftKey]="draftKey()"
             [isChatLoading]="isChatLoading()"
             [showFileControls]="resolvedConfig().showFileControls"
           [showVoiceControl]="resolvedConfig().showVoiceControl"
@@ -228,6 +242,11 @@
               [showAnnouncements]="showAnnouncements()"
           [announcementPlacement]="announcementPlacement()"
               [sessionId]="sessionId()"
+              [allowFolderAttachments]="allowFolderAttachments()"
+              [showScopePicker]="showScopePicker()"
+              [offerIncognito]="showScopePicker() && !project()"
+              [project]="project()"
+              [draftKey]="draftKey()"
               [isChatLoading]="isChatLoading()"
               [showFileControls]="resolvedConfig().showFileControls"
           [showVoiceControl]="resolvedConfig().showVoiceControl"
@@ -264,56 +283,38 @@
             [isChatLoading]="isChatLoading()"
             [streamingMessageId]="streamingMessageId()"
             [embeddedMode]="true"
+            [allowDownload]="citationsDownloadAllowed()"
             (continueRequested)="continueRequested.emit()" />
         </div>
       </div>
 
       <!-- Fixed input at bottom -->
-      <div class="chat-input-footer embedded">
-        <!-- Assistant Indicator (floating badge above input) -->
-        @if (isLoadingAssistant()) {
-          <div class="flex justify-center mb-2">
-            <div class="animate-pulse inline-flex items-center gap-2.5 rounded-xl bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 pr-3 h-10">
-              <div class="w-9 h-full rounded-l-xl bg-gray-200 dark:bg-gray-700"></div>
-              <div class="flex flex-col gap-1">
-                <div class="h-3 w-32 rounded-sm bg-gray-200 dark:bg-gray-700"></div>
-                <div class="h-2 w-16 rounded-sm bg-gray-200 dark:bg-gray-700"></div>
-              </div>
-              <div class="h-3 w-3 rounded-full bg-gray-200 dark:bg-gray-700"></div>
-            </div>
-          </div>
-        } @else if (assistant()) {
-          <div class="assistant-indicator-input-wrapper embedded">
-            <app-assistant-indicator
-              [name]="assistant()!.name"
-              [emoji]="assistant()!.emoji ?? ''"
-              [ownerName]="assistant()!.ownerName"
-              [isOwner]="isAssistantOwner()"
-              [governance]="agentGovernance()"
-              (newSessionClicked)="onAssistantNewSession()"
-              (editClicked)="onAssistantEdit()"
-              (shareClicked)="onAssistantShare()" />
-          </div>
+      <div class="chat-input-footer embedded compact">
+        @if (isArchiveServed()) {
+          <app-expired-session-notice />
+        } @else {
+          <app-chat-input
+            [showAnnouncements]="showAnnouncements()"
+            [announcementPlacement]="announcementPlacement()"
+            [sessionId]="sessionId()"
+            [allowFolderAttachments]="allowFolderAttachments()"
+            [draftKey]="draftKey()"
+            [isChatLoading]="isChatLoading()"
+            [showFileControls]="resolvedConfig().showFileControls"
+            [showVoiceControl]="resolvedConfig().showVoiceControl"
+            (messageSubmitted)="onMessageSubmitted($event)"
+            (messageCancelled)="onMessageCancelled()"
+            (fileAttached)="onFileAttached($event)"
+            [compact]="true"
+          >
+            <!-- Context meter (cost lives in its panel), beside the model
+                 picker. Pinned to this chat's own session: an embedded chat is
+                 deliberately NOT the viewed session, so an unpinned meter would
+                 report whatever conversation the user last opened — a plausible
+                 number belonging to something else. -->
+            <app-context-meter composerMeta [sessionId]="sessionId()" />
+          </app-chat-input>
         }
-        <!-- Cost + context, same placement as full-page mode. Pinned to this
-             chat's own session: an embedded chat is deliberately NOT the viewed
-             session, so an unpinned badge would report whatever conversation the
-             user last opened — a plausible number belonging to something else. -->
-        <div class="flex justify-end pb-1 pr-[10px]">
-          <app-session-cost-badge [sessionId]="sessionId()" />
-        </div>
-        <app-chat-input
-          [showAnnouncements]="showAnnouncements()"
-          [announcementPlacement]="announcementPlacement()"
-          [sessionId]="sessionId()"
-          [isChatLoading]="isChatLoading()"
-          [showFileControls]="resolvedConfig().showFileControls"
-          [showVoiceControl]="resolvedConfig().showVoiceControl"
-          (messageSubmitted)="onMessageSubmitted($event)"
-          (messageCancelled)="onMessageCancelled()"
-          (fileAttached)="onFileAttached($event)"
->
-        </app-chat-input>
       </div>
     </div>
   } @else {
@@ -334,35 +335,66 @@
           [streamingMessageId]="streamingMessageId()"
           [feedbackAgent]="feedbackAgent()"
           [sessionId]="sessionId()"
+          [allowDownload]="citationsDownloadAllowed()"
           (continueRequested)="continueRequested.emit()" />
       </div>
     </div>
 
     <!-- Chat input footer -->
     <div
-      class="chat-input-footer full-page"
+      class="chat-input-footer full-page compact"
       [class.sidenav-expanded]="!isSidenavCollapsed()"
       [class.artifact-pane-open]="artifactPanelOpen()">
       <div class="mx-auto px-4 max-w-[720px]">
-        <div class="flex justify-end pb-1 pr-[10px]">
-          <app-session-cost-badge />
-        </div>
-        <app-chat-input
-          [showAnnouncements]="showAnnouncements()"
-          [announcementPlacement]="announcementPlacement()"
-          [sessionId]="sessionId()"
-          [isChatLoading]="isChatLoading()"
-          [showFileControls]="resolvedConfig().showFileControls"
-          [showVoiceControl]="resolvedConfig().showVoiceControl"
-          (messageSubmitted)="onMessageSubmitted($event)"
-          (messageCancelled)="onMessageCancelled()"
-          (fileAttached)="onFileAttached($event)"
->
-        </app-chat-input>
+        @if (isArchiveServed()) {
+          <app-expired-session-notice />
+        } @else {
+          <app-chat-input
+            [showAnnouncements]="showAnnouncements()"
+            [announcementPlacement]="announcementPlacement()"
+            [sessionId]="sessionId()"
+            [allowFolderAttachments]="allowFolderAttachments()"
+            [draftKey]="draftKey()"
+            [isChatLoading]="isChatLoading()"
+            [showFileControls]="resolvedConfig().showFileControls"
+            [showVoiceControl]="resolvedConfig().showVoiceControl"
+            (messageSubmitted)="onMessageSubmitted($event)"
+            (messageCancelled)="onMessageCancelled()"
+            (fileAttached)="onFileAttached($event)"
+            [compact]="true"
+            [project]="project()"
+          >
+            <!-- Context meter (cost lives in its panel), beside the model
+                 picker; unpinned so it follows the viewed session. -->
+            <app-context-meter composerMeta />
+          </app-chat-input>
+        }
       </div>
     </div>
   }
 }
+
+<!-- The bound agent, projected into the top nav as the conversation's breadcrumb. -->
+<ng-template #agentIndicator>
+  @if (isLoadingAssistant()) {
+    <div
+      class="h-6 w-28 animate-pulse rounded-md bg-gray-200/70 motion-reduce:animate-none dark:bg-white/5"
+      role="status"
+      aria-label="Loading agent"
+    ></div>
+  } @else if (assistant(); as agent) {
+    <app-agent-indicator
+      [name]="indicatorName()"
+      [emoji]="agent.emoji ?? ''"
+      [ownerName]="agent.ownerName"
+      [isOwner]="isAssistantOwner()"
+      [projectId]="agent.projectId ?? null"
+      [governance]="agentGovernance()"
+      (newSessionClicked)="onAssistantNewSession()"
+      (editClicked)="onAssistantEdit()"
+      (shareClicked)="onAssistantShare()" />
+  }
+</ng-template>
 
 <!-- Voice Conversation Overlay -->
 @if (isVoiceActive()) {

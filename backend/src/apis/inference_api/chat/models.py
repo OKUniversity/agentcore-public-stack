@@ -8,13 +8,15 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from apis.shared.assistants.models import MAX_AGENT_INSTRUCTIONS_CHARS
+from apis.shared.browser_takeover import coerce_frame_height
+from apis.shared.handoff.turn import HandoffContextRequest
 from apis.shared.sessions.session_lease import STEER_QUEUE_MAX_CHARS
 
-# Hard upper bound on a user-supplied custom system prompt. Mirrors the
-# limit applied inside SystemPromptBuilder.from_user_prompt — surfacing
-# it at the API layer so oversized payloads are rejected before any
-# downstream work runs.
-MAX_USER_SYSTEM_PROMPT_CHARS = 8 * 1024
+# Hard upper bound on a request's ``system_prompt``. The Agent Designer preview sends an
+# agent's live instructions here, so it is the save-time instructions cap: at the old
+# 8 KiB, previewing any agent with longer instructions failed validation.
+MAX_USER_SYSTEM_PROMPT_CHARS = MAX_AGENT_INSTRUCTIONS_CHARS
 
 
 class FileContent(BaseModel):
@@ -62,10 +64,10 @@ class AppContextUpdateEntry(BaseModel):
 
     MCP Apps PR #6. The embedded App's JSON-RPC `ui/update-model-context`
     is relayed by app-api to `/invocations` with this directive. Like
-    `app_tool_call` it runs NO model turn — it stashes the payload on the
-    conversation agent's Strands `agent.state` under
-    `mcp_apps.context[resource_uri]`. The next real user turn merges any
-    pending entries into that turn's prompt and clears them.
+    `app_tool_call` it runs NO model turn — it holds the payload for the
+    `(session, user)` conversation (`chat/app_context_dispatch.py`). The
+    next real user turn merges any pending entries into that turn's prompt
+    and clears them.
 
     `resource_uri` is the bound MCP App resource (`ui://...`) and is the
     dedupe key: the host keeps only the last update per resource between
@@ -106,6 +108,13 @@ class InvocationRequest(BaseModel):
 
     session_id: str
     message: str = ""
+    # Session prewarm (docs/specs/agentcore-runtime-v2.md §5a): app-api sends
+    # `{"session_id": ..., "warm": true}` with the conversation's affinity header
+    # when the user opens a conversation, so the microVM the first real turn
+    # lands on is already started. The handler returns before reading anything:
+    # no ownership read, no session or metadata rows, no lease, no quota, no
+    # model call. Every other field is ignored on a warm request.
+    warm: Optional[bool] = None
     model_id: Optional[str] = None
     temperature: Optional[float] = None
     system_prompt: Optional[str] = None
@@ -113,6 +122,11 @@ class InvocationRequest(BaseModel):
     enabled_tools: Optional[List[str]] = None  # User-specific tool preferences
     files: Optional[List[FileContent]] = None  # Direct file content (base64-encoded)
     file_upload_ids: Optional[List[str]] = None  # Upload IDs to resolve from S3
+    # Attached Drive folders (docs/specs/drive-folder-attachments.md §4.4): folder
+    # attach ids from app-api's `POST /sessions/{id}/folders`. Each counts ONE
+    # against the per-message cap and reaches the model as a manifest; its files
+    # are never on `file_upload_ids`. Ignored while FOLDER_ATTACHMENTS_ENABLED is off.
+    folder_attachment_ids: Optional[List[str]] = None
     provider: Optional[str] = None  # LLM provider: "bedrock", "openai", or "gemini"
     max_tokens: Optional[int] = None  # Maximum tokens to generate
     # Per-request canonical inference param overrides (temperature, top_p,
@@ -125,6 +139,11 @@ class InvocationRequest(BaseModel):
     # AgentCore Runtime returns 424 when it sees a non-empty 'assistant_id' field,
     # likely trying to resolve it as an AWS Bedrock Agent ID.
     rag_assistant_id: Optional[str] = None
+    # Incognito chat (#1738): the user chose, before the first message, that
+    # this conversation reads long-term memory but never adds to it. Honoured
+    # only on the turn that creates the session; afterwards the stored flag
+    # decides (``session_is_incognito``), so a later request can't change it.
+    incognito: Optional[bool] = None
     # Marketplace D11: this turn was handed to the Agent by an `@`-mention in
     # the composer, rather than the whole conversation being bound to it.
     #
@@ -168,6 +187,13 @@ class InvocationRequest(BaseModel):
     # rather than a quietly-ignored flag — a silently downgraded preview would run the
     # wrong configuration and report it as the reviewed one.
     review_preview: Optional[bool] = None
+    # Handoffs (docs/specs/agent-handoffs-and-consults.md §4.2): this is the first turn of a
+    # conversation started by handing off from another one. `{handoffId, text}`, where `text` is
+    # the context card as the user sent it (absent when they removed it). The server re-caps it,
+    # accepts the handoff once, and prepends it wrapped; the bubble shows `message` only. Ignored
+    # with a warning while HANDOFFS_ENABLED is off, on a resume, and on a conversation that
+    # already took a handoff.
+    handoff_context: Optional[HandoffContextRequest] = None
     # When set, the route resumes a paused agent turn instead of starting a
     # new one. `message` is ignored in that case — the original prompt is
     # already in the agent's interrupt context.
@@ -222,6 +248,20 @@ class InvocationRequest(BaseModel):
     # `message` is ignored; no model turn runs. The context is merged into
     # (and cleared before) the next real user turn's prompt.
     app_context_update: Optional[AppContextUpdateEntry] = None
+    # The height, in CSS pixels, the SPA's docked browser panel would give the
+    # sign-in stream (authenticated-web-assessment spec D3a). Client data, not
+    # prompt data: the route hands it to tools through Strands'
+    # `invocation_state`, so it never reaches the model, and only
+    # `request_user_login` reads it, to size the handover. Sent on every
+    # request because the turn that hands the browser over is not known in
+    # advance. An unusable value becomes None rather than a 422: a hint about
+    # window size must never be able to fail a turn.
+    browser_frame_height: Optional[int] = None
+
+    @field_validator("browser_frame_height", mode="before")
+    @classmethod
+    def _drop_unusable_frame_height(cls, value: Any) -> Optional[int]:
+        return coerce_frame_height(value)
 
     @field_validator("system_prompt")
     @classmethod
