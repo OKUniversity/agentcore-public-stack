@@ -31,6 +31,8 @@ import base64
 from dataclasses import dataclass
 
 from apis.shared.aws_clients import get_dynamodb_table
+from apis.shared.build_info import build_stamp
+from apis.shared.sessions.ledger_rollups import LEDGERED, live_ledger_writes_on
 from typing import Iterable, List, Literal, Optional, Tuple, Any, Dict
 from decimal import Decimal
 
@@ -120,27 +122,32 @@ def _coerce_cost_total(raw: Any) -> float:
 async def store_message_metadata(
     session_id: str,
     user_id: str,
-    message_id: int,
+    message_id: Optional[int],
     message_metadata: MessageMetadata
-) -> None:
+) -> Dict[str, Any]:
     """
     Store message metadata after streaming completes
 
     Args:
         session_id: Session identifier
         user_id: User identifier
-        message_id: Message number (1, 2, 3, ...)
+        message_id: Message number (1, 2, 3, ...), or None for a call that produced no
+            message (a handoff brief, which carries ``callKind`` instead)
         message_metadata: MessageMetadata object to store
 
     Note:
         This should be called AFTER the session manager flushes messages,
         ensuring the message file exists before we try to update it.
+
+    Returns:
+        The derived prompt-cache observability written on the row (``cacheStatus`` …),
+        or ``{}`` when it was skipped.
     """
     sessions_metadata_table = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
     if not sessions_metadata_table:
         raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
 
-    await _store_message_metadata_cloud(
+    return await _store_message_metadata_cloud(
         session_id=session_id,
         user_id=user_id,
         message_id=message_id,
@@ -234,10 +241,10 @@ def get_user_display_text(session_id: str, user_id: str, message_id: int) -> Opt
 async def _store_message_metadata_cloud(
     session_id: str,
     user_id: str,
-    message_id: int,
+    message_id: Optional[int],
     message_metadata: MessageMetadata,
     table_name: str
-) -> None:
+) -> Dict[str, Any]:
     """
     Store message metadata (cost record) in DynamoDB and update cost summary
 
@@ -320,7 +327,6 @@ async def _store_message_metadata_cloud(
 
             # Session reference (for linking back to session)
             "sessionId": session_id,
-            "messageId": message_id,
 
             # Attribution
             "userId": user_id,
@@ -329,6 +335,11 @@ async def _store_message_metadata_cloud(
             # TTL - only cost records have this attribute
             "ttl": ttl,
 
+            # Which build of the service produced this call: `appVersion` and
+            # `build` (docs/specs/release-ledger.md D1). Before the metadata so
+            # a caller that knows better (the backfill) can override them.
+            **build_stamp(),
+
             # Cost and usage metadata
             **metadata_decimal,
 
@@ -336,6 +347,17 @@ async def _store_message_metadata_cloud(
             # wastedUsd) — {} when derivation was skipped or failed
             **_convert_floats_to_decimal(cache_observability),
         }
+
+        # A call that produced no message (a handoff brief, marked by ``callKind``) carries no
+        # messageId: readers join feedback and per-turn views on it, and the source's last
+        # turn's index would hand that answer's thumb to the brief (handoffs spec §4.5.1).
+        if message_id is not None:
+            item["messageId"] = message_id
+
+        # Release ledger: mark a row the live writer will count, on this same put, so the
+        # backfill can skip it whatever range it is given (docs/specs/release-ledger.md §7).
+        if live_ledger_writes_on():
+            item[LEDGERED] = True
 
         # Store in DynamoDB
         table.put_item(Item=item)
@@ -365,7 +387,8 @@ async def _store_message_metadata_cloud(
         await _update_cost_summary_async(
             user_id=user_id,
             timestamp=timestamp,
-            message_metadata=message_metadata
+            message_metadata=message_metadata,
+            ledger_row=item,
         )
 
         # Shared Projects: a call made by a project's harness also counts toward that
@@ -375,6 +398,8 @@ async def _store_message_metadata_cloud(
             timestamp=timestamp,
             message_metadata=message_metadata,
         )
+
+        return cache_observability
 
     except Exception as e:
         logger.error(f"Failed to store message metadata in DynamoDB: {e}", exc_info=True)
@@ -792,7 +817,8 @@ async def _update_project_rollup_async(
 async def _update_cost_summary_async(
     user_id: str,
     timestamp: str,
-    message_metadata: MessageMetadata
+    message_metadata: MessageMetadata,
+    ledger_row: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Update pre-aggregated cost summary (async, non-blocking)
@@ -810,6 +836,8 @@ async def _update_cost_summary_async(
         user_id: User identifier
         timestamp: ISO timestamp of the message
         message_metadata: MessageMetadata containing cost, usage, and model info
+        ledger_row: The ``C#`` item just written, for the release ledger's
+            version-keyed rollups (``ledger_rollups``); None writes none.
     """
     try:
         import asyncio
@@ -923,7 +951,8 @@ async def _update_cost_summary_async(
                 cache_savings=cache_savings,
                 model_id=model_id,
                 model_name=model_name,
-                provider=provider
+                provider=provider,
+                ledger_row=ledger_row,
             )
         )
 
@@ -946,7 +975,8 @@ async def _update_system_rollups_async(
     cache_savings: float,
     model_id: str | None,
     model_name: str | None,
-    provider: str | None
+    provider: str | None,
+    ledger_row: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Update system-wide rollups for admin dashboard (async, fire-and-forget)
@@ -955,6 +985,11 @@ async def _update_system_rollups_async(
     - Daily rollup (ROLLUP#DAILY, SK: YYYY-MM-DD)
     - Monthly rollup (ROLLUP#MONTHLY, SK: YYYY-MM)
     - Per-model rollup (ROLLUP#MODEL, SK: YYYY-MM#model_id)
+    - While ``RELEASE_LEDGER_ENABLED`` is on, the release ledger's
+      ``LEDGER#VERSION`` / ``#MODEL`` / ``#TOOL`` / ``#AGENT`` / ``#PROJECT``
+      rows for ``ledger_row`` (docs/specs/release-ledger.md §5.2), concurrently
+      with the ``ROLLUP#`` writes and with their failure semantics: each side
+      logs and swallows its own errors, so neither can skip the other.
 
     These updates are non-blocking and failures don't affect the main request flow.
     The rollups support the admin cost dashboard with pre-aggregated system-wide metrics.
@@ -969,7 +1004,40 @@ async def _update_system_rollups_async(
         model_id: Model identifier
         model_name: Human-readable model name
         provider: LLM provider
+        ledger_row: The stored ``C#`` item, for the release ledger; None skips it.
     """
+    import asyncio
+
+    from apis.shared.sessions.ledger_rollups import bump_ledger_for_row
+
+    await asyncio.gather(
+        _bump_rollup_rows(
+            user_id=user_id,
+            period=period,
+            date=date,
+            cost=cost,
+            usage_delta=usage_delta,
+            cache_savings=cache_savings,
+            model_id=model_id,
+            model_name=model_name,
+            provider=provider,
+        ),
+        bump_ledger_for_row(ledger_row),
+    )
+
+
+async def _bump_rollup_rows(
+    user_id: str,
+    period: str,
+    date: str,
+    cost: float,
+    usage_delta: dict,
+    cache_savings: float,
+    model_id: str | None,
+    model_name: str | None,
+    provider: str | None,
+) -> None:
+    """The ``ROLLUP#DAILY`` / ``#MONTHLY`` / ``#MODEL`` bumps. Never raises."""
     try:
         # Check if we're using DynamoDB storage (rollups only make sense in cloud mode)
         system_rollup_table = os.environ.get("DYNAMODB_SYSTEM_ROLLUP_TABLE_NAME")
@@ -2223,12 +2291,17 @@ async def _bump_session_aggregates(
         if not sk:
             return
 
-        update_parts_set = ["lastContextTokens = :t"]
-        values: Dict[str, Any] = {":c": Decimal(str(cost_value)), ":t": int(input_tokens)}
-
-        if context_window:
-            update_parts_set.append("contextWindow = :w")
-            values[":w"] = int(context_window)
+        values: Dict[str, Any] = {":c": Decimal(str(cost_value))}
+        update_parts_set: List[str] = []
+        # A call that is not a turn (``callKind``, e.g. a handoff brief) reads the history plus
+        # its own instruction, so its input is not the conversation's context size. It adds to
+        # the cost and cache rollups, and leaves the context meter to the turns.
+        if not _call_kind(message_metadata):
+            update_parts_set.append("lastContextTokens = :t")
+            values[":t"] = int(input_tokens)
+            if context_window:
+                update_parts_set.append("contextWindow = :w")
+                values[":w"] = int(context_window)
 
         # Per-session cache-efficiency rollups (next to totalCost). Zero
         # deltas are added unconditionally so the attributes exist (as 0)
@@ -2290,9 +2363,9 @@ async def _bump_session_aggregates(
                 update_parts_add.append(f"{attr} :{attr}")
                 values[f":{attr}"] = value
 
-        update_expression = (
-            "ADD " + ", ".join(update_parts_add) + " SET " + ", ".join(update_parts_set)
-        )
+        update_expression = "ADD " + ", ".join(update_parts_add)
+        if update_parts_set:
+            update_expression += " SET " + ", ".join(update_parts_set)
 
         response = table.update_item(
             Key={"PK": f"USER#{user_id}", "SK": sk},
@@ -2309,6 +2382,12 @@ async def _bump_session_aggregates(
     except Exception as e:
         # Non-fatal — lazy backfill compensates on next read.
         logger.debug("bump_session_aggregates failed (will be backfilled on read): %s", e)
+
+
+def _call_kind(message_metadata: Any) -> Optional[str]:
+    """The ``callKind`` extra on a cost row's metadata: set on a call that is not a turn."""
+    extra = getattr(message_metadata, "model_extra", None)
+    return extra.get("callKind") if isinstance(extra, dict) else None
 
 
 #: Session-row counter per compaction event kind (see
@@ -2478,7 +2557,7 @@ async def _backfill_session_aggregates(
                 # match true context-window occupancy.
                 token_usage = rec_float.get("tokenUsage") or {}
                 ts = rec_float.get("timestamp")
-                if ts and (last_timestamp is None or ts > last_timestamp):
+                if ts and not rec_float.get("callKind") and (last_timestamp is None or ts > last_timestamp):
                     last_timestamp = ts
                     last_context_tokens = int(
                         (token_usage.get("inputTokens") or 0)
@@ -2749,6 +2828,9 @@ async def _get_all_message_metadata_cloud(session_id: str, user_id: str, table_n
             # Extract message_id as integer (DynamoDB returns Decimal, convert to int then str)
             # Must convert to int first to avoid "0.0" -> "0" mismatch
             message_id_raw = item_float.get("messageId")
+            if message_id_raw is None:
+                # A call that produced no message (a handoff brief): nothing to join it to.
+                continue
             message_id = str(int(message_id_raw)) if isinstance(message_id_raw, (int, float)) else str(message_id_raw)
 
             logger.debug(f"Processing cost record for message_id={message_id}, SK={item_float.get('SK')}")

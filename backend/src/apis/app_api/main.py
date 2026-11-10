@@ -16,6 +16,9 @@ import os
 env_path = Path(__file__).parent.parent.parent / '.env'
 load_dotenv(dotenv_path=env_path, override=True)
 
+# After the .env load so a local run can name its version there.
+from apis.shared.build_info import APP_VERSION  # noqa: E402
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -96,6 +99,13 @@ async def lifespan(app: FastAPI):
 
     reconcile_task = asyncio.create_task(run_reconcile_loop())
 
+    # One conditional put per build, so the release ledger knows when this
+    # build went live here (docs/specs/release-ledger.md §5.2). Off the
+    # startup path: a thread, after the app is serving.
+    from apis.shared.costs.deploy_marker import record_deploy_marker
+
+    asyncio.get_running_loop().run_in_executor(None, record_deploy_marker, "app-api")
+
     # Event-loop lag watchdog: one uvicorn worker means synchronous work on the
     # loop stalls every request on this task, /health included. This measures
     # the stall (EventLoopLagMs, alarmed in CDK) so a hang is a number and a
@@ -118,7 +128,7 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app with lifespan
 app = FastAPI(
     title="Agent Core Public Stack - API",
-    version=os.environ.get("APP_VERSION", "unknown"),
+    version=APP_VERSION,
     description="Agent execution and tool orchestration service",
     lifespan=lifespan
 )
@@ -234,6 +244,7 @@ from apis.app_api.sessions.search_routes import router as session_search_router
 from apis.app_api.admin.routes import router as admin_router
 from apis.app_api.models.routes import router as models_router
 from apis.app_api.costs.routes import router as costs_router
+from apis.app_api.quota.routes import router as quota_requests_router
 from apis.app_api.chat.routes import router as chat_router
 from apis.app_api.chat.converse_routes import router as converse_router
 from apis.app_api.chat.proxy_routes import router as bff_chat_proxy_router
@@ -258,6 +269,7 @@ from apis.app_api.assistants.routes import router as assistants_router
 from apis.app_api.agent_designer.routes import router as agents_router
 from apis.app_api.documents.routes import router as documents_router
 from apis.app_api.kb_upgrade.routes import router as kb_upgrade_router
+from apis.app_api.assistants.knowledge_mode import router as knowledge_mode_router
 from apis.app_api.users.routes import router as users_router
 from apis.app_api.user_settings.routes import router as user_settings_router
 from apis.app_api.connectors.routes import router as connectors_router
@@ -291,11 +303,13 @@ app.include_router(admin_router)
 app.include_router(assistants_router)
 app.include_router(agents_router)  # Agent Designer /agents surface; 404s while AGENTS_API_ENABLED off
 app.include_router(documents_router)
+app.include_router(knowledge_mode_router)  # Agent Designer: whole vs searched knowledge base
 app.include_router(kb_upgrade_router)  # Owner-facing KB upgrade card; phase "none" (renders nothing) while MANAGED_KB_MIGRATION_ENABLED is off
 app.include_router(users_router)
 app.include_router(user_settings_router)
 app.include_router(models_router)
 app.include_router(costs_router)
+app.include_router(quota_requests_router)  # /quota/* quota requests; 404s while QUOTA_REQUESTS_ENABLED is off
 app.include_router(chat_router)  # Application-specific chat endpoints
 app.include_router(converse_router)  # API-key authenticated /chat/api-converse (Bedrock Converse)
 app.include_router(bff_chat_proxy_router)  # Cookie-authenticated SSE proxy (Phase 4, dormant until SPA cutover)

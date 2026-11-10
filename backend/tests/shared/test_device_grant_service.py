@@ -9,6 +9,7 @@ claim decides the winner — so stubbing the repository would test nothing.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 import boto3
@@ -66,6 +67,33 @@ def codec() -> CookieCodec:
     )
     c._cipher = AESGCM(b"\x01" * 32)
     return c
+
+
+def serialize_writes(repository: DeviceGrantRepository) -> None:
+    """Make the moto table's writes atomic, as DynamoDB's are.
+
+    moto mutates its in-memory tables with no lock. ``update_item`` evaluates
+    its condition and applies the update as two steps, and
+    ``transact_write_items`` deep-copies every table it touches so it can roll
+    back, so a write on another thread mid-copy raises ``RuntimeError:
+    dictionary changed size during iteration``. One lock across both calls
+    stands in for DynamoDB's atomicity; conditions still decide every outcome.
+    """
+    lock = threading.Lock()
+    real_update_item = repository._table.update_item
+    client = repository._dynamodb.meta.client
+    real_transact_write_items = client.transact_write_items
+
+    def update_item(**kwargs):
+        with lock:
+            return real_update_item(**kwargs)
+
+    def transact_write_items(**kwargs):
+        with lock:
+            return real_transact_write_items(**kwargs)
+
+    repository._table.update_item = update_item
+    client.transact_write_items = transact_write_items
 
 
 @pytest.fixture
@@ -202,8 +230,13 @@ class TestAuthorize:
         assert found.device_code_hash == hash_device_code(auth.device_code)
 
     @pytest.mark.asyncio
-    async def test_concurrent_authorizes_all_succeed(self, service) -> None:
+    async def test_concurrent_authorizes_all_succeed(self, service, grants) -> None:
         """Distinct codes, so the create transaction never contends."""
+        # Each authorize is a transact_write_items on its own thread, and moto
+        # deep-copies the table inside it, so an unlocked insert alongside can
+        # fail the copy. DynamoDB has no such failure; the lock removes moto's.
+        serialize_writes(grants)
+
         results = await asyncio.gather(*(service.authorize() for _ in range(10)))
         assert len({r.device_code for r in results}) == 10
         assert len({r.user_code for r in results}) == 10
@@ -498,7 +531,7 @@ class TestPollClaim:
         assert second.error == "invalid_grant"
 
     @pytest.mark.asyncio
-    async def test_concurrent_polls_hand_over_exactly_one_session(self, service, seeded_session) -> None:
+    async def test_concurrent_polls_hand_over_exactly_one_session(self, service, grants, seeded_session) -> None:
         """The headline property. Two CLIs sharing one session would tumble
         each other's Cognito refresh, which the per-session lock exists to
         prevent — so it must never happen in the first place.
@@ -509,6 +542,10 @@ class TestPollClaim:
         handed over, which is the invariant under test.
         """
         auth, _ = await _authorize_and_approve(service, seeded_session)
+        # Same moto gap as the approval race: its update_item is not atomic
+        # across threads, so the claim's condition could pass for several
+        # callers. The lock stands in for DynamoDB's per-item atomicity.
+        serialize_writes(grants)
 
         results = await asyncio.gather(*(service.poll(device_code=auth.device_code) for _ in range(8)))
 

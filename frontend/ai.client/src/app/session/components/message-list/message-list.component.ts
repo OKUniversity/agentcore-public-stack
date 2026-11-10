@@ -15,6 +15,9 @@ import { BrowserLoginPromptComponent } from './components/browser-login-prompt/b
 import { BrowserPanelComponent } from './components/browser-panel/browser-panel.component';
 import { CompactionSummaryComponent } from './components/compaction-summary/compaction-summary.component';
 import { ArtifactCardComponent } from './components/artifact/artifact-card.component';
+import { HandoffRowComponent } from '../handoff/handoff-row.component';
+import { HandoffStateService } from '../../services/handoff/handoff-state.service';
+import { HandoffView } from '../../services/handoff/handoff.models';
 import { ArtifactPanelComponent } from './components/artifact/artifact-panel.component';
 import { FilePreviewPanelComponent } from './components/file-preview/file-preview-panel.component';
 import { ArtifactStateService } from '../../services/artifacts/artifact-state.service';
@@ -89,12 +92,18 @@ interface Turn {
  * tool call, which is precisely the grouping this component is trying to do,
  * and they start a spurious turn group on top of that.
  *
+ * The stored continue prompt (`continuation`) is scaffolding too: on a model
+ * that refuses assistant prefill, Continue sends a fixed user turn the user
+ * never typed. Rendered, it split one answer into two around a bubble the
+ * user did not write; skipped, the partial and its continuation are one run.
+ *
  * A mid-turn steer is the case this must NOT catch: that is a real user
  * message with real text, and the words on either side of it are answers to
  * different things, so it genuinely should break the run.
  */
 function isProtocolScaffolding(message: Message): boolean {
   if (message.role !== 'user') return false;
+  if (message.continuation) return true;
   return message.content.every((block) => block.type === 'toolResult');
 }
 
@@ -138,6 +147,7 @@ function segmentTurn(messages: readonly Message[]): TurnSegment[] {
     SharedArtifactCardComponent,
     McpAppActionsComponent,
     AgentFeedbackLinkComponent,
+    HandoffRowComponent,
   ],
   templateUrl: './message-list.component.html',
   styleUrl: './message-list.component.css',
@@ -234,6 +244,7 @@ export class MessageListComponent {
   continueRequested = output<void>();
 
   private consentService = inject(OAuthConsentService);
+  private handoffState = inject(HandoffStateService);
   private toolApprovalService = inject(ToolApprovalService);
   private userQuestionService = inject(UserQuestionService);
   private browserLoginService = inject(BrowserLoginService);
@@ -404,11 +415,44 @@ export class MessageListComponent {
       return this.preparingSettled() ? 'Getting ready' : 'Thinking';
     }
 
+    // The model's reasoning summary is streaming right above this line, so
+    // "Waiting for the model" would contradict what the user can read. Like
+    // `hasStreamedText`, this is first-hand from the content stream.
+    if (this.isReasoningNow()) {
+      return 'Reasoning';
+    }
+
     if (phase === 'thinking' && !this.hasStreamedText()) {
       return 'Waiting for the model';
     }
 
     return 'Thinking';
+  });
+
+  /**
+   * Whether the model is mid-reasoning right now: the newest assistant
+   * message ends in a reasoning block with text whose span is still open.
+   *
+   * The LAST block, not any block: once the model moves on to a tool call or
+   * the answer, a new block starts and this goes false, so the label never
+   * claims reasoning while the model is writing tool arguments. The duration
+   * is the stream parser's own "span closed" mark. Only models that stream a
+   * reasoning summary (adaptive Claude with `display: "summarized"`) ever set
+   * this; every other model keeps the labels below.
+   */
+  private readonly isReasoningNow = computed<boolean>(() => {
+    const messages = this.messages();
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role !== 'assistant') continue;
+      const last = message.content[message.content.length - 1];
+      return (
+        last?.type === 'reasoningContent' &&
+        !!last.reasoningContent?.reasoningText?.text?.trim() &&
+        typeof last.reasoningDurationMs !== 'number'
+      );
+    }
+    return false;
   });
 
   /**
@@ -731,6 +775,40 @@ export class MessageListComponent {
   }
 
   // ----------------------------------------------------------------
+  // Handoff rows (handoffs spec §4.3): UI only, never part of the
+  // conversation the model reads. Anchored like artifacts, after the
+  // message that was last when the handoff was sent.
+  // ----------------------------------------------------------------
+
+  private readonly handoffRows = computed<readonly HandoffView[]>(() =>
+    this.handoffState.rowsFor(this.sessionId()),
+  );
+
+  private readonly handoffRowsByMessageIndex = computed<ReadonlyMap<number, HandoffView[]>>(() => {
+    const loaded = this.loadedMessageIndices();
+    const map = new Map<number, HandoffView[]>();
+    for (const row of this.handoffRows()) {
+      if (!loaded.has(row.sourceMessageIndex)) continue;
+      const list = map.get(row.sourceMessageIndex);
+      if (list) list.push(row);
+      else map.set(row.sourceMessageIndex, [row]);
+    }
+    return map;
+  });
+
+  /** Rows whose anchor isn't in the loaded page (or a conversation that was empty), at the tail. */
+  protected readonly unanchoredHandoffRows = computed<readonly HandoffView[]>(() => {
+    const loaded = this.loadedMessageIndices();
+    return this.handoffRows().filter((row) => !loaded.has(row.sourceMessageIndex));
+  });
+
+  protected handoffRowsForMessageId(id: string): readonly HandoffView[] {
+    const n = this.parseMessageIndex(id);
+    if (n === null) return [];
+    return this.handoffRowsByMessageIndex().get(n) ?? [];
+  }
+
+  // ----------------------------------------------------------------
   // Shared-conversation artifacts (recipient view)
   // ----------------------------------------------------------------
 
@@ -792,7 +870,15 @@ export class MessageListComponent {
    *  affordance instead of a silently stalled tool call. */
   protected unanchoredInterrupts = computed<OAuthConsentRequest[]>(() => {
     const ids = new Set(this.messages().map((m) => m.id));
-    return this.consentService.pending().filter((req) => !req.messageId || !ids.has(req.messageId));
+    // Scoped to THIS list's session (handoffs spec §4.3): a handoff's target streams in the
+    // background, and its `oauth_required` anchors to a message id that is never in this list,
+    // so without the session check it rendered here as though this thread were waiting on it.
+    // A list bound to no session keeps the old behaviour.
+    const sessionId = this.sessionId();
+    return this.consentService
+      .pending()
+      .filter((req) => !sessionId || !req.sessionId || req.sessionId === sessionId)
+      .filter((req) => !req.messageId || !ids.has(req.messageId));
   });
 
   /** Pending tool-approval prompts, rendered at the end of the conversation.
@@ -950,7 +1036,8 @@ export class MessageListComponent {
    */
   scrollToLastUserMessage(behavior: ScrollBehavior = 'smooth'): void {
     const msgs = this.messages();
-    const lastUserMsg = [...msgs].reverse().find(m => m.role === 'user');
+    // Scaffolding never renders, so it has no element to scroll to.
+    const lastUserMsg = [...msgs].reverse().find(m => m.role === 'user' && !isProtocolScaffolding(m));
     if (lastUserMsg) {
       this.scrollToMessage(lastUserMsg.id, behavior);
     }

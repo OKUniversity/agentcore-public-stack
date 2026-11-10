@@ -4,6 +4,165 @@ All notable changes to this project are documented in this file. Format follows 
 
 For narrative release notes written for operators and product owners, see [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
+## [1.35.0] - 2026-11-08
+
+Contract redlining in the Word tools is finished: `redline_word_document` inserts and deletes whole tracked paragraphs and can leave changes it cannot place as ACTION NEEDED comments, and a new `compare_word_documents` turns a counterparty's clean revised copy into a redline of the original. All four ship under the existing `WORD_TRACKED_CHANGES_ENABLED` switch with no flag of their own, and grow the Word family's tool spec by about 1,000 tokens (`redline_word_document` 568 → 1,152, `compare_word_documents` 419), one cached `toolConfig` rewrite at deploy for users with the Word tools. The release ledger is complete: read-only admin routes under `/admin/costs/ledger/*`, eval and smoke results published into the ledger, a Releases tab on `/admin/costs`, and a terminal readout script plus `/release-readout` skill. Flags: one new SPA field, `features.releaseLedger` (in development, default off, the SPA half of the existing `RELEASE_LEDGER_ENABLED`); no default changes, none retired. Manual steps: none required; this is the first release prod can turn the ledger on from (runbook in `docs/specs/release-ledger.md` §7.2). No GSI changes; no dependency changes.
+
+### 🚀 Added
+
+- **Release ledger admin API** (behind `RELEASE_LEDGER_ENABLED`, `admin.costs`): `GET /admin/costs/ledger/versions`, `series`, `tools`, `agents`, `projects`, `quality`, `readout` and `export` (NDJSON) over the `LEDGER#` rows; known partitions only, never a scan; TTFT percentiles read from CloudWatch at read time; auth answered before the flag's 404; `/admin/feedback/fleet` gains a `version` arm (#1906)
+- **Eval and smoke results in the ledger.** `eval_harness.py score --publish` writes a `LEDGER#EVAL` row and `smoke_turns.py --publish --prefix <p>` a `LEDGER#SMOKE` row, keyed by the Runtime build that served the turns, idempotent and content-guarded; `smoke_turns.py --auth eval-user` signs in as the seeded eval user (#1908)
+- **Releases tab on `/admin/costs`** (in development, default off: SPA `features.releaseLedger`, the SPA half of `RELEASE_LEDGER_ENABLED`). Version strip, candidate-against-baseline compare header with caveats first, KPI cards, a trend chart with version bands, tools, agents and projects tables, a quality panel with no composite score, and JSON / NDJSON exports (#1921)
+- **`backend/scripts/release_readout.py` and the `/release-readout` skill.** A caveats-first `readout.md` + `readout.json` from the readout route's own handler (or a deployed route, a saved response, or an export), and a skill that turns it into a ship / watch / investigate verdict; the release skill now asks for the outgoing release's readout in each release PR (#1923, #1930)
+- **`redline_word_document` inserts whole paragraphs** (on wherever `WORD_TRACKED_CHANGES_ENABLED` builds the tool; no new flag). A change can give `insert` ("after" / "before") and `paragraphs` instead of `replace`; each new paragraph is a tracked insertion, paragraph mark included, copying the style, numbering and run formatting of the paragraph its `like` names, so a new numbered section or list item takes the next number and Reject All leaves no empty paragraph. Every call now also checks that its edited paragraphs read as before once its own revisions are rejected. The tool spec grows by 285 tokens (568 → 853, Bedrock CountTokens), so the first turn after the deploy rewrites the cached `toolConfig` once for users with the Word tools. Verified in Word for Mac and LibreOffice (#1922)
+- **`redline_word_document` can leave changes it cannot place as comments** (wherever `WORD_TRACKED_CHANGES_ENABLED` builds the tool; no new flag). A new optional `if_unplaced` argument: `"fail"` (the default) keeps the all-or-nothing call, and `"comment"` turns each change the document defeats (wording not found or ambiguous, a hyperlink or field in the way, an overlap) into an "ACTION NEEDED —" comment on the paragraph it most likely meant and saves the rest, listing applied and commented changes apart. Placed changes are written exactly as in `"fail"` mode. The tool spec grows by 151 tokens (853 → 1004, Bedrock CountTokens), so the first turn after the deploy rewrites the cached `toolConfig` once for users with the Word tools (#1924)
+- **`redline_word_document` deletes whole paragraphs** (on wherever `WORD_TRACKED_CHANGES_ENABLED` builds the tool; no new flag). A change can give `delete: "paragraph"`, optionally with `through` (wording of a later paragraph in the same container), instead of `replace`: every run moves into `w:del` and each paragraph mark is a tracked deletion too, so Accept All removes the paragraphs and the list items or sections after them renumber, rather than leaving an empty paragraph that keeps its number. Where no paragraph follows (end of a cell or of the document, before a table) the deletion takes the previous paragraph's mark when the two are formatted alike, and refuses otherwise. The redline self-check (every call) now compares paragraph marks and properties as well as wording. Checked in Word for Mac and LibreOffice. Works with `if_unplaced: "comment"`: a deletion the document defeats becomes its ACTION NEEDED comment, and no comment ever sits in a paragraph whose mark the call deletes. The spec grows 1004 → 1152 tokens (CountTokens), one `toolConfig` rewrite at deploy for users with the Word tools (#1927)
+- **`compare_word_documents` turns a clean revised copy into a redline** (a new Word tool beside `redline_word_document`, under `WORD_TRACKED_CHANGES_ENABLED`; no new flag). Given an original and a revised `.docx` with no tracked changes, it writes the revised wording into a copy of the original as tracked changes by `Counterparty` (or a name the user gives) and returns the list of changes: reworded paragraphs marked word by word in the original's formatting, removed and added paragraphs as whole tracked paragraphs (the same deletions and insertions `redline_word_document` writes), tables with an unchanged grid compared cell by cell, and a comment for what cannot be marked (a changed table grid, a change inside a hyperlink or field). Documents that already have tracked changes are refused. Every call checks that Accept All reads as the revised copy and Reject All as the original. The new spec adds 419 tokens (Bedrock CountTokens; the Word family 2,928 → 3,347) to `toolConfig`, one rewrite of the cached prefix at deploy for users with the Word tools. Verified in Word for Mac and LibreOffice (#1929)
+
+### 🐛 Fixed
+
+- The release-ledger backfill could count a live-ledgered turn twice, because a cost row's timestamp precedes `firstLiveAt`; live writes now mark the `C#` row `ledgered: true` in the same `put_item`, and the backfill never adds a marked row (#1904)
+
+### 🏗️ Infrastructure
+
+- `ReleaseLedgerMetricsRead` (`cloudwatch:GetMetricData`) on the existing app-api managed policy, only while `CDK_RELEASE_LEDGER_ENABLED` is on; `backend/evals/tool_spec_tokens.json` copied into the app-api image (#1906)
+
+### 🔧 CI/CD
+
+- The nightly dev eval job also runs the turn smoke matrix as the eval user, and both publish into dev's ledger where `CDK_RELEASE_LEDGER_ENABLED` is on; the summary gains a "Turn Smoke (dev)" row (#1908)
+
+### 📚 Docs
+
+- `docs/specs/word-tracked-changes.md` §3a–§3d and §4a–§4d (insertions, unplaced comments, deletions, compare); `docs/specs/eval-harness.md` §15 (phase 2 coverage across surfaces) and §16 (phase 3 Evaluations page) (#1926); `docs/specs/release-ledger.md` §5.4, §6.5, §7.1–§7.2; CLAUDE.md says when a change does not need its own feature flag (#1925)
+
+## [1.34.0] - 2026-11-07
+
+Long document work on Claude Opus 5.5 stops failing: reasoning streams as a summary instead of a silent gap that hit the 120 s read timeout, the read timeout itself is 600 s, Continue sends a user turn on models that refuse an assistant prefill, a conversation stays within Bedrock's five non-PDF documents, duplicate attachment names are avoided across turns, a tool round's page reads fit one Memory event, a young conversation compacts at the hard ceiling, and the Opus 5.5 output default is 64K. Agents gain a response-strictness setting, a `knowledge_files` tool and a Designer mode line; the Word tools can run a bound skill's script; the composer shows the attachment budget before send; knowledge-base uploads accept 50 MB; admins search users by fragment; API-key callers get prompt caching; and a release ledger stamps every image and cost row. Flags: four in development, default off (`AGENT_KNOWLEDGE_FILES_ENABLED`, `WORD_SKILL_SCRIPTS_ENABLED`, `CONVERSE_DOCUMENTS_AS_TEXT_ENABLED`, `RELEASE_LEDGER_ENABLED`, plus SPA `features.knowledgeBaseMode`) and three default-on rollout switches (`CONVERSE_DOCUMENT_CAP_ENABLED`, `INLINE_BUDGET_BY_REFERENCE_ENABLED`, `AGENTCORE_MEMORY_COMPACTION_TAIL_TOKEN_BOUND_ENABLED`). Manual step: run `backfill_model_output_caps.py` on every environment that already has Claude Opus 5.5 in its catalog. No GSI changes; no dependency changes.
+
+### 🚀 Added
+
+- **Response strictness on Agents** (issue #112). `responseStrictness` (`strict` / `balanced` / `flexible`) appends a grounding rule to the Agent's instructions; balanced leaves the prompt byte-identical; part of version snapshots and the marketplace review diff (#1891)
+- **`knowledge_files` for Agents** (in development, default off: `AGENT_KNOWLEDGE_FILES_ENABLED` / `CDK_AGENT_KNOWLEDGE_FILES_ENABLED`, Runtime only; on in our production). A non-project Agent lists its Knowledge and reads one document by name when the knowledge base is too large to send whole (#1915)
+- **Knowledge-base mode line** (in development: SPA `features.knowledgeBaseMode`). `GET /assistants/{id}/knowledge-base/mode` tells an author whether the knowledge base is sent whole or searched, and why, including which single document is over the budget (#1915, #1917)
+- **Word tools run a bound skill's script** (in development, default off: `WORD_SKILL_SCRIPTS_ENABLED` / `CDK_WORD_SKILL_SCRIPTS_ENABLED`, Runtime only). `create_word_document` and `modify_word_document` accept `skill_name`, `path` and `params` and run the skill's `scripts/*.py` inside Code Interpreter instead of the model retyping it (#1914)
+- **Documents as text on Converse** (in development, default off: `CONVERSE_DOCUMENTS_AS_TEXT_ENABLED` / `CDK_CONVERSE_DOCUMENTS_AS_TEXT_ENABLED`, Runtime only; on in our `development` and `production` environments). docx, txt, md, csv and html attachments reach a Converse model as rendered text; PDFs stay native; stored messages unchanged (#1907)
+- **Release ledger** (in development, default off: `RELEASE_LEDGER_ENABLED` / `CDK_RELEASE_LEDGER_ENABLED`). `APP_VERSION` / `APP_BUILD` baked into every image and stamped on cost rows, EMF records, `/health`, `/ping` and eval runs; a `LEDGER#DEPLOY` marker per build; `turnOutcome` and `emptyAnswer` on `C#` rows; tool census payload sizes; `LEDGER#VERSION` and monthly `LEDGER#MODEL` / `TOOL` / `AGENT` / `PROJECT` rollups while on (#1888, #1898, #1899)
+- **Composer shows the combined attachment budget before send.** Files that will not fit a message's 7 MB inline budget are named before the send, and an over-budget document is read by reference instead of dropped (rollout switch `INLINE_BUDGET_BY_REFERENCE_ENABLED`, default on) (#1912)
+- **Prompt caching on `/chat/api-converse`.** A `cachePoint` after the system prompt and after the last message, so API-key callers pay cache-read rates for a repeated prompt and a client-held conversation (#1889)
+- **Admin user search by fragment.** `GET /admin/users/search` and `GET /admin/users/domains/list` rank exact, prefix, contains, all-words and typo matches from a per-task in-memory index bounded by `ADMIN_USER_INDEX_MAX_ROWS` (issue #1874) (#1885)
+- **Knowledge-base uploads up to 50 MB** on managed knowledge bases. One server-side limit, `KB_UPLOAD_MAX_FILE_BYTES` from `CDK_KB_UPLOAD_MAX_FILE_BYTES` (default 52,428,800, the Bedrock per-file limit); the SPA reads it as `kbUsage.maxFileBytes`; classic knowledge bases keep their 20 MB processing limit (#1916)
+- `.sql` files accepted as chat attachments and knowledge-base files (issue #1883) (#1887)
+- Pin and Unpin in the conversation title menu (#1884)
+- Two CloudWatch alarms: `model-read-timeouts` and `chat-stream-upstream-drops` (#1895)
+
+### ✨ Improved
+
+- **Claude Opus 5.5 writes up to 64,000 output tokens per call by default** (was 32,000; the card allows 128,000). Applies to newly added catalog rows; an existing row changes with `backfill_model_output_caps.py` or an admin edit under Admin → Models. Haiku 5.5 stays at 32,000 because of its 100K input price step (#1911)
+- A response cut at the output limit says so, in the chat and in the `max_tokens` `stream_error`: "Cut off at the model's output limit. Continue picks up where it stopped." (#1911)
+- **Opus 5.5 and Haiku 5.5 stream summarized reasoning** with the `drop_block` binding, so a long think no longer sits silent; measured as no prompt-cache re-write (#1890)
+- Reasoning block redrawn as a tool-rail sibling with a shared shimmer that honours reduced motion; the loading label reads "Reasoning" (#1890)
+- Chat markdown typography tightened; code-block colours follow light and dark themes (#1879)
+- A spreadsheet or deck no longer disqualifies a knowledge base from full-context mode; the budget is settable from CDK as `CDK_ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS` (#1915)
+- A tool round's `document_read` page reads share `DOCUMENT_READ_MAX_BATCH_BYTES` (7 MB) so one Memory event never exceeds its 10 MB quota; `next_start` continues the range (#1900)
+- Compaction's protected tail is bounded by tokens and a young conversation cuts at the hard ceiling (rollout switch `AGENTCORE_MEMORY_COMPACTION_TAIL_TOKEN_BOUND_ENABLED`, default on) (#1910)
+
+### 🐛 Fixed
+
+- "Agent force-stopped: … Read timed out" on long Opus 5.5 turns: `RETRY_READ_TIMEOUT` 120 → 600 s, app-api proxy read 660 s, read timeouts no longer retried, and the error names the phase it failed in (#1895)
+- A follow-up queued during a turn that then failed was sent on its own; it now returns to the composer with a "Follow-up not sent" toast, and the empty assistant bubble a failed call left behind is dropped (#1913)
+- Continue failed on Claude 4.6 and later ("does not support assistant message prefill") and restarted the answer on GPT Responses models; both now send a fixed user turn (#1903, #1909)
+- After Continue, the continued answer no longer splits around a user bubble the user never typed, and message ids stay aligned with the server; `GET /sessions/{id}/messages` marks the continue prompt `continuation: true` (#1911)
+- Two same-named attachments across turns force-stopped every later turn on a warm agent; names are now unique across the live conversation (#1902)
+- "You can't include more than 5 documents in a request" on a warm conversation: a per-call projection keeps the first five non-PDF documents native and sends the rest as text or a stub (rollout switch `CONVERSE_DOCUMENT_CAP_ENABLED`, default on) (#1905)
+- Admin User Lookup matched only a whole email address (#1885)
+- 403 toasts on the tools pages for tools the user cannot reach, and request URLs in toast details (issue #1873) (#1884)
+- A `.sql` upload got a 403 from S3; the PUT now uses the presigned Content-Type (#1887)
+- A knowledge-base object refused for size after passing presign stayed in S3 until its agent was deleted; the ingestion consumer now deletes it (#1918)
+- The Designer mode line mislabelled a single oversized document as having no text (#1917)
+- Test flakes: the device-grant authorize test's moto transaction race and an unbounded MCP session-heal turn (#1896, #1901)
+
+### ⚠️ Changed
+
+- `RETRY_READ_TIMEOUT` defaults to 600 s (was 120); the app-api proxy read timeout is 660 s (was 300); a read timeout is no longer retried. A deployment that pinned `RETRY_READ_TIMEOUT` keeps its value (#1895)
+- Opus 5.5 and Haiku 5.5 requests always carry a `thinking` dict (`summarized`, `drop_block`) unless the caller set one (#1890)
+- A Converse request is projected per call for the document cap, so the wire request can differ from the stored message (#1905)
+- The knowledge-base per-file limit is 50 MiB by default (was 10 MB in the SPA); `CDK_KB_UPLOAD_MAX_FILE_BYTES=10485760` restores the old limit (#1916)
+
+### 🔒 Security
+
+- Error toast details no longer expose request URLs; admin user search returns generic error detail (#1884, #1885)
+
+### 🏗️ Infrastructure
+
+- Two new CloudWatch alarms in `AiPathAlarmsConstruct`, threshold `CDK_OBSERVABILITY_CHAT_STREAM_DROP_THRESHOLD` (default 5/h) for the drop alarm (#1895)
+- The kb-migration ingestion consumer gains `s3:DeleteObject*` on `assistants/*/documents/*`, the only IAM change (#1918)
+- New CDK config: `agentKnowledgeFiles`, `wordSkillScripts`, `converseDocumentsAsText`, `releaseLedger`, `assistantKbFullContext.maxTokens`, `managedKb.uploadMaxFileBytes` (1..50 MiB, synth fails otherwise). New Runtime variables are written only while on, so the default spends none of the Runtime's 2,560-byte environment budget (#1907, #1914, #1915, #1916, #1899)
+- Every container image rebuilds on this release: `VERSION` joins each image's hash manifest and `APP_VERSION` / `APP_BUILD` are build args (#1888)
+
+### 🔧 CI/CD
+
+- `build-one.sh` passes `APP_VERSION` and `APP_BUILD` build args; `build-and-push-if-changed.sh` substitutes the content hash; `load-env.sh` and `platform.yml` forward `CDK_ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS`, `CDK_AGENT_KNOWLEDGE_FILES_ENABLED`, `CDK_RELEASE_LEDGER_ENABLED`, `CDK_WORD_SKILL_SCRIPTS_ENABLED`, `CDK_CONVERSE_DOCUMENTS_AS_TEXT_ENABLED`, `CDK_KB_UPLOAD_MAX_FILE_BYTES`, `CDK_OBSERVABILITY_CHAT_STREAM_DROP_THRESHOLD` (#1888, #1895, #1907, #1914, #1915, #1916, #1899)
+
+### 📚 Docs
+
+- New spec `docs/specs/release-ledger.md`; compaction thresholds §3.2; document-context-offload, skill-creator and turn-path-ttft updates; a force-stop row in `docs/testing/smoke-regression.md`; docs-site pages for models, users, feature flags, agents, API keys and knowledge bases; kaizen research 2026-11-06 (#1886, #1888, #1899, #1910, #1913, #1914, #1915, #1916)
+
+## [1.33.0] - 2026-11-04
+
+Ask for more quota, hand work off with a model-written brief, see the account's AWS limits, and turn meetings into GitHub Project items. Every new feature is behind an in-development flag, off by default. Roles gain system instructions, Haiku 5.5 is curated, and app-api's DynamoDB grants are prefix-scoped. No GSI changes; no backfills.
+
+### 🚀 Added
+
+- **Quota requests, extensions and chargeback** (in development: `QUOTA_REQUESTS_ENABLED` / `CDK_QUOTA_REQUESTS_ENABLED`, `features.quotaRequests`). Users request more quota from the composer, the blocked state or Settings → Usage; admins grant additive extensions that stack on the resolved tier, and a chargeback report closes its ledger lazily. app-api only (#1813, #1815, #1821, #1829, #1831)
+- **Handoffs, SPA and brief** (in development: `HANDOFFS_ENABLED`, `features.handoffs`; `HANDOFF_BRIEF_ENABLED` / `CDK_HANDOFF_BRIEF_ENABLED`, `features.handoffBrief`). Review sheet, background send and handoff row; a brief the source's own model writes from its prompt cache; relayed prompts; inbox entries and browser notifications (#1748, #1849, #1854, #1859, #1863)
+- **AWS Limits admin page** (in development: `AWS_LIMITS_ENABLED` / `CDK_AWS_LIMITS_ENABLED`, `features.awsLimits`). Service Quotas with usage, 7-day peaks, Bedrock model usage and increase requests; Service Quotas IAM exists only while on (#1842, #1866, #1875)
+- **Meeting transcripts to GitHub issues** (in development: `MEETING_TASKS_ENABLED` / `CDK_MEETING_TASKS_ENABLED`, Runtime only). Tool families `google_calendar_meetings`, `zoom_meeting_transcripts`, `github_issues_local`, seeded off and not public (#1822, #1836, #1840)
+- **Project file readiness** (in development: `PROJECT_FILE_READINESS_ENABLED` / `CDK_PROJECT_FILE_READINESS_ENABLED`, `features.projectFileReadiness`). A strip above a project composer and a per-turn note naming files the model cannot see yet (#1838, #1839)
+- **AgentCore Web Search as a Gateway connector**, and a default of 5 results behind `WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED` / `CDK_WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED` (in development, Runtime only) (#1819, #1817)
+- **Role system instructions.** `AppRole.system_instruction` (8,000 chars) composed into plain chats between the base prompt and the active mode; admin role editor field (#1864)
+- **Claude Haiku 5.5 curated**, with the preserved-thinking `drop_block` binding (#1853)
+- Connector picker offers all 24 AgentCore OAuth vendors; Entra tenant ID on Microsoft connectors; the OAuth connector picker on built-in tools (#1867, #1830)
+- Delegated admins: a models admin can add a curated model; a read-only role list feeds role pickers (#1857, #1858)
+- Eval harness: large-document cases, judge model controls, orphan sweep, nightly track against dev, Haiku 5.5 baseline (#1810, #1812, #1820, #1865)
+
+### ✨ Improved
+
+- Handoff brief input is billed at the prompt-cache read rate (#1849)
+- AWS Limits starts on Adjustable only with a Hide unused toggle (#1875)
+- `resolve_turn_agent` and the prompt-composition phases extracted from the inference route (#1847)
+
+### 🐛 Fixed
+
+- A new Agent's or Project's files no longer wait up to 15 minutes at "Setting up"; the first upload invokes the migration worker directly (#1837)
+- Reading a project file that is not ready returns a result instead of failing the call; the readiness strip counts failures, keeps polling and passes AA contrast in dark mode (#1839, #1841)
+- A quota decision shows at once; a revoked extension on an approved request is labelled (#1816)
+- A cancelled handoff brief is metered as an estimate (#1856); the notification bell no longer under-counts (#1862)
+- Admins are told why AgentCore rejected a connector config; the connector list is no longer stale across tasks (#1871, #1872)
+- Sidebar session lists get their own drop-list ids, so dragging works with pinned Agents (#1823)
+- Nightly teardown retries a failed stack delete; `destroy.sh` empties buckets itself; `log_success` defined in `managed-kb.sh` (#1844, #1808)
+
+### ⚠️ Changed
+
+- A client-supplied `system_prompt` on `/chat/stream` is ignored outside `preview-` sessions (#1864)
+- The local GitHub tool family id is `github_issues_local` (#1836)
+
+### 🔒 Security
+
+- Dependabot alerts patched (`pyasn1`, `@hono/node-server`); unused `authlib` removed (#1848)
+
+### 🏗️ Infrastructure
+
+- app-api's DynamoDB grants are scoped by table-name prefix and the Runtime's are compacted; expect ~30–40 s of `AccessDenied` on the role while the policy propagates (#1806)
+- Four SSM parameters nothing read are dropped
+
+### 📦 Dependencies
+
+- `strands-agents` 1.61.1 → 1.63.0 (#1850); `aws-opentelemetry-distro` 0.19.0 → 0.22.0; `pyasn1` 0.6.4 → 0.6.5
+
+### 📚 Docs
+
+- Docs-site and README rewritten for a public-sector audience; new specs for quota requests, the handoff brief, meeting tasks, spoken audio, and rewind's long-term-memory residue (#1855, #1860, #1861)
+
 ## [1.32.0] - 2026-10-30
 
 The terminal client becomes a first-class way in: `aps-tui` signs in with the same session as the browser (device authorization), holds a real conversation with the agent, reaches projects, Agents, skills and saved conversations, and can run tools on the user's own machine with their approval. Conversations can be rewound to an earlier message or forked from one (in development, default off; on in our dev and prod environments). Every skill bound on a Shared Project now runs for every member, and the agent can list and read a project's Files by name. Agents can be duplicated and pinned to the sidebar. Two production app-api task deaths are fixed at the root (a PDFium crash and a 3.5-minute event-loop block), with a faster health check and a new event-loop lag alarm around them. An evaluation harness drives a golden set through dev and scores it against a committed baseline. **Three things need attention:** the load balancer now accepts traffic only from CloudFront (`CDK_ALB_RESTRICT_TO_CLOUDFRONT`, default on), one backfill (`backfill_project_skill_adders.py`) must be run on each environment with projects, and the bootstrap seed should be re-run so the `web_research` skill picks up its new description. New flags: `SESSION_REWIND_ENABLED` and `SESSION_FORK_ENABLED` (default off; set on in `development` and `production`). No GSI changes.

@@ -87,12 +87,28 @@ describe('buildAppApiEnvironment — session prewarm', () => {
   });
 });
 
+describe('buildAppApiEnvironment — quota requests', () => {
+  it('forwards the flag, off by default', () => {
+    const off = buildAppApiEnvironment(createMockConfig(), stubParams());
+    expect(off.QUOTA_REQUESTS_ENABLED).toBe('false');
+
+    const on = buildAppApiEnvironment(createMockConfig({ quotaRequests: { enabled: true } }), stubParams());
+    expect(on.QUOTA_REQUESTS_ENABLED).toBe('true');
+  });
+
+  it('forwards the AWS Limits flag, off by default', () => {
+    expect(buildAppApiEnvironment(createMockConfig(), stubParams()).AWS_LIMITS_ENABLED).toBe('false');
+    const on = buildAppApiEnvironment(createMockConfig({ awsLimits: { enabled: true } }), stubParams());
+    expect(on.AWS_LIMITS_ENABLED).toBe('true');
+  });
+});
+
 describe('buildAppApiEnvironment — handoffs', () => {
   it('forwards the flag, off by default', () => {
     const off = buildAppApiEnvironment(createMockConfig(), stubParams());
     expect(off.HANDOFFS_ENABLED).toBe('false');
 
-    const on = buildAppApiEnvironment(createMockConfig({ handoffs: { enabled: true } }), stubParams());
+    const on = buildAppApiEnvironment(createMockConfig({ handoffs: { enabled: true, briefEnabled: false } }), stubParams());
     expect(on.HANDOFFS_ENABLED).toBe('true');
   });
 });
@@ -131,6 +147,14 @@ describe('buildAppApiEnvironment — source provenance', () => {
       stubParams(),
     );
     expect(on.SOURCE_PROVENANCE_ENABLED).toBe('true');
+  });
+});
+
+describe('buildAppApiEnvironment — release ledger', () => {
+  it('forwards the flag, off by default', () => {
+    expect(buildAppApiEnvironment(createMockConfig(), stubParams()).RELEASE_LEDGER_ENABLED).toBe('false');
+    const on = buildAppApiEnvironment(createMockConfig({ releaseLedger: { enabled: true } }), stubParams());
+    expect(on.RELEASE_LEDGER_ENABLED).toBe('true');
   });
 });
 
@@ -257,5 +281,20 @@ describe('buildAppApiEnvironment — born-managed (NEW_DEFAULT)', () => {
     const off = buildAppApiEnvironment(createMockConfig(), stubParams());
     expect(off.MANAGED_KB_NEW_DEFAULT).toBe('false');
     expect(Object.keys(off)).toContain('MANAGED_KB_NEW_DEFAULT');
+  });
+});
+
+describe('buildAppApiEnvironment — knowledge-base per-file upload limit', () => {
+  it('forwards KB_UPLOAD_MAX_FILE_BYTES, 50 MiB by default', () => {
+    const env = buildAppApiEnvironment(createMockConfig(), stubParams());
+    expect(env.KB_UPLOAD_MAX_FILE_BYTES).toBe('52428800');
+  });
+
+  it('forwards an operator-lowered limit unchanged', () => {
+    const base = createMockConfig();
+    const config = createMockConfig({
+      managedKb: { ...base.managedKb, uploadMaxFileBytes: 10 * 1024 * 1024 },
+    });
+    expect(buildAppApiEnvironment(config, stubParams()).KB_UPLOAD_MAX_FILE_BYTES).toBe('10485760');
   });
 });

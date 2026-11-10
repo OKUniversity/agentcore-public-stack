@@ -368,18 +368,53 @@ changed). Then do the backmerge (§7).
 branch's code is already deployed there. Run the smoke pass
 (`docs/testing/smoke-regression.md`, the `/smoke-regression` skill) and the eval
 harness's full golden set as the eval user, then paste the `score` table into the
-PR body. A `GATE: FAIL` is a release blocker until `--explain` shows why:
+PR body. A `GATE: FAIL` is a release blocker until `--explain` shows why.
+
+Run it once for **each model that is the catalog default in some environment**.
+Each has its own committed baseline in `backend/evals/baselines/`. Haiku 5.5 has
+been dev's default since 2026-11-04, and prod stays on Haiku 4.5 until a release
+carries the Haiku 5.5 row and an admin makes it the default there:
 
 ```bash
 cd backend
-AWS_PROFILE=dev-ai uv run python scripts/eval_harness.py run --out /tmp/eval-release-x.y.z \
-    --auth cognito --base-url https://dev.boisestate.ai/api --prefix dev-boisestateai-v2 \
-    --model-id us.anthropic.claude-haiku-4-5-20251001-v1:0 --yes
-uv run python scripts/eval_harness.py score --out /tmp/eval-release-x.y.z
+for model in us.anthropic.claude-haiku-5-5 us.anthropic.claude-haiku-4-5-20251001-v1:0; do
+  AWS_PROFILE=dev-ai uv run python scripts/eval_harness.py run --out /tmp/eval-release-x.y.z-${model} \
+      --auth cognito --base-url https://dev.boisestate.ai/api --prefix dev-boisestateai-v2 \
+      --model-id "${model}" --yes
+  uv run python scripts/eval_harness.py score --out /tmp/eval-release-x.y.z-${model}
+done
 ```
 
 Re-promote the baseline (`eval_harness.py baseline`) only on purpose — after a
 deliberate model or prompt change — in its own PR with the score output.
+
+**Ledger readout of the outgoing release.** The smoke pass and the eval say
+whether this branch works; the release ledger says whether the release *now
+being replaced* quietly cost more or answered worse than the one before it,
+over every real turn. Run the `/release-readout` skill for the outgoing release
+against its predecessor (cutting `1.35.0`: candidate `1.34.0`, baseline
+`1.33.0`) and paste its `readout.md` plus the one-word verdict (ship / watch /
+investigate) into the release PR body under a **Ledger readout** heading. So
+each release PR carries the previous release's verdict, and a reviewer sees a
+trend before the next one ships.
+
+```bash
+cd backend
+AWS_PROFILE=dev-ai .venv/bin/python scripts/release_readout.py \
+    --profile dev-ai --prefix dev-boisestateai-v2 \
+    --version <outgoing> --baseline <the release before it> --out /tmp/readout-<outgoing>
+```
+
+- **Which environment.** Prod's ledger once `RELEASE_LEDGER_ENABLED` is on there
+  and backfilled (`docs/specs/release-ledger.md` §7.2), since prod is where the
+  outgoing release actually ran as itself; until then, dev, and say so in the
+  PR. On dev the outgoing version label covers every `develop` merge since it
+  was cut, not one image.
+- **Content-free.** The markdown already labels agents and projects by rank;
+  never add a session id, user id or title to it. Don't pass `--show-ids` for
+  a PR body.
+- **Not a gate.** An **investigate** verdict is a reason to look before
+  merging, not a CI failure: read the skill's §4 and decide with the user.
 
 ---
 
@@ -502,8 +537,9 @@ don't use them; prefer plain text over fragile intra-doc anchors.
 
 **Before finalizing:** `sync-version.sh --check` passes, the three gate scripts
 pass (§1–§1c), the notes carry a **Feature flags** table and a **Manual steps**
-section (each may say "none"), and both docs lead with the new version above the
-untouched previous entries.
+section (each may say "none"), both docs lead with the new version above the
+untouched previous entries, and the PR body carries the outgoing release's
+**Ledger readout** (§2).
 
 ---
 

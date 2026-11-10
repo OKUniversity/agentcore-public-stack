@@ -121,7 +121,7 @@ between B11 and B12 and the `preparing`/`prepared` frames are never sent.
 | `registry` | `create_default_registry` (imports; sympy behind `calculator`), `ToolFilter`, `_register_external_mcp_tools`: a `ThreadPoolExecutor` + fresh event loop + `asyncio.run`, **one `get_tool` GetItem per enabled tool** (uncached; `repository.get_tool` is a direct `get_item`). | C ×N | 50 |
 | `session_mgr` | `SessionFactory.create_session_manager`: `load_memory_config`; **`_discover_strategy_ids`** (`MemoryClient(region)` → 2 clients on a fresh session, then a control-plane `get_memory_strategies` call; `lru_cache` per process, so **once per fresh process = once per conversation**); retrieval config; `TurnBasedSessionManager(...)` → SDK ctor builds **`MemoryClient()` (fresh session + 2 clients) and then a second fresh session + 2 clients that replace the first pair**; Strands `RepositorySessionManager.__init__` → `read_session` (**1 `ListEvents`, 2 on a new session** via the legacy fallback) → `create_session` (**1 `CreateEvent`** on a new session). | 4 parses, M ×2–3 | 616–830 |
 | `tools` | `filter_tools_extended`; gateway: `_expand_gateway_tool_ids` (executor + `asyncio.run`, `get_tool` per gateway id) and `get_gateway_client_if_enabled` (client object; started later by Strands); external MCP: capture contextvars, executor + `asyncio.run` → `load_external_tools`: `get_tool` per server, `create_external_mcp_client`, **`await client.load_tools()` per server, serially** = `MCPClient.start()` (a background thread with its own loop, HTTP `initialize`) + `tools/list`; OAuth pre-flight recovery; `extra_tools` appended. | C ×N, MCP ×servers | **2039** (62% of the build) with **one** server on dev — undecomposed |
-| `hooks` | Eleven hooks constructed (no IO). | — | 0 |
+| `hooks` | Eleven hooks constructed (no IO); a twelfth, `WebSearchDefaultsHook`, only while `WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED` is on. | — | 0 |
 | `plugins` | Skills runtime (skill records if any), `build_tool_result_offloader`. | 0–1 | 13 |
 | `finalize` (#1377 splits it into `strands_agent` + `finalize`) | `AgentFactory.create_agent`: `CountTokensBedrockModel` → Strands `BedrockModel` → **fresh `boto3.Session()` + `bedrock-runtime` client (another parse)**; `Agent(...)`: tool registry `process_tools` (MCP clients register as consumers; `load_tools` is a no-op because the pre-flight primed the cache); `AgentInitializedEvent` → `TurnBasedSessionManager.initialize` → SDK `read_agent` (**1–2 `ListEvents`**, skipped on a new session) → `list_messages` (**1 `ListEvents`, `MAX_FETCH_ALL`**) → converter → document-byte strip → sanitize → compaction (`_load_compaction_state`: **1 DynamoDB GSI read**; possibly `_retrieve_session_summaries`) → pairing repair. New session: `create_agent` `CreateEvent`. Then `_adopt_session_conversation`, snapshot stamping, cache insert. | 1 parse, M ×2–3, D ×1 | 194 |
 
@@ -605,6 +605,17 @@ the network half is unmeasured. Expected on dev: ≈0 on a follow-up (the `Query
 `tools` stage), and on a first turn at most the downloads less that same window. Read
 `agent_build.kb_full_context` on dev before turning it on anywhere else.
 
+*P3b″. Project file readiness (`PROJECT_FILE_READINESS_ENABLED`, default off).* A Shared
+Project harness turn (not a resume or continuation) also starts `load_file_status_note` at the
+project gate, beside the member note: one `Query` for the harness's `DOC#` rows, run in a
+thread. It is awaited only at message assembly in the stream, after the agent build, so its
+round trip overlaps the KB search and the build and adds nothing before the first token unless
+the `Query` outlasts both. Its result is a `<project_files_status>` block appended to the user
+message, or nothing when every file is ready; it never reaches the system prompt or
+`toolConfig`. It reads the rows separately from `load_full_kb_context`, which costs a second
+small `Query` on project turns while both flags are on; sharing one listing would couple the
+two loaders for no measurable gain.
+
 *Tests.* P3a: a fake session factory and a fake tool loader that each sleep; assert the
 build's wall time is the max not the sum, that `tools` order is unchanged across runs
 (`test_prompt_cache_determinism.py` already pins order), and that a failure in either thread
@@ -830,6 +841,10 @@ In the order the V2 spec gives, with two additions from this map:
   `MCPSessionHealHook` probes the MCP client's session (~1–2µs on top of Strands' ~1.6µs
   dispatch of any callback pair) and reconnects only a session that already died, off the
   loop, on the call that would otherwise fail.
+  `WebSearchDefaultsHook` (only while `WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED` is on) pays
+  a string suffix test per call (~0.1µs), plus a dict copy on a `___WebSearch` call that
+  names no `maxResults` (~0.3µs; both measured 2026-10-31, local). It replaces `event.tool_use` instead of writing into it, because that dict
+  is the `toolUse` block already in history.
 - Nothing in P2–P5 touches the prompt, `toolConfig` or restored history. If a change here
   ever needs to, it is a different spec.
 
@@ -945,7 +960,7 @@ Three instruments, each blind where another sees. Read the user-facing one first
 How the client metric is recorded (`apis/app_api/telemetry/routes.py`, `TurnTimingService` in the SPA):
 - One `POST /telemetry/turn-timing` per send, after the first token has arrived, fire-and-forget. A turn that ends before its first token, a resume and a "Continue" report nothing.
 - Recorded as EMF under metric names, not dimensions, like every EMF caller here: `ClientFirstTokenMs` on every turn; `ClientFirstTurnFirstTokenMs` or `ClientFollowUpFirstTokenMs`; and, for first turns, `ClientFirstTurnWarmedFirstTokenMs` or `ClientFirstTurnColdFirstTokenMs`. A first turn starts its Runtime session and a follow-up usually finds it running, so one percentile over both moves whenever the mix does.
-- Properties for Logs Insights on the app-api log group: `modelId` (the selected model, even when the request omits it as the default), `warmAgeMs` (time since this tab prewarmed the conversation, or null), `hasAgent`, `hasFiles`, `visible`. No message content, user id or session id.
+- Properties for Logs Insights on the app-api log group: `modelId` (the selected model, even when the request omits it as the default), `warmAgeMs` (time since this tab prewarmed the conversation, or null), `hasAgent`, `hasFiles`, `visible`, `spaVersion` (the bundle that measured it). Every EMF record, on every namespace, also carries the emitting service's `appVersion` and `build` (`docs/specs/release-ledger.md` D1), so a percentile can be read per version without a dimension. No message content, user id or session id.
 - A turn is "first" when this tab knows the conversation as new and it has no messages, so an existing conversation sent to before its history loads stays a follow-up.
 
 How the probe runs (`apis/app_api/telemetry/ttft_probe.py`, `TtftProbeConstruct`):
@@ -999,6 +1014,14 @@ Next, in this order, each its own PR:
 
 1. The assistant block (B8) into `resolve_agent_turn(...)` returning either a refusal to
    stream or the resolved instructions/overrides/citations, with its writes moved per P4.
+   *Done as `resolve_turn_agent` (2026-11-03)*, with the same order and the same awaits:
+   access, version snapshot, the use writes (skippable with `record_use=False`), the
+   project gate and its two tasks, `resolve_agent_invocation` and the full-context load.
+   Binding validation stays ahead of it, and the KB search, `compose_turn_system_prompt`
+   (steps 5–5a), the project-memory await and binding persistence follow it. The custom
+   prompt and plain-turn personal instructions are `apply_turn_prompt_extras`. Split out
+   so a handoff brief resolves the agent a turn would (agent-handoffs-and-consults.md
+   §4.5.1). The P4 write moves are still open.
 2. The build's three sync→async bridges (F8) into one `run_blocking_async(coro)` helper
    with the contextvar capture in one place.
 3. `stream_with_quota_warning` and `_guarded_stream` into a `TurnStream` object that owns

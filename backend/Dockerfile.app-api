@@ -72,6 +72,10 @@ RUN useradd -m -u 1000 -s /bin/bash appuser
 # is the regression guard; if it fails, this image stops booting.
 COPY --from=builder /app/.venv /app/.venv
 COPY backend/src /app/src
+# The committed per-tool spec-token measurement, read by the release ledger's
+# tools table (apis/shared/costs/ledger_reader.spec_tokens resolves
+# /app/evals/ from /app/src/). Hashed as a manifest in build-one.sh.
+COPY backend/evals/tool_spec_tokens.json /app/evals/tool_spec_tokens.json
 
 # Precompile our own source the same way the venv was (see UV_COMPILE_BYTECODE
 # above). `-q` keeps the layer log quiet; a syntax error still fails the build,
@@ -83,9 +87,13 @@ RUN python -m compileall -q /app/src
 # Switch to non-root user
 USER appuser
 
-# Version injection (defaults to "unknown" if not provided via --build-arg)
+# Version injection (defaults to "unknown" if not provided via --build-arg).
+# APP_BUILD is the image's own content-hash tag; scripts/build/build-one.sh
+# passes both. Baked, not a Runtime variable: docs/specs/release-ledger.md D2.
 ARG APP_VERSION=unknown
+ARG APP_BUILD=unknown
 ENV APP_VERSION=${APP_VERSION}
+ENV APP_BUILD=${APP_BUILD}
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

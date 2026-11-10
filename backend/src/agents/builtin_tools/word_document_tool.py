@@ -16,6 +16,9 @@ Tools
 * ``redline_word_document`` — propose edits as tracked changes and comments.
   Built only while ``WORD_TRACKED_CHANGES_ENABLED`` is on; stdlib, no Code
   Interpreter (``office/docx_redline.py``).
+* ``compare_word_documents`` — write a revised copy's differences into the
+  original as tracked changes. Built with the redline tool, while
+  ``WORD_TRACKED_CHANGES_ENABLED`` is on; stdlib (``office/docx_compare.py``).
 
 (A page-screenshot/preview tool is intentionally omitted: rasterizing a
 .docx requires LibreOffice/poppler, which the Python-only Code Interpreter
@@ -46,7 +49,23 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from strands import tool
 
-from agents.builtin_tools.office.docx_redline import Change, RedlineError, redline
+from agents.builtin_tools.office.docx_compare import DEFAULT_AUTHOR, NoDifferences, compare
+from agents.builtin_tools.office.docx_redline import (
+    IF_UNPLACED,
+    Change,
+    NewParagraph,
+    RedlineError,
+    RedlineResult,
+    redline,
+)
+from agents.main_agent.skills.skill_scripts import (
+    SkillScript,
+    SkillScriptError,
+    TurnSkillRecords,
+    attach_turn_skill_records,
+    load_skill_script,
+    parse_script_params,
+)
 from agents.builtin_tools.office._storage import (
     _DocGenError,
     _ci_exec,
@@ -89,6 +108,92 @@ _DOCX_PREAMBLE = (
     "from docx.shared import Pt, RGBColor, Inches\n"
     "from docx.enum.text import WD_ALIGN_PARAGRAPH\n"
 )
+
+
+# Sandbox path a skill script is written to. A fixed name, not the skill's
+# filename: "redline-engine.py" is not an importable module name, and a fixed
+# name means two skills' scripts can never collide on one sandbox session.
+_SANDBOX_SKILL_SCRIPT = "_skill_script.py"
+
+# What a skill script prints, or returns from ``run``, reaches the model. It is
+# a per-turn payload that stays in history, so it is bounded.
+_MAX_SCRIPT_OUTPUT_CHARS = 4_000
+
+
+def _skill_script_entry(label: str, params_json: str) -> str:
+    """The fixed code that runs a skill script against ``doc``.
+
+    Loads the file written at :data:`_SANDBOX_SKILL_SCRIPT` as a module (by
+    path, so nothing depends on ``sys.path``), then calls its
+    ``run(doc, params)``. ``doc`` is the document the tool opened or created;
+    ``run`` edits it in place and may return a short text summary, which is
+    printed so it comes back as the sandbox's stdout. ``params_json`` is
+    already JSON text (``parse_script_params``) and is embedded as a string
+    literal, never as code.
+    """
+    return (
+        "import importlib.util as _skill_ilu\n"
+        "import json as _skill_json\n"
+        f"_skill_spec = _skill_ilu.spec_from_file_location('_skill_script', {_SANDBOX_SKILL_SCRIPT!r})\n"
+        "_skill_mod = _skill_ilu.module_from_spec(_skill_spec)\n"
+        "_skill_spec.loader.exec_module(_skill_mod)\n"
+        "if not callable(getattr(_skill_mod, 'run', None)):\n"
+        f"    raise RuntimeError({label + ' defines no run(doc, params) function.'!r})\n"
+        f"_skill_result = _skill_mod.run(doc, _skill_json.loads({params_json!r}))\n"
+        "if _skill_result is not None:\n"
+        "    print(_skill_result if isinstance(_skill_result, str) "
+        "else _skill_json.dumps(_skill_result, default=str))\n"
+    )
+
+
+def _run_docx_skill_script(
+    code_interpreter_id: str,
+    script: Any,
+    params_json: str,
+    filename: str,
+    source_bytes: Optional[bytes] = None,
+) -> Tuple[bytes, str]:
+    """Run a skill script on a new (``source_bytes`` None) or loaded document.
+
+    The script's bytes are written into the sandbox as a file and executed
+    there only; the Runtime host never imports or compiles them. Returns the
+    document bytes and the script's bounded output. Blocking — call via
+    ``asyncio.to_thread``.
+    """
+    from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
+
+    code_interpreter = CodeInterpreter(_region())
+    code_interpreter.start(identifier=code_interpreter_id)
+    try:
+        if source_bytes is not None:
+            _ci_write_bytes(code_interpreter, _SANDBOX_SOURCE, source_bytes)
+            opener = f"doc = Document({_SANDBOX_SOURCE!r})\n"
+        else:
+            opener = "doc = Document()\n"
+        _ci_write_bytes(code_interpreter, _SANDBOX_SKILL_SCRIPT, script.source)
+        output = _ci_exec(
+            code_interpreter,
+            (
+                f"{_DOCX_PREAMBLE}\n"
+                f"{opener}\n"
+                f"{_skill_script_entry(script.label, params_json)}\n"
+                f"doc.save({filename!r})\n"
+            ),
+        )
+        data = _ci_read_bytes(code_interpreter, filename)
+        if data is None:
+            raise _DocGenError(
+                f"Document '{filename}' was not produced by {script.label}."
+            )
+        output = output.strip()
+        if len(output) > _MAX_SCRIPT_OUTPUT_CHARS:
+            output = output[:_MAX_SCRIPT_OUTPUT_CHARS] + " … (output truncated)"
+        return data, output
+    finally:
+        try:
+            code_interpreter.stop()
+        except Exception:  # pragma: no cover - cleanup best-effort
+            pass
 
 
 def _generate_docx_bytes(
@@ -244,8 +349,234 @@ async def _find_word_document(
 # ---------------------------------------------------------------------------
 
 
-def make_create_word_document_tool(session_id: str, user_id: str):
-    """Create a ``create_word_document`` tool bound to the given identity."""
+def _script_call_problem(
+    python_code: Optional[str],
+    skill_name: Optional[str],
+    path: Optional[str],
+    params: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Why a flag-on call's arguments cannot run, or ``None``.
+
+    Exactly one source of code: ``python_code``, or ``skill_name`` + ``path``.
+    """
+    wants_script = bool(skill_name) or bool(path)
+    if python_code and wants_script:
+        return (
+            "❌ Pass either `python_code` or `skill_name` + `path`, not both. "
+            "Use the skill script alone; put its inputs in `params`."
+        )
+    if wants_script and not (skill_name and path):
+        return "❌ Running a skill script needs both `skill_name` and `path`."
+    if not wants_script and not python_code:
+        return "❌ Pass `python_code`, or `skill_name` + `path` to run a skill's script."
+    if params is not None and not wants_script:
+        return "❌ `params` is only used with a skill script (`skill_name` + `path`)."
+    return None
+
+
+async def _load_script(
+    skill_records: TurnSkillRecords,
+    skill_name: str,
+    path: str,
+    params: Optional[Dict[str, Any]],
+) -> Tuple[Optional[SkillScript], str, Optional[Dict[str, Any]]]:
+    """``(script, params_json, error)``: the skill script resolved on this turn's skills."""
+    try:
+        params_json = parse_script_params(params)
+        script = await asyncio.to_thread(
+            load_skill_script, skill_records.records, skill_name, path
+        )
+    except SkillScriptError as exc:
+        return None, "", _error(f"❌ {exc}")
+    return script, params_json, None
+
+
+def _script_details(script: Optional[SkillScript], output: str) -> str:
+    """The download card's extra sentence naming the skill file that ran."""
+    if script is None:
+        return ""
+    details = f"Ran skill script {script.label}."
+    return f"{details} Its output: {output}" if output else details
+
+
+async def _create_word_document(
+    session_id: str,
+    user_id: str,
+    document_name: str,
+    python_code: Optional[str],
+    skill_records: Optional[TurnSkillRecords] = None,
+    skill_name: Optional[str] = None,
+    path: Optional[str] = None,
+    params: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """``create_word_document``'s body, from python-docx code or a skill script."""
+    is_valid, error_msg = _validate_document_name(document_name)
+    if not is_valid:
+        return _error(
+            f"❌ Invalid document name '{document_name}': {error_msg}\n\n"
+            "Examples: sales-report, Q4_analysis, report-final"
+        )
+
+    filename = f"{document_name}.docx"
+    code_interpreter_id = _get_code_interpreter_id()
+    if not code_interpreter_id:
+        return _error(_NO_CI_MESSAGE)
+    if not _storage_configured():
+        return _error(_NO_STORAGE_MESSAGE)
+
+    script: Optional[SkillScript] = None
+    params_json = "{}"
+    if skill_records is not None and (skill_name or path):
+        script, params_json, problem = await _load_script(
+            skill_records, skill_name or "", path or "", params
+        )
+        if problem is not None:
+            return problem
+
+    output = ""
+    try:
+        if script is None:
+            file_bytes = await asyncio.to_thread(
+                _generate_docx_bytes, code_interpreter_id, python_code or "", filename
+            )
+        else:
+            file_bytes, output = await asyncio.to_thread(
+                _run_docx_skill_script, code_interpreter_id, script, params_json, filename
+            )
+    except _DocGenError as exc:
+        hint = (
+            "Check the python-docx code for errors."
+            if script is None
+            else f"The error came from skill script {script.label}."
+        )
+        return _error(
+            f"❌ Failed to create '{filename}'.\n\n```\n{exc}\n```\n\n{hint}"
+        )
+    except Exception as exc:  # noqa: BLE001 - surface any sandbox error
+        logger.error(f"create_word_document sandbox error: {exc}")
+        return _error(f"❌ Failed to create '{filename}': {exc}")
+
+    try:
+        upload_id, size_kb = await _store_document(
+            user_id, session_id, filename, file_bytes, _DOCX_MIME
+        )
+    except Exception as exc:  # noqa: BLE001 - storage failure is terminal
+        logger.error(f"create_word_document storage error: {exc}")
+        return _error(f"❌ Created '{filename}' but failed to save it: {exc}")
+
+    return _download_card(
+        filename, upload_id, size_kb, "Created", _script_details(script, output)
+    )
+
+
+async def _modify_word_document(
+    session_id: str,
+    user_id: str,
+    document_name: str,
+    python_code: Optional[str],
+    output_name: Optional[str],
+    skill_records: Optional[TurnSkillRecords] = None,
+    skill_name: Optional[str] = None,
+    path: Optional[str] = None,
+    params: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """``modify_word_document``'s body, from python-docx code or a skill script."""
+    code_interpreter_id = _get_code_interpreter_id()
+    if not code_interpreter_id:
+        return _error(_NO_CI_MESSAGE)
+    if not _storage_configured():
+        return _error(_NO_STORAGE_MESSAGE)
+
+    source = await _find_word_document(user_id, session_id, document_name)
+    if source is None:
+        return _error(
+            f"❌ No Word document named '{document_name}' was found in this "
+            "chat. Use list_word_documents to see what's available."
+        )
+
+    out_base = output_name or source.filename
+    if out_base.lower().endswith(".docx"):
+        out_base = out_base[: -len(".docx")]
+    is_valid, error_msg = _validate_document_name(out_base)
+    if not is_valid:
+        return _error(
+            f"❌ Invalid output name '{out_base}': {error_msg}"
+        )
+    output_filename = f"{out_base}.docx"
+
+    script: Optional[SkillScript] = None
+    params_json = "{}"
+    if skill_records is not None and (skill_name or path):
+        script, params_json, problem = await _load_script(
+            skill_records, skill_name or "", path or "", params
+        )
+        if problem is not None:
+            return problem
+
+    output = ""
+    try:
+        source_bytes = await asyncio.to_thread(
+            _download_s3_bytes, source.s3_bucket, source.s3_key
+        )
+        if script is None:
+            file_bytes = await asyncio.to_thread(
+                _modify_docx_bytes,
+                code_interpreter_id,
+                source_bytes,
+                python_code or "",
+                output_filename,
+            )
+        else:
+            file_bytes, output = await asyncio.to_thread(
+                _run_docx_skill_script,
+                code_interpreter_id,
+                script,
+                params_json,
+                output_filename,
+                source_bytes,
+            )
+    except _DocGenError as exc:
+        hint = (
+            "Check the python-docx code for errors."
+            if script is None
+            else f"The error came from skill script {script.label}."
+        )
+        return _error(
+            f"❌ Failed to modify '{source.filename}'.\n\n```\n{exc}\n```\n\n{hint}"
+        )
+    except Exception as exc:  # noqa: BLE001 - surface any sandbox error
+        logger.error(f"modify_word_document error: {exc}")
+        return _error(f"❌ Failed to modify '{source.filename}': {exc}")
+
+    try:
+        upload_id, size_kb = await _store_document(
+            user_id, session_id, output_filename, file_bytes, _DOCX_MIME
+        )
+    except Exception as exc:  # noqa: BLE001 - storage failure is terminal
+        logger.error(f"modify_word_document storage error: {exc}")
+        return _error(
+            f"❌ Modified '{source.filename}' but failed to save it: {exc}"
+        )
+
+    return _download_card(
+        output_filename, upload_id, size_kb, "Updated", _script_details(script, output)
+    )
+
+
+def make_create_word_document_tool(
+    session_id: str,
+    user_id: str,
+    skill_records: Optional[TurnSkillRecords] = None,
+):
+    """Create a ``create_word_document`` tool bound to the given identity.
+
+    ``skill_records`` is passed only while ``WORD_SKILL_SCRIPTS_ENABLED`` is
+    on: the tool then also accepts ``skill_name`` / ``path`` / ``params`` and
+    runs a bound skill's script in Code Interpreter. Without it the spec is
+    the one this tool has always had.
+    """
+    if skill_records is not None:
+        return _make_create_with_skill_scripts(session_id, user_id, skill_records)
 
     @tool
     async def create_word_document(
@@ -305,48 +636,118 @@ def make_create_word_document_tool(session_id: str, user_id: str):
             An inline download card. The document is also saved to this
             chat's Files.
         """
-        is_valid, error_msg = _validate_document_name(document_name)
-        if not is_valid:
-            return _error(
-                f"❌ Invalid document name '{document_name}': {error_msg}\n\n"
-                "Examples: sales-report, Q4_analysis, report-final"
-            )
-
-        filename = f"{document_name}.docx"
-        code_interpreter_id = _get_code_interpreter_id()
-        if not code_interpreter_id:
-            return _error(_NO_CI_MESSAGE)
-        if not _storage_configured():
-            return _error(_NO_STORAGE_MESSAGE)
-
-        try:
-            file_bytes = await asyncio.to_thread(
-                _generate_docx_bytes, code_interpreter_id, python_code, filename
-            )
-        except _DocGenError as exc:
-            return _error(
-                f"❌ Failed to create '{filename}'.\n\n```\n{exc}\n```\n\n"
-                "Check the python-docx code for errors."
-            )
-        except Exception as exc:  # noqa: BLE001 - surface any sandbox error
-            logger.error(f"create_word_document sandbox error: {exc}")
-            return _error(f"❌ Failed to create '{filename}': {exc}")
-
-        try:
-            upload_id, size_kb = await _store_document(
-                user_id, session_id, filename, file_bytes, _DOCX_MIME
-            )
-        except Exception as exc:  # noqa: BLE001 - storage failure is terminal
-            logger.error(f"create_word_document storage error: {exc}")
-            return _error(f"❌ Created '{filename}' but failed to save it: {exc}")
-
-        return _download_card(filename, upload_id, size_kb, "Created")
+        return await _create_word_document(session_id, user_id, document_name, python_code)
 
     return create_word_document
 
 
-def make_modify_word_document_tool(session_id: str, user_id: str):
-    """Create a ``modify_word_document`` tool bound to the given identity."""
+def _make_create_with_skill_scripts(
+    session_id: str, user_id: str, skill_records: TurnSkillRecords
+):
+    @tool
+    async def create_word_document(
+        document_name: str,
+        python_code: Optional[str] = None,
+        skill_name: Optional[str] = None,
+        path: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Create a new Word (.docx) document using python-docx code or a skill's script.
+
+        Executes python-docx code, or a Python script that ships with an
+        active skill, in a sandboxed Code Interpreter to build a document
+        from scratch, saves it to the user's files, and returns a
+        download card. Great for structured reports with headings,
+        paragraphs, tables, and matplotlib charts.
+
+        Available libraries in the sandbox: python-docx, matplotlib, pandas,
+        numpy.
+
+        Args:
+            python_code: python-docx code that builds the document. Omit it
+                when running a skill's script (skill_name + path). A blank
+                document is already available as ``doc = Document()`` — do NOT
+                call ``Document()`` or ``doc.save()`` yourself; the tool saves
+                it for you. ``Pt``, ``RGBColor``, ``Inches`` and
+                ``WD_ALIGN_PARAGRAPH`` are already imported.
+
+                Example:
+                    doc.add_heading('Quarterly Report', level=1)
+                    doc.add_paragraph('Revenue increased by 15%...')
+                    table = doc.add_table(rows=2, cols=2)
+                    table.style = 'Light Grid Accent 1'
+                    table.rows[0].cells[0].text = 'Quarter'
+                    # ALWAYS bold a header row this way. A table style's
+                    # own header emphasis is conditional formatting that
+                    # not every viewer applies, so set it on the runs:
+                    for cell in table.rows[0].cells:
+                        for run in cell.paragraphs[0].runs:
+                            run.bold = True
+
+                To embed a chart, save a PNG with matplotlib then insert it:
+                    import matplotlib.pyplot as plt
+                    plt.figure(figsize=(8, 5))
+                    plt.bar(['Q1', 'Q2'], [100, 120])
+                    plt.savefig('chart.png', dpi=200, bbox_inches='tight')
+                    plt.close()
+                    doc.add_picture('chart.png', width=Inches(6))
+
+                Start a major section on a fresh page with an explicit
+                break -- python-docx does no layout, so a document that
+                should be several pages contains no page boundaries at
+                all unless you add them:
+                    doc.add_page_break()
+                    doc.add_heading('Appendix A', level=1)
+
+            skill_name: Instead of python_code, run a Python script that ships
+                with an active skill: the skill's name (as in
+                ``<available_skills>``). Use this whenever a skill provides a
+                script for the job: do NOT copy the script into python_code.
+            path: The script's path from the skill's file listing, e.g.
+                ``scripts/engine.py``. Only files under ``scripts/`` can run.
+                The script runs in the same sandbox, must define
+                ``run(doc, params)``, edits ``doc`` in place and may return a
+                short summary, which comes back to you.
+            params: Optional object passed to the script's ``run`` as
+                ``params`` (for example which playbook or clauses to apply).
+                Keep it small; at most 16 KB as JSON.
+
+            document_name: File name WITHOUT extension (.docx is added
+                automatically). Use only letters, numbers, hyphens, and
+                underscores (e.g. "sales-report", "Q4_analysis").
+
+        Returns:
+            An inline download card. The document is also saved to this
+            chat's Files.
+        """
+        problem = _script_call_problem(python_code, skill_name, path, params)
+        if problem:
+            return _error(problem)
+        return await _create_word_document(
+            session_id,
+            user_id,
+            document_name,
+            python_code,
+            skill_records=skill_records,
+            skill_name=skill_name,
+            path=path,
+            params=params,
+        )
+
+    return attach_turn_skill_records(create_word_document, skill_records)
+
+
+def make_modify_word_document_tool(
+    session_id: str,
+    user_id: str,
+    skill_records: Optional[TurnSkillRecords] = None,
+):
+    """Create a ``modify_word_document`` tool bound to the given identity.
+
+    ``skill_records``: as for :func:`make_create_word_document_tool`.
+    """
+    if skill_records is not None:
+        return _make_modify_with_skill_scripts(session_id, user_id, skill_records)
 
     @tool
     async def modify_word_document(
@@ -380,62 +781,81 @@ def make_modify_word_document_tool(session_id: str, user_id: str):
         Returns:
             An inline download card for the edited document.
         """
-        code_interpreter_id = _get_code_interpreter_id()
-        if not code_interpreter_id:
-            return _error(_NO_CI_MESSAGE)
-        if not _storage_configured():
-            return _error(_NO_STORAGE_MESSAGE)
-
-        source = await _find_word_document(user_id, session_id, document_name)
-        if source is None:
-            return _error(
-                f"❌ No Word document named '{document_name}' was found in this "
-                "chat. Use list_word_documents to see what's available."
-            )
-
-        out_base = output_name or source.filename
-        if out_base.lower().endswith(".docx"):
-            out_base = out_base[: -len(".docx")]
-        is_valid, error_msg = _validate_document_name(out_base)
-        if not is_valid:
-            return _error(
-                f"❌ Invalid output name '{out_base}': {error_msg}"
-            )
-        output_filename = f"{out_base}.docx"
-
-        try:
-            source_bytes = await asyncio.to_thread(
-                _download_s3_bytes, source.s3_bucket, source.s3_key
-            )
-            file_bytes = await asyncio.to_thread(
-                _modify_docx_bytes,
-                code_interpreter_id,
-                source_bytes,
-                python_code,
-                output_filename,
-            )
-        except _DocGenError as exc:
-            return _error(
-                f"❌ Failed to modify '{source.filename}'.\n\n```\n{exc}\n```\n\n"
-                "Check the python-docx code for errors."
-            )
-        except Exception as exc:  # noqa: BLE001 - surface any sandbox error
-            logger.error(f"modify_word_document error: {exc}")
-            return _error(f"❌ Failed to modify '{source.filename}': {exc}")
-
-        try:
-            upload_id, size_kb = await _store_document(
-                user_id, session_id, output_filename, file_bytes, _DOCX_MIME
-            )
-        except Exception as exc:  # noqa: BLE001 - storage failure is terminal
-            logger.error(f"modify_word_document storage error: {exc}")
-            return _error(
-                f"❌ Modified '{source.filename}' but failed to save it: {exc}"
-            )
-
-        return _download_card(output_filename, upload_id, size_kb, "Updated")
+        return await _modify_word_document(
+            session_id, user_id, document_name, python_code, output_name
+        )
 
     return modify_word_document
+
+
+def _make_modify_with_skill_scripts(
+    session_id: str, user_id: str, skill_records: TurnSkillRecords
+):
+    @tool
+    async def modify_word_document(
+        document_name: str,
+        python_code: Optional[str] = None,
+        output_name: Optional[str] = None,
+        skill_name: Optional[str] = None,
+        path: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Modify an existing Word (.docx) document with python-docx code or a skill's script.
+
+        Loads a document previously created in this chat, runs your
+        python-docx code (or a Python script that ships with an active skill)
+        against it, and saves the result (as a new file so the original is
+        preserved). Returns a download card.
+
+        Use ``list_word_documents`` first if you are unsure of the exact name.
+
+        Args:
+            document_name: Name of the existing document to edit (with or
+                without the .docx extension), e.g. "sales-report".
+            python_code: python-docx code that edits the document. Omit it
+                when running a skill's script (skill_name + path). The loaded
+                document is available as ``doc = Document(...)`` — do NOT call
+                ``Document()`` or ``doc.save()`` yourself. ``Pt``, ``RGBColor``,
+                ``Inches`` and ``WD_ALIGN_PARAGRAPH`` are already imported.
+
+                Example (append a section):
+                    doc.add_heading('Addendum', level=1)
+                    doc.add_paragraph('Updated figures for Q2.')
+
+            output_name: Optional name (without extension) for the edited copy.
+                Defaults to the source name (a new versioned copy is saved).
+            skill_name: Instead of python_code, run a Python script that ships
+                with an active skill: the skill's name (as in
+                ``<available_skills>``). Use this whenever a skill provides a
+                script for the job: do NOT copy the script into python_code.
+            path: The script's path from the skill's file listing, e.g.
+                ``scripts/engine.py``. Only files under ``scripts/`` can run.
+                The script runs in the same sandbox, must define
+                ``run(doc, params)``, edits ``doc`` in place and may return a
+                short summary, which comes back to you.
+            params: Optional object passed to the script's ``run`` as
+                ``params`` (for example which playbook or clauses to apply).
+                Keep it small; at most 16 KB as JSON.
+
+        Returns:
+            An inline download card for the edited document.
+        """
+        problem = _script_call_problem(python_code, skill_name, path, params)
+        if problem:
+            return _error(problem)
+        return await _modify_word_document(
+            session_id,
+            user_id,
+            document_name,
+            python_code,
+            output_name,
+            skill_records=skill_records,
+            skill_name=skill_name,
+            path=path,
+            params=params,
+        )
+
+    return attach_turn_skill_records(modify_word_document, skill_records)
 
 
 def _parse_changes(changes: Any) -> Tuple[List[Change], List[str]]:
@@ -464,11 +884,58 @@ def _parse_changes(changes: Any) -> Tuple[List[Change], List[str]]:
         if occurrence is not None and (isinstance(occurrence, bool) or not isinstance(occurrence, int)):
             problems.append(f"{label}: `occurrence` must be a whole number.")
             continue
-        parsed.append(Change(find, replace, comment, occurrence))
+        if raw.get("delete") is not None or raw.get("through") is not None:
+            delete, through = raw.get("delete"), raw.get("through")
+            if raw.get("insert") is not None or raw.get("paragraphs") is not None:
+                problems.append(f"{label}: give `insert` or `delete`, not both.")
+                continue
+            if delete is not None and not isinstance(delete, str):
+                problems.append(f'{label}: `delete` must be "paragraph".')
+                continue
+            if through is not None and not isinstance(through, str):
+                problems.append(f"{label}: `through` must be text.")
+                continue
+            if isinstance(delete, str):
+                delete = delete.strip().lower()
+                delete = "paragraph" if delete == "paragraphs" else delete
+            parsed.append(Change(find, replace, comment, occurrence, delete=delete, through=through))
+            continue
+        if raw.get("insert") is None and raw.get("paragraphs") is None:
+            parsed.append(Change(find, replace, comment, occurrence))
+            continue
+        insert = raw.get("insert")
+        new, problem = _parse_new_paragraphs(raw.get("paragraphs"), label)
+        if problem:
+            problems.append(problem)
+            continue
+        if not isinstance(insert, str):
+            problems.append(f'{label}: `insert` must be "after" or "before".')
+            continue
+        parsed.append(Change(find, replace, comment, occurrence, insert.strip().lower(), new))
     return parsed, problems
 
 
-def _default_redline_name(source_base: str) -> str:
+def _parse_new_paragraphs(raw: Any, label: str) -> Tuple[Tuple[NewParagraph, ...], Optional[str]]:
+    """``paragraphs`` as :class:`NewParagraph` objects; a bare string is its ``text``."""
+    if not isinstance(raw, list) or not raw:
+        return (), f"{label}: `paragraphs` must be a non-empty list of {{text, like?, lead?}}."
+    out: List[NewParagraph] = []
+    for number, item in enumerate(raw, 1):
+        if isinstance(item, str):
+            item = {"text": item}
+        if not isinstance(item, dict):
+            return (), f"{label}: new paragraph {number} must be an object with `text`."
+        text, like, lead = item.get("text"), item.get("like"), item.get("lead")
+        if not isinstance(text, str):
+            return (), f"{label}: new paragraph {number} needs `text`."
+        for name, value in (("like", like), ("lead", lead)):
+            if value is not None and not isinstance(value, str):
+                return (), f"{label}: new paragraph {number}'s `{name}` must be text."
+        out.append(NewParagraph(text, like, lead))
+    return tuple(out), None
+
+
+def _default_redline_name(source_base: str, suffix: str = "redline") -> str:
     """``<source>-redline``, reduced to what ``_validate_document_name`` accepts.
 
     Real file names carry spaces and punctuation ("Q3 Budget (draft)"), and
@@ -479,7 +946,87 @@ def _default_redline_name(source_base: str) -> str:
     """
     ascii_base = unicodedata.normalize("NFKD", source_base).encode("ascii", "ignore").decode()
     safe = re.sub(r"[^A-Za-z0-9_]+", "-", ascii_base).strip("-")
-    return f"{safe or 'document'}-redline"
+    return f"{safe or 'document'}-{suffix}"
+
+
+async def _redline_word_document(
+    session_id: str,
+    user_id: str,
+    user_name: Optional[str],
+    document_name: str,
+    changes: Any,
+    author: Optional[str],
+    output_name: Optional[str],
+    if_unplaced: Any = "fail",
+) -> Any:
+    if not _storage_configured():
+        return _error(_NO_STORAGE_MESSAGE)
+
+    parsed, problems = _parse_changes(changes)
+    mode = if_unplaced.strip().lower() if isinstance(if_unplaced, str) else None
+    if mode not in IF_UNPLACED:
+        problems.append('`if_unplaced` must be "fail" or "comment".')
+    if problems:
+        return _error("❌ Nothing was changed:\n" + "\n".join(f"- {p}" for p in problems))
+
+    source = await _find_word_document(user_id, session_id, document_name)
+    if source is None:
+        return _error(
+            f"❌ No Word document named '{document_name}' was found in this "
+            "chat. Use list_word_documents to see what's available."
+        )
+
+    source_base = source.filename[: -len(".docx")] if source.filename.lower().endswith(".docx") else source.filename
+    out_base = output_name or _default_redline_name(source_base)
+    if out_base.lower().endswith(".docx"):
+        out_base = out_base[: -len(".docx")]
+    is_valid, error_msg = _validate_document_name(out_base)
+    if not is_valid:
+        return _error(f"❌ Invalid output name '{out_base}': {error_msg}")
+    output_filename = f"{out_base}.docx"
+    reviewer = (author or user_name or "").strip() or "Reviewer"
+
+    try:
+        source_bytes = await asyncio.to_thread(
+            _download_s3_bytes, source.s3_bucket, source.s3_key
+        )
+        result = await asyncio.to_thread(redline, source_bytes, parsed, reviewer, None, mode)
+    except RedlineError as exc:
+        return _error(
+            f"❌ Nothing was changed in '{source.filename}':\n"
+            + "\n".join(f"- {p}" for p in exc.problems)
+        )
+    except Exception as exc:  # noqa: BLE001 - surface any read/parse error
+        logger.error(f"redline_word_document error: {exc}")
+        return _error(f"❌ Failed to redline '{source.filename}': {exc}")
+
+    try:
+        upload_id, size_kb = await _store_document(
+            user_id, session_id, output_filename, result.docx, _DOCX_MIME
+        )
+    except Exception as exc:  # noqa: BLE001 - storage failure is terminal
+        logger.error(f"redline_word_document storage error: {exc}")
+        return _error(
+            f"❌ Redlined '{source.filename}' but failed to save it: {exc}"
+        )
+
+    return _download_card(output_filename, upload_id, size_kb, "Redlined", _redline_details(reviewer, result))
+
+
+def _redline_details(reviewer: str, result: RedlineResult) -> str:
+    """What the call did: the applied changes, then (``if_unplaced="comment"``)
+    the ones left as ACTION NEEDED comments, so a read-back fixes only those."""
+    if not result.commented:
+        return f"Tracked changes by {reviewer}: " + "; ".join(result.applied) + "."
+    applied = (
+        f"Tracked changes by {reviewer}: " + "; ".join(result.applied) + "."
+        if result.applied
+        else "No change could be placed."
+    )
+    return (
+        f"{applied} Not placed, left as ACTION NEEDED comments ({len(result.commented)}): "
+        + "; ".join(result.commented)
+    )
 
 
 def make_redline_word_document_tool(session_id: str, user_id: str, user_name: Optional[str]):
@@ -488,7 +1035,10 @@ def make_redline_word_document_tool(session_id: str, user_id: str, user_name: Op
     Built only while ``WORD_TRACKED_CHANGES_ENABLED`` is on
     (``docs/specs/word-tracked-changes.md`` §3). ``user_name`` is the default
     author of each revision: a redline goes back to the counterparty as the
-    user's.
+    user's. Changes can also insert whole paragraphs (§3a) and delete them,
+    paragraph marks included (§3c), and ``if_unplaced="comment"`` leaves the
+    ones it cannot place as ACTION NEEDED comments (§3b); its default keeps the
+    all-or-nothing call.
     """
 
     @tool
@@ -497,6 +1047,7 @@ def make_redline_word_document_tool(session_id: str, user_id: str, user_name: Op
         changes: List[Dict[str, Any]],
         author: Optional[str] = None,
         output_name: Optional[str] = None,
+        if_unplaced: str = "fail",
     ) -> Any:
         """Propose edits to a Word (.docx) document as tracked changes and comments.
 
@@ -506,8 +1057,11 @@ def make_redline_word_document_tool(session_id: str, user_id: str, user_name: Op
         Reviewing pane and can be accepted or rejected. The original is kept;
         the redline is saved as a new file and returned as a download card.
 
-        All or nothing: if any change cannot be placed, nothing is saved and
-        the error names each problem, so fix those changes and call again.
+        All or nothing by default: if any change cannot be placed, nothing is
+        saved and the error names each problem, so fix those changes and call
+        again. With if_unplaced="comment", each change that cannot be placed
+        becomes an "ACTION NEEDED" comment on the paragraph it most likely
+        meant, and the rest are saved.
 
         Args:
             document_name: The document to mark up (with or without .docx),
@@ -524,65 +1078,195 @@ def make_redline_word_document_tool(session_id: str, user_id: str, user_name: Op
                 - comment: optional comment on the change, or on `find` alone
                   when there is no `replace`.
                 - occurrence: 1-based, only when `find` appears more than once.
+                To add whole paragraphs (a new section, list item or clause),
+                give these instead of `replace`:
+                - insert: "after" or "before" the paragraph `find` is in.
+                - paragraphs: the new paragraphs in order, each {"text": ...,
+                  "like"?: ..., "lead"?: ...}. `like` is wording from the
+                  paragraph whose style, numbering and font to copy (default:
+                  the `find` paragraph), so one like a numbered heading or
+                  list item takes the next number; where numbers are typed,
+                  write the number in `text`. `lead` is an inline heading
+                  such as "Survival." in that paragraph's lead-in format.
+                  A `comment` goes on the `find` paragraph. Example, a new
+                  section after section 7: {"find": "<words from section 7's
+                  last paragraph>", "insert": "after", "paragraphs":
+                  [{"text": "Survival", "like": "<words of a section
+                  heading>"}, {"text": "Sections 4 and 5 survive..."}]}
+                To remove whole paragraphs, give instead of `replace`:
+                - delete: "paragraph" removes the paragraph `find` is in,
+                  paragraph mark included, so the list items or sections
+                  after it renumber once accepted. Prefer it to replace ""
+                  when a whole item, clause or section goes.
+                - through: optional wording from a later paragraph in the
+                  same part of the document (body, cell); every paragraph
+                  from `find`'s through the first after it containing this
+                  is removed, e.g. a section from heading to last paragraph.
+                  A `comment` is placed beside the deletion.
             author: Name shown on each change. Defaults to the user's name.
             output_name: File name for the redline, without extension.
                 Defaults to "<document_name>-redline".
+            if_unplaced: "fail" (default) or "comment". Prefer "comment" for
+                more than a few changes, so one wrong `find` costs no re-send
+                of the rest. To fix a commented change, call again on the saved
+                redline with just that change.
 
         Returns:
-            A download card for the redline and one line per change applied.
+            A download card for the redline, one line per change applied and,
+            with "comment", one per change left as a comment.
         """
-        if not _storage_configured():
-            return _error(_NO_STORAGE_MESSAGE)
-
-        parsed, problems = _parse_changes(changes)
-        if problems:
-            return _error("❌ Nothing was changed:\n" + "\n".join(f"- {p}" for p in problems))
-
-        source = await _find_word_document(user_id, session_id, document_name)
-        if source is None:
-            return _error(
-                f"❌ No Word document named '{document_name}' was found in this "
-                "chat. Use list_word_documents to see what's available."
-            )
-
-        source_base = source.filename[: -len(".docx")] if source.filename.lower().endswith(".docx") else source.filename
-        out_base = output_name or _default_redline_name(source_base)
-        if out_base.lower().endswith(".docx"):
-            out_base = out_base[: -len(".docx")]
-        is_valid, error_msg = _validate_document_name(out_base)
-        if not is_valid:
-            return _error(f"❌ Invalid output name '{out_base}': {error_msg}")
-        output_filename = f"{out_base}.docx"
-        reviewer = (author or user_name or "").strip() or "Reviewer"
-
-        try:
-            source_bytes = await asyncio.to_thread(
-                _download_s3_bytes, source.s3_bucket, source.s3_key
-            )
-            result = await asyncio.to_thread(redline, source_bytes, parsed, reviewer)
-        except RedlineError as exc:
-            return _error(
-                f"❌ Nothing was changed in '{source.filename}':\n"
-                + "\n".join(f"- {p}" for p in exc.problems)
-            )
-        except Exception as exc:  # noqa: BLE001 - surface any read/parse error
-            logger.error(f"redline_word_document error: {exc}")
-            return _error(f"❌ Failed to redline '{source.filename}': {exc}")
-
-        try:
-            upload_id, size_kb = await _store_document(
-                user_id, session_id, output_filename, result.docx, _DOCX_MIME
-            )
-        except Exception as exc:  # noqa: BLE001 - storage failure is terminal
-            logger.error(f"redline_word_document storage error: {exc}")
-            return _error(
-                f"❌ Redlined '{source.filename}' but failed to save it: {exc}"
-            )
-
-        details = f"Tracked changes by {reviewer}: " + "; ".join(result.applied) + "."
-        return _download_card(output_filename, upload_id, size_kb, "Redlined", details)
+        return await _redline_word_document(
+            session_id, user_id, user_name, document_name, changes, author, output_name, if_unplaced
+        )
 
     return redline_word_document
+
+
+#: The comparison's change list reaches the model and stays in history, so it
+#: is bounded; the redline itself holds every change.
+_MAX_COMPARE_LINES = 40
+_MAX_COMPARE_CHARS = 4_000
+
+
+def _compare_details(original: str, reviewer: str, result: Any) -> str:
+    """What the model is told: counts, then one line per change, bounded."""
+    counts = f"{result.reworded} reworded, {result.added} added and {result.removed} removed paragraph(s)"
+    head = f"Tracked changes by {reviewer} against '{original}': {counts}."
+    lines = list(result.changes) + list(result.unmarked)
+    kept: List[str] = []
+    used = len(head)
+    for line in lines[:_MAX_COMPARE_LINES]:
+        if used + len(line) + 3 > _MAX_COMPARE_CHARS:
+            break
+        kept.append(line)
+        used += len(line) + 3
+    more = len(lines) - len(kept)
+    tail = f" …and {more} more; the redline has every change." if more else ""
+    note = (
+        " Differences that could not be marked are comments in the document."
+        if result.unmarked else ""
+    )
+    return head + (" Changes: " + " | ".join(kept) + "." if kept else "") + tail + note
+
+
+async def _compare_word_documents(
+    session_id: str,
+    user_id: str,
+    original_name: str,
+    revised_name: str,
+    author: Optional[str],
+    output_name: Optional[str],
+) -> Any:
+    if not _storage_configured():
+        return _error(_NO_STORAGE_MESSAGE)
+
+    found = []
+    for name in (original_name, revised_name):
+        meta = await _find_word_document(user_id, session_id, name)
+        if meta is None:
+            return _error(
+                f"❌ No Word document named '{name}' was found in this "
+                "chat. Use list_word_documents to see what's available."
+            )
+        found.append(meta)
+    original, revised = found
+    if (original.s3_bucket, original.s3_key) == (revised.s3_bucket, revised.s3_key):
+        return _error(f"❌ '{original_name}' and '{revised_name}' are the same document. Name two different files.")
+
+    source_base = (
+        original.filename[: -len(".docx")] if original.filename.lower().endswith(".docx") else original.filename
+    )
+    out_base = output_name or _default_redline_name(source_base, "compared")
+    if out_base.lower().endswith(".docx"):
+        out_base = out_base[: -len(".docx")]
+    is_valid, error_msg = _validate_document_name(out_base)
+    if not is_valid:
+        return _error(f"❌ Invalid output name '{out_base}': {error_msg}")
+    output_filename = f"{out_base}.docx"
+    reviewer = (author or "").strip() or DEFAULT_AUTHOR
+
+    try:
+        original_bytes, revised_bytes = await asyncio.gather(
+            asyncio.to_thread(_download_s3_bytes, original.s3_bucket, original.s3_key),
+            asyncio.to_thread(_download_s3_bytes, revised.s3_bucket, revised.s3_key),
+        )
+        result = await asyncio.to_thread(compare, original_bytes, revised_bytes, reviewer)
+    except NoDifferences:
+        return {
+            "content": [{"text": (
+                f"'{original.filename}' and '{revised.filename}' have the same wording, so there is "
+                "nothing to mark. Formatting-only changes are not compared."
+            )}],
+            "status": "success",
+        }
+    except RedlineError as exc:
+        return _error(
+            f"❌ Could not compare '{original.filename}' with '{revised.filename}':\n"
+            + "\n".join(f"- {p}" for p in exc.problems)
+        )
+    except Exception as exc:  # noqa: BLE001 - surface any read/parse error
+        logger.error(f"compare_word_documents error: {exc}")
+        return _error(f"❌ Failed to compare '{original.filename}' with '{revised.filename}': {exc}")
+
+    try:
+        upload_id, size_kb = await _store_document(
+            user_id, session_id, output_filename, result.docx, _DOCX_MIME
+        )
+    except Exception as exc:  # noqa: BLE001 - storage failure is terminal
+        logger.error(f"compare_word_documents storage error: {exc}")
+        return _error(f"❌ Compared the documents but failed to save the redline: {exc}")
+
+    details = _compare_details(original.filename, reviewer, result)
+    return _download_card(output_filename, upload_id, size_kb, "Compared", details)
+
+
+def make_compare_word_documents_tool(session_id: str, user_id: str):
+    """Create a ``compare_word_documents`` tool bound to the given identity.
+
+    Built beside ``redline_word_document``, while ``WORD_TRACKED_CHANGES_ENABLED``
+    is on (``docs/specs/word-tracked-changes.md`` §3b). Its spec is a constant: the default author is ``Counterparty``, not the
+    user, because the revisions being marked are someone else's.
+    """
+
+    @tool
+    async def compare_word_documents(
+        original_name: str,
+        revised_name: str,
+        author: Optional[str] = None,
+        output_name: Optional[str] = None,
+    ) -> Any:
+        """Compare two versions of a Word (.docx) document and mark the differences as tracked changes.
+
+        Use this when the user has an original and a revised copy without
+        tracked changes (such as a counterparty's clean return of a contract)
+        and asks what changed, for a comparison or for a redline between them.
+        The revised wording is written into a copy of the original as tracked
+        changes, so each one can be accepted or rejected in Word. Neither file
+        is changed; the comparison is saved as a new file and returned as a
+        download card with a list of the changes to summarize for the user.
+
+        Compares wording, not formatting, headers, footers or footnotes. A
+        table whose rows or columns changed, and a change inside a hyperlink or
+        field, become comments instead. A document that already has tracked
+        changes is refused: read it instead.
+
+        Args:
+            original_name: The earlier version (with or without .docx). Use
+                list_word_documents if unsure.
+            revised_name: The later version to compare with it.
+            author: Name shown on each change: whoever made the revisions.
+                Defaults to "Counterparty".
+            output_name: File name for the comparison, without extension.
+                Defaults to "<original_name>-compared".
+
+        Returns:
+            A download card for the redline and the list of changes.
+        """
+        return await _compare_word_documents(
+            session_id, user_id, original_name, revised_name, author, output_name
+        )
+
+    return compare_word_documents
 
 
 def make_list_word_documents_tool(session_id: str, user_id: str):

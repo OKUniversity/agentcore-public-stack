@@ -192,11 +192,25 @@ export const CURATED_BEDROCK_MODELS: CuratedModel[] = [
       // Measured against `us.anthropic.claude-opus-5-5` 2026-09-25: temperature
       // and top_p both 400 ("deprecated for this model"), and
       // `thinking.type.disabled` 400s — adaptive thinking is always on, so no
-      // `thinking` param is declared. The effort enum is the endpoint's own
-      // 400 on a bogus level; `medium` is the card's published default.
+      // `thinking` param is declared. The backend sends the thinking dict
+      // itself (summarized display + the drop_block binding,
+      // `_apply_thinking_binding` in model_config.py), because a catalog row
+      // already saved in a deployment never picks up a change here. The
+      // effort enum is the endpoint's own 400 on a bogus level; `medium` is
+      // the card's published default.
+      //
+      // max_tokens defaults to 64K, half the card's 128K. At 32K, long
+      // structured answers (a 91-row clause checklist over three documents, a
+      // full Word-document build) were cut at exactly 32,000 output tokens.
+      // 64K fits two such answers, and a longer one still ends in the
+      // Continue affordance, not an error. The cap bounds the worst case only:
+      // a call bills the tokens it writes, so a typical answer costs the same
+      // either way, and a capped call costs ~$1.41 at $22/MTok (128K would be
+      // ~$2.82, paid again on every tool round that hits it). A saved catalog
+      // row keeps its own default; admins change it in Manage Models.
       supportedParams: {
         params: {
-          max_tokens: { supported: true, min: 1, max: 128_000, default: 32_000 },
+          max_tokens: { supported: true, min: 1, max: 128_000, default: 64_000 },
           effort: {
             supported: true,
             allowed: ['low', 'medium', 'high', 'xhigh', 'max'],
@@ -293,6 +307,62 @@ export const CURATED_BEDROCK_MODELS: CuratedModel[] = [
           top_k: { supported: true, min: 1, default: null },
           max_tokens: { supported: true, min: 1, max: 64_000, default: 8192 },
           thinking: { supported: true, min: 1024, max: 48_000, default: 4096 },
+        },
+      },
+    },
+  },
+  {
+    key: 'claude-haiku-5-5',
+    tagline: "Anthropic's fastest, most efficient 5.5 model — high-volume work with effort control.",
+    capabilities: ['Adaptive thinking', 'Effort control', 'Vision', 'Prompt caching'],
+    pricingTier: 'regional',
+    template: {
+      ...claude4xDefaults(),
+      // `us.` because dev's SCP denies every `global.*` profile. Prod has no
+      // SCP: `global.anthropic.claude-haiku-5-5` at $0.10 / $0.50 is cheaper.
+      modelId: 'us.anthropic.claude-haiku-5-5',
+      // **Load-bearing pricing, not the window.** The card says 1M tokens, but
+      // a prompt over 100,000 tokens is billed on the "Long Context" row, 5x on
+      // every bucket, and `CuratedModel` holds one flat rate per bucket (the
+      // same reason the GPT-5.6 rows pin 272K). Compaction reads this value:
+      // it cuts at 50K, aims for 12.5K, and forces a cut at 70K, so a turn
+      // never reaches the step. Raising it past ~142K would let the hard
+      // ceiling (0.7x the window) cross 100K.
+      maxInputTokens: 100_000,
+      modelName: 'Claude Haiku 5.5',
+      shortDescription: 'Fast and low-cost, with effort control',
+      maxOutputTokens: 128_000,
+      // Regional (CRIS): $0.11 / $0.55, cache write $0.1375 (1.25x), read
+      // $0.011 (0.1x). The Price List API (`AmazonBedrockFoundationModels`,
+      // us-west-2, 2026-11-03) and the card agree. Its tokenizer counts ~30%
+      // more tokens than Haiku 4.5's for the same text, so the saving against
+      // Haiku 4.5 is ~7.7x on the same conversation, not 10x.
+      ...ratesWithDerivedCache(0.11, 0.55),
+      knowledgeCutoffDate: '2026-06-01',
+      // Probed on dev 2026-11-03 against `us.anthropic.claude-haiku-5-5`:
+      // `temperature` and `top_p` 400 ("deprecated for this model"), and
+      // `thinking.type.enabled` 400s. Adaptive thinking is on by default, and
+      // the backend sends it with the preserved-thinking `drop_block` binding
+      // on every request (`_apply_thinking_binding` in model_config.py), so
+      // no `thinking` param is declared. `effort: max` is valid only while
+      // thinking is on, and it always is here. CountTokens is unsupported on
+      // bedrock-runtime, so context attribution records nothing for this id.
+      // The cache minimum measured between 475 (no write) and 772 tokens
+      // (written); the card says 512.
+      //
+      // max_tokens stays at 32K, below the card's 128K, because of the 100K
+      // input step above. Output becomes input: the next tool round in the
+      // same turn, and the next turn, re-send it. A 64K answer on a 50K prompt
+      // puts the following call past 100K and bills it at 5x, and compaction
+      // cannot cut inside a protected turn to prevent that.
+      supportedParams: {
+        params: {
+          max_tokens: { supported: true, min: 1, max: 128_000, default: 32_000 },
+          effort: {
+            supported: true,
+            allowed: ['low', 'medium', 'high', 'xhigh', 'max'],
+            default: 'medium',
+          },
         },
       },
     },

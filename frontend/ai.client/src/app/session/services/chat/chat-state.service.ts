@@ -96,9 +96,10 @@ export class ChatStateService {
      * Sessions whose resume stream was refused because the paused turn could
      * no longer be picked up (`error_kind: 'resume_unavailable'`). The refusal
      * is streamed but not persisted, so the post-resume reload must be skipped
-     * or it would erase the only explanation. Read once, then cleared.
+     * or it would erase the only explanation. Read once, then cleared. The
+     * value is the backend's reason (`missing`, `expired`, `unknown_interrupt`).
      */
-    private readonly resumeUnavailable = new Set<string>();
+    private readonly resumeUnavailable = new Map<string, string>();
 
     readonly isChatLoading = computed(() => this.viewedState()?.loading() ?? false);
     readonly currentStopReason = computed(() => this.viewedState()?.stopReason() ?? null);
@@ -325,6 +326,15 @@ export class ChatStateService {
     }
 
     /**
+     * How a session's last assistant message ended (`end_turn`, `max_tokens`,
+     * `error`, …), or null while one is streaming or none has. `error` means
+     * the turn's reply is the server's error message.
+     */
+    stopReasonFor(sessionId: string): string | null {
+        return this.states().get(sessionId)?.stopReason() ?? null;
+    }
+
+    /**
      * Marks (or clears) whether a session's last turn ended in a recoverable
      * max_tokens truncation that the user can continue from.
      */
@@ -332,14 +342,21 @@ export class ChatStateService {
         this.stateFor(sessionId).lastTurnContinuable.set(continuable);
     }
 
-    /** Records that a session's resume was refused as unresumable. */
-    markResumeUnavailable(sessionId: string): void {
-        this.resumeUnavailable.add(sessionId);
+    /** Records that a session's resume was refused as unresumable, and why. */
+    markResumeUnavailable(sessionId: string, reason = 'unknown'): void {
+        this.resumeUnavailable.set(sessionId, reason);
     }
 
     /** Whether the session's last resume was refused; clears the mark. */
     takeResumeUnavailable(sessionId: string): boolean {
-        return this.resumeUnavailable.delete(sessionId);
+        return this.takeResumeRefusal(sessionId) !== null;
+    }
+
+    /** Why the session's last resume was refused, or null if it wasn't; clears the mark. */
+    takeResumeRefusal(sessionId: string): string | null {
+        const reason = this.resumeUnavailable.get(sessionId) ?? null;
+        this.resumeUnavailable.delete(sessionId);
+        return reason;
     }
 
     /**

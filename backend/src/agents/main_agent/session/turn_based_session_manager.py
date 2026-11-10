@@ -1614,8 +1614,21 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         cutoffs = self._valid_cutoff_indices
         total_turns = len(cutoffs)
         protected_turns = self.compaction_config.protected_turns
+        # Token bound on the protected tail (spec §3.2): the ceiling. Only
+        # under the model-relative policy, and only while the rollout switch
+        # is on; ``None`` keeps the tail whole whatever its size.
+        tail_bound: Optional[int] = (
+            policy.ceiling
+            if policy.floor is not None and self.compaction_config.tail_token_bound_enabled
+            else None
+        )
 
-        if total_turns <= protected_turns:
+        # A conversation no older than the protected turns is never cut on
+        # the ceiling alone — every cut would land inside the tail. At the
+        # hard ceiling it is: a young conversation at 160k is the same cost
+        # problem as an old one, and turn count is no reason to carry it.
+        young = total_turns <= protected_turns
+        if young and not (tail_bound is not None and at_hard_ceiling):
             logger.debug(
                 f"Only {total_turns} turns available (need > {protected_turns}), "
                 f"keeping all messages"
@@ -1636,7 +1649,12 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
                 protected_turns,
                 policy.floor,
                 history_tokens if history_tokens is not None else input_tokens,
+                tail_bound_tokens=tail_bound,
             )
+        # Whole turns the cut keeps, and whether it went inside the protected
+        # tail to get there — persisted on the policy snapshot, numbers only.
+        kept_turns = sum(1 for idx in cutoffs if idx >= relative_cut) if relative_cut > 0 else total_turns
+        tail_bounded = relative_cut > 0 and kept_turns < min(protected_turns, total_turns)
 
         if relative_cut <= 0:
             # Everything already fits under the floor — the excess is system
@@ -1731,6 +1749,10 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             "forced": forced,
             "inputTokens": input_tokens,
             "retainedTokensEstimate": retained_estimate,
+            # The protected tail was over its token bound and the cut kept
+            # only ``keptTurns`` of the newest turns (spec §3.2).
+            "tailBounded": tail_bounded,
+            "keptTurns": kept_turns,
             # Summary provenance — what the admin profile and the cost
             # anatomy read to explain a cut without reading the conversation.
             "summarySource": summary_source,
@@ -1965,6 +1987,30 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         except Exception as e:  # noqa: BLE001 - never break a turn
             logger.warning(f"apply_rewind skipped: {e}", exc_info=True)
             return None
+
+    def rewound_copy(self, messages: List[Dict], row: Optional[Dict]) -> List[Dict]:
+        """A deep copy of ``messages`` cut to any rewind the next turn's head would apply.
+
+        For a call that reads the history without being a turn (a handoff brief,
+        agent-handoffs-and-consults.md §4.5.1): ``apply_rewind`` cuts the live list only
+        at the head of the next turn, so between a rewind and that turn the live list
+        still holds what the user hid. The copy is cut the same way; the live list,
+        this manager's rewind epoch and the stashed row are left for the next turn.
+        ``row`` is the session's metadata row, read by the caller this request.
+        """
+        copied = copy.deepcopy(messages)
+        from apis.shared.feature_flags import session_rewind_enabled
+
+        if not session_rewind_enabled() or not row:
+            return copied
+        try:
+            state = RewindState.from_row(row)
+            applied = self._live_conversation.rewind_epoch
+            if state.epoch > applied:
+                self._cut_live_list(copied, state, applied)
+        except Exception as e:  # noqa: BLE001 - a failed cut must not fail the caller
+            logger.warning(f"rewound_copy: rewind not applied to the copy: {e}")
+        return copied
 
     def _cut_live_list(self, messages: List[Dict], state: RewindState, applied_epoch: int) -> Optional[int]:
         """Slice ``messages`` in place to the rewinds after ``applied_epoch``.
@@ -2229,6 +2275,9 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
                 "CompactionFloorUnreachable": (
                     1 if (policy.floor is not None and retained_estimate is not None and retained_estimate > policy.floor) else 0
                 ),
+                # The protected tail alone exceeded the ceiling and the cut
+                # kept fewer than ``protected_turns`` turns (spec §3.2).
+                "CompactionTailBounded": 1 if (state.policy or {}).get("tailBounded") else 0,
             },
             {
                 "policySource": policy.source,

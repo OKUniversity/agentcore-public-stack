@@ -9,6 +9,8 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple, TypeVar
 
+from apis.shared.models.assistant_prefill import is_continuation_prompt
+
 # Relative imports from shared sessions module
 from .models import Message, MessageContent, MessageResponse, MessagesListResponse, MessageMetadata, Citation
 
@@ -230,8 +232,16 @@ def _convert_message_to_response(msg: Message, session_id: str, sequence_number:
                     logger.warning(f"Failed to parse citations for message {computed_id}: {e}")
                     citations = None
 
+    continuation = is_continuation_prompt(msg.role, [block.text if block.type == "text" else None for block in msg.content])
+
     return MessageResponse(
-        id=computed_id, role=msg.role, content=msg.content, created_at=msg.timestamp or "", metadata=metadata_dict, citations=citations
+        id=computed_id,
+        role=msg.role,
+        content=msg.content,
+        created_at=msg.timestamp or "",
+        metadata=metadata_dict,
+        citations=citations,
+        continuation=True if continuation else None,
     )
 
 
@@ -565,6 +575,24 @@ async def get_messages_from_cloud(
                 user_id=user_id,
             )
 
+        async def fetch_handoffs():
+            """Handoff rows on a source and ``spawnedFrom`` on a target (handoffs spec §4.3).
+
+            Reads the raw META row: the ``SessionMetadata`` model behind
+            ``get_pending_interrupts`` doesn't carry ``spawnedFrom``. Nothing
+            at all while ``HANDOFFS_ENABLED`` is off.
+            """
+            from apis.shared.feature_flags import handoffs_enabled
+
+            if not handoffs_enabled():
+                return [], None
+            from apis.shared.handoff.replay import load_handoff_replay
+
+            from .metadata import load_session_meta
+
+            meta = await load_session_meta(session_id, user_id)
+            return await load_handoff_replay(session_id, user_id, meta.row)
+
         async def fetch_rewind():
             """Which stored messages a rewind has hidden (rewind spec §4).
 
@@ -588,6 +616,7 @@ async def get_messages_from_cloud(
             tool_summary_rows,
             source_provenance_rows,
             extraction_rows,
+            handoff_replay,
             rewind_state,
         ) = await asyncio.gather(
             fetch_messages(),
@@ -597,6 +626,7 @@ async def get_messages_from_cloud(
             fetch_tool_summaries(),
             fetch_source_provenance(),
             fetch_extractions(),
+            fetch_handoffs(),
             fetch_rewind(),
         )
 
@@ -722,6 +752,11 @@ async def get_messages_from_cloud(
         if not next_token:
             extractions = [row for row in extraction_rows if row.get("fields")]
 
+        # Handoffs: the rows a source thread shows after `sourceMessageIndex`,
+        # and the link a target's first bubble labels. First page only, like
+        # the replays above; the SPA places rows by index, not by page.
+        handoff_rows, spawned_from = handoff_replay if not next_token else ([], None)
+
         return MessagesListResponse(
             messages=message_responses,
             next_token=next_page_token,
@@ -730,6 +765,8 @@ async def get_messages_from_cloud(
             tool_summaries=tool_summaries,
             source_provenance=source_provenance,
             extractions=extractions,
+            handoffs=handoff_rows,
+            spawned_from=spawned_from,
             next_message_index=len(messages_raw) if rewind_state is not None else None,
         )
 

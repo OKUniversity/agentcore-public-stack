@@ -21,6 +21,11 @@ describe('FEATURES', () => {
     expect(environment.features.documentExtract).toBe(false);
     expect(environment.features.sessionRewind).toBe(false);
     expect(environment.features.sessionFork).toBe(false);
+    expect(environment.features.quotaRequests).toBe(false);
+    expect(environment.features.projectFileReadiness).toBe(false);
+    expect(environment.features.awsLimits).toBe(false);
+    expect(environment.features.knowledgeBaseMode).toBe(false);
+    expect(environment.features.releaseLedger).toBe(false);
   });
 
   it('turns finished features on locally, matching their default-on backend switches', () => {

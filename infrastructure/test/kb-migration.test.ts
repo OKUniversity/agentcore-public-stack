@@ -568,6 +568,10 @@ describe('KbMigrationConstruct — flags reach every function', () => {
     expect(env(p).MANAGED_KB_PER_OWNER_DEFAULT_BYTES).toBe(String(100 * 1024 * 1024));
     expect(env(p).MANAGED_KB_PER_OWNER_ELEVATED_BYTES).toBe(String(1024 * 1024 * 1024));
     expect(env(p).MANAGED_KB_PER_KB_CEILING_BYTES).toBe(String(500 * 1024 * 1024));
+    // The ingestion consumer holds each stored object to the per-file limit.
+    expect(env(lambdaFor(t, HANDLERS.ingestionConsumer)).KB_UPLOAD_MAX_FILE_BYTES).toBe(
+      String(50 * 1024 * 1024),
+    );
     // KB_MIGRATION_RETAIN_DAYS, not MANAGED_KB_RETENTION_WINDOW_DAYS. This
     // assertion previously pinned the latter — which the construct set and
     // `worker._retain_days()` never read, so it confirmed the construct against
@@ -1051,7 +1055,7 @@ describe('KbMigrationConstruct — IAM', () => {
     expect(resources).not.toContain('"*"');
   });
 
-  it('gives the worker and consumer READ-only access to the documents bucket', () => {
+  it('never lets a migration Lambda write the documents bucket', () => {
     // Source bytes for re-ingestion and the S3 HEAD byte accounting
     // sizes documents with (Requirement 12.3). Nothing here writes user
     // documents, and a write grant would let a migration corrupt the
@@ -1064,8 +1068,44 @@ describe('KbMigrationConstruct — IAM', () => {
     const allS3Actions = docStatements.flatMap((s) =>
       (Array.isArray(s.Action) ? s.Action : [s.Action]) as string[],
     );
-    expect(allS3Actions).not.toContain('s3:PutObject');
-    expect(allS3Actions).not.toContain('s3:DeleteObject');
+    // Prefix match, not equality: CDK grants emit wildcards (`s3:PutObject*`),
+    // which an exact `not.toContain('s3:PutObject')` would wave through.
+    for (const action of allS3Actions) {
+      expect(action.startsWith('s3:Put')).toBe(false);
+    }
+  });
+
+  const s3ActionsOf = (statements: PolicyStatement[]): string[] =>
+    statements.flatMap((s) =>
+      (Array.isArray(s.Action) ? s.Action : [s.Action]).filter(
+        (a): a is string => typeof a === 'string' && a.startsWith('s3:'),
+      ),
+    );
+
+  it('lets only the ingestion consumer delete, and only document keys', () => {
+    // An object the consumer refuses after measuring it (over the per-file
+    // limit, or overshooting the byte cap) is deleted, as chat's
+    // `complete_upload` does. Without this grant the delete was AccessDenied,
+    // logged as a warning, and the object stayed until its agent was deleted.
+    const consumer = statementsForRole(t, /KbIngestionConsumerLambdaServiceRole/);
+    const deletes = consumer.filter((s) =>
+      s3ActionsOf([s]).some((a) => a.startsWith('s3:Delete')),
+    );
+    expect(deletes).toHaveLength(1);
+    const resources = JSON.stringify(deletes[0].Resource);
+    expect(resources).toContain('/assistants/*/documents/*');
+    expect(resources).not.toMatch(/"arn:[^"]*:s3:::[^"/]*"/); // never the bucket itself
+
+    for (const role of [
+      /KbMigrationWorkerLambdaServiceRole/,
+      /KbMigrationDispatcherLambdaServiceRole/,
+      /KbMigrationReconcilerLambdaServiceRole/,
+      /KbDocumentReconcilerLambdaServiceRole/,
+    ]) {
+      for (const action of s3ActionsOf(statementsForRole(t, role))) {
+        expect(action.startsWith('s3:Delete')).toBe(false);
+      }
+    }
   });
 
   it('lets the reconciler list and read the documents bucket, read-only', () => {
@@ -1160,16 +1200,33 @@ describe('KbMigration wiring on PlatformStack', () => {
     }
   });
 
-  it('never reads the service-role ARN back from the SSM path this stack publishes', () => {
-    // Passing the ManagedKbRoleConstruct by ref is not a style choice:
-    // CloudFormation resolves AWS::SSM::Parameter::Value template
-    // parameters BEFORE any stack resource exists, so a same-stack read
-    // is unsatisfiable on first deploy.
-    const params = t.toJSON().Parameters ?? {};
-    for (const param of Object.values(params) as Array<Record<string, unknown>>) {
-      const type = param.Type as string | undefined;
-      if (!type?.startsWith('AWS::SSM::Parameter::Value')) continue;
-      expect(param.Default).not.toBe('/test-project/managed-kb/service-role-arn');
-    }
+  it('lets app-api start born-managed provisioning without waiting for the tick', () => {
+    // born_managed._start_worker_now async-invokes the migration worker on a new
+    // knowledge base's first upload. Without the name it logs and falls back to
+    // the 15-minute dispatcher tick; without the grant the invoke is refused and
+    // it falls back the same way. Both fail silently, so both are asserted
+    // against the worker the dispatcher itself invokes.
+    const workerLogicalId = Object.keys(t.findResources('AWS::Lambda::Function'))
+      .find((id) => id.includes('KbMigrationWorkerLambda'));
+    expect(workerLogicalId).toBeDefined();
+
+    type Container = { Environment?: Array<{ Name: string; Value: unknown }> };
+    const env = Object.values(t.findResources('AWS::ECS::TaskDefinition')).flatMap((td) =>
+      ((td.Properties as { ContainerDefinitions?: Container[] }).ContainerDefinitions ?? [])
+        .flatMap((c) => c.Environment ?? []),
+    );
+    expect(env).toContainEqual({
+      Name: 'KB_MIGRATION_WORKER_FUNCTION_NAME',
+      Value: { Ref: workerLogicalId },
+    });
+
+    type Statement = { Sid?: string; Action?: unknown; Resource?: unknown };
+    const invoke = Object.values(t.findResources('AWS::IAM::ManagedPolicy'))
+      .flatMap((r) =>
+        (r.Properties as { PolicyDocument?: { Statement?: Statement[] } }).PolicyDocument?.Statement ?? [],
+      )
+      .find((st) => st.Sid === 'KbMigrationWorkerInvoke');
+    expect(invoke?.Action).toBe('lambda:InvokeFunction');
+    expect(invoke?.Resource).toEqual({ 'Fn::GetAtt': [workerLogicalId, 'Arn'] });
   });
 });

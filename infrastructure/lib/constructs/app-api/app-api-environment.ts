@@ -253,6 +253,10 @@ export function buildAppApiEnvironment(
     MANAGED_KB_PER_OWNER_DEFAULT_BYTES: String(config.managedKb.perOwnerDefaultBytes),
     MANAGED_KB_PER_OWNER_ELEVATED_BYTES: String(config.managedKb.perOwnerElevatedBytes),
     MANAGED_KB_PER_KB_CEILING_BYTES: String(config.managedKb.perKnowledgeBaseCeilingBytes),
+    // Per-file knowledge-base upload limit, enforced at presign and import and
+    // returned to the SPA as `kbUsage.maxFileBytes`. The managed ingestion
+    // consumer holds stored objects to the same value (kb-migration-construct.ts).
+    KB_UPLOAD_MAX_FILE_BYTES: String(config.managedKb.uploadMaxFileBytes),
     // Gates the owner-facing upgrade offer (Requirement 23.1), which is served by
     // THIS task — `apis/app_api/kb_upgrade/service.py` reads this exact variable.
     //
@@ -383,6 +387,12 @@ export function buildAppApiEnvironment(
     // Session prewarm (opt-in while in development): gates POST /chat/prewarm.
     // app-api only; the Runtime's warm action is a no-op behind this route.
     SESSION_PREWARM_ENABLED: config.sessionPrewarm.enabled ? 'true' : 'false',
+    // Quota requests (opt-in while in development): gates /quota/* and the
+    // admin request queue. app-api only; extensions resolve everywhere.
+    QUOTA_REQUESTS_ENABLED: config.quotaRequests.enabled ? 'true' : 'false',
+    // AWS Limits (opt-in while in development): gates /admin/aws-limits.
+    // app-api only; the Runtime never reads Service Quotas.
+    AWS_LIMITS_ENABLED: config.awsLimits.enabled ? 'true' : 'false',
     // Handoffs (opt-in while in development): gates /sessions/{id}/handoffs.
     HANDOFFS_ENABLED: config.handoffs.enabled ? 'true' : 'false',
     // Conversation rewind (opt-in while in development): gates
@@ -418,12 +428,24 @@ export function buildAppApiEnvironment(
     // so only "true" enables.
     SOURCE_PROVENANCE_ENABLED: config.sourceProvenance.enabled ? 'true' : 'false',
 
+    // Release ledger writes (docs/specs/release-ledger.md §5.2). app-api's share
+    // is the api-converse cost rows it writes; the Runtime writes the rest. In
+    // development, so only "true" enables.
+    RELEASE_LEDGER_ENABLED: config.releaseLedger.enabled ? 'true' : 'false',
+
     // Typed structured extraction (docs/specs/structured-extraction.md).
     // app-api's share is the read side: `GET /messages` replays the stored
     // `EXTR#` rows, which the SSE event does not re-stream. In development, so
     // only "true" enables. The model id is deliberately NOT set here — app-api
     // never makes the extraction call.
     DOCUMENT_EXTRACT_ENABLED: config.documentExtract.enabled ? 'true' : 'false',
+
+    // Assistant KB full-context mode. app-api never sends a knowledge base to a
+    // model; its share is `GET /assistants/{id}/knowledge-base/mode`, which tells
+    // an Agent's author which mode the Runtime runs it in, and so must see the
+    // Runtime's flag and budget. In development, so only "true" enables.
+    ASSISTANT_KB_FULL_CONTEXT_ENABLED: config.assistantKbFullContext.enabled ? 'true' : 'false',
+    ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS: String(config.assistantKbFullContext.maxTokens),
     ...(params.largeDocumentPrepareQueueUrl
       ? { LARGE_DOCUMENT_PREPARE_QUEUE_URL: params.largeDocumentPrepareQueueUrl }
       : {}),

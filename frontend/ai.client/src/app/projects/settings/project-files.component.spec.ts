@@ -178,14 +178,43 @@ describe('ProjectFilesComponent', () => {
     expect(el.querySelector('[role=status]')?.textContent).toContain('Upload failed');
   });
 
-  it('refuses a file over the limit before asking the server', async () => {
+  it('refuses a file over the API’s limit before asking the server', async () => {
+    api.files.mockReturnValue(of({
+      documents: [doc('a')], nextToken: null, canEdit: true,
+      kbUsage: { engine: 'managed', storedBytes: 0, reservedBytes: 0, cap: 100 * 1024 * 1024, elevated: false, maxFileBytes: 50 * 1024 * 1024 },
+    }));
     const { fixture, el, component } = await render();
     const big = new File(['x'], 'huge.pdf');
-    Object.defineProperty(big, 'size', { value: 11 * 1024 * 1024 });
+    Object.defineProperty(big, 'size', { value: 51 * 1024 * 1024 });
     await pick(component, [big]);
     fixture.detectChanges();
     expect(api.fileUploadUrl).not.toHaveBeenCalled();
-    expect(el.textContent).toContain('Files can be up to 10 MB');
+    expect(el.textContent).toContain('Files can be up to 50 MB. This one is 51 MB.');
+  });
+
+  it('sends a file the old 10 MB limit refused when the API allows it', async () => {
+    api.files.mockReturnValue(of({
+      documents: [doc('a')], nextToken: null, canEdit: true,
+      kbUsage: { engine: 'managed', storedBytes: 0, reservedBytes: 0, cap: 100 * 1024 * 1024, elevated: false, maxFileBytes: 50 * 1024 * 1024 },
+    }));
+    api.fileUploadUrl.mockReturnValue(throwError(() => new HttpErrorResponse({ status: 503 })));
+    const { component } = await render();
+    const file = new File(['x'], 'report.pdf');
+    Object.defineProperty(file, 'size', { value: 30 * 1024 * 1024 });
+    await pick(component, [file]);
+    expect(api.fileUploadUrl).toHaveBeenCalled();
+  });
+
+  it('shows the server’s sentence when it refuses a file over the limit', async () => {
+    api.fileUploadUrl.mockReturnValue(
+      throwError(() => new HttpErrorResponse({ status: 413, error: { detail: 'Files can be up to 50 MB. This one is 60 MB.' } })),
+    );
+    const { fixture, el, component } = await render();
+    const big = new File(['x'], 'huge.pdf');
+    Object.defineProperty(big, 'size', { value: 60 * 1024 * 1024 });
+    await pick(component, [big]);
+    fixture.detectChanges();
+    expect(el.textContent).toContain('Files can be up to 50 MB. This one is 60 MB.');
   });
 
   it('shows the API’s sentence when the upload is refused (archived)', async () => {
@@ -220,6 +249,66 @@ describe('ProjectFilesComponent', () => {
     expect(el.textContent).toContain('Ready');
     expect(api.file).toHaveBeenCalledTimes(2);
     expect(api.file).toHaveBeenCalledWith('prj_1', 'p');
+  });
+
+  describe('a file that takes a while', () => {
+    let visibility: DocumentVisibilityState;
+
+    beforeEach(() => {
+      visibility = 'visible';
+      vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility);
+    });
+
+    const setVisibility = (next: DocumentVisibilityState) => {
+      visibility = next;
+      document.dispatchEvent(new Event('visibilitychange'));
+    };
+
+    const mount = async () => {
+      const fixture = TestBed.createComponent(ProjectFilesComponent);
+      fixture.componentRef.setInput('project', PROJECT);
+      fixture.detectChanges();
+      await vi.advanceTimersByTimeAsync(0);
+      fixture.detectChanges();
+      return { fixture, el: fixture.nativeElement as HTMLElement };
+    };
+
+    it('is still polled after five minutes, and shows Ready when it gets there', async () => {
+      // Prod, 2026-11-03: a new project's first files waited ~14 minutes for their
+      // knowledge base, and the page stopped polling at 5, stuck on "Setting up".
+      vi.useFakeTimers();
+      api.files.mockReturnValue(of({ documents: [doc('p', { status: 'provisioning' })], nextToken: null, canEdit: true }));
+      let ready = false;
+      api.file.mockImplementation(() => of(doc('p', { status: ready ? 'complete' : 'provisioning' })));
+      const { fixture, el } = await mount();
+      expect(el.textContent).toContain('Setting up');
+
+      await vi.advanceTimersByTimeAsync(14 * 60 * 1000);
+      ready = true;
+      await vi.advanceTimersByTimeAsync(10_000);
+      fixture.detectChanges();
+      expect(el.textContent).toContain('Ready');
+    });
+
+    it('asks nothing while the tab is hidden, and resumes when it is back', async () => {
+      vi.useFakeTimers();
+      api.files.mockReturnValue(of({ documents: [doc('p', { status: 'provisioning' })], nextToken: null, canEdit: true }));
+      api.file.mockReturnValue(of(doc('p', { status: 'provisioning' })));
+      const { fixture, el } = await mount();
+
+      setVisibility('hidden');
+      api.file.mockClear();
+      // Long enough for the poll to run out entirely while nobody is looking.
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+      expect(api.file).not.toHaveBeenCalled();
+
+      api.file.mockReturnValue(of(doc('p', { status: 'complete' })));
+      setVisibility('visible');
+      await vi.advanceTimersByTimeAsync(1000);
+      fixture.detectChanges();
+      expect(api.file).toHaveBeenCalledWith('prj_1', 'p');
+      expect(el.textContent).toContain('Ready');
+    });
   });
 
   it('deletes after confirmation', async () => {

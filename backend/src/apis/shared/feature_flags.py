@@ -83,6 +83,31 @@ def word_tracked_changes_enabled() -> bool:
     return os.environ.get("WORD_TRACKED_CHANGES_ENABLED", "").strip().lower() != "false"
 
 
+def word_skill_scripts_enabled() -> bool:
+    """Whether the Word tools can run a script that ships inside a bound skill.
+
+    On, ``create_word_document`` and ``modify_word_document`` also take
+    ``skill_name`` / ``path`` / ``params``: the tool resolves the file through
+    the turn's own skill records (only a ``scripts/*.py`` resource of a skill
+    bound to the turn), writes it into the Code Interpreter sandbox next to the
+    document and calls its ``run(doc, params)`` there, so the model never
+    retypes a long program into ``python_code``. The script runs only in the
+    sandbox, never on the Runtime host (``agents/main_agent/skills/skill_scripts.py``).
+    Off, neither tool's spec changes and skill scripts stay inert everywhere.
+
+    The spec change is one ``toolConfig`` rewrite per deployment when it turns
+    on, never per session: the extra arguments are optional and constant.
+
+    **Opt-in while the feature is in development** (CLAUDE.md "Feature flags"):
+    only ``"true"`` (case-insensitive) enables it; unset arrives as ``""`` and
+    is off. CDK sets it on the AgentCore Runtime only, and only while on, from
+    ``config.wordSkillScripts.enabled``. No SPA switch: the result comes back on
+    the existing download card. A **feature switch** once finished: running an
+    author's code on a user's document is a capability a deployment may not want.
+    """
+    return os.environ.get("WORD_SKILL_SCRIPTS_ENABLED", "").strip().lower() == "true"
+
+
 def assistant_kb_full_context_enabled() -> bool:
     """Whether a small assistant knowledge base reaches the model whole
     (``apis/shared/assistants/kb_full_context.py``).
@@ -100,6 +125,30 @@ def assistant_kb_full_context_enabled() -> bool:
     (``AssistantDocumentsRead``, shared with spreadsheet analysis). No SPA switch.
     """
     return os.environ.get("ASSISTANT_KB_FULL_CONTEXT_ENABLED", "").strip().lower() == "true"
+
+
+def agent_knowledge_files_enabled() -> bool:
+    """Whether an ordinary Agent's turn gets ``knowledge_files``, which lists its
+    Knowledge documents and reads one by name
+    (``agents/builtin_tools/project_files_tool.py``, the ``project_files`` tool
+    in its Knowledge voice).
+
+    On, a turn with ``rag_assistant_id`` set that is not a project harness's
+    builds the tool (constant spec, so one ``toolConfig`` change per deployment
+    when it is turned on), and the retrieved-excerpts preamble gains one constant
+    sentence naming it (``KNOWLEDGE_FILES_EXCERPTS_NOTE``). Off, neither the
+    ``toolConfig`` nor the persisted user message changes by a byte. A project
+    harness keeps ``project_files`` either way.
+
+    **Opt-in while the feature is in development** (CLAUDE.md "Feature flags"):
+    only ``"true"`` (case-insensitive) enables it; unset arrives as ``""`` and
+    is off. AgentCore Runtime only: CDK writes it there, and only while on, from
+    ``config.agentKnowledgeFiles.enabled``. No SPA switch: the tool has no UI.
+
+    A **feature switch** once finished: it widens what an Agent can read of its
+    own Knowledge (by name, whole), which a deployment may reasonably not want.
+    """
+    return os.environ.get("AGENT_KNOWLEDGE_FILES_ENABLED", "").strip().lower() == "true"
 
 
 def large_document_attachments_enabled() -> bool:
@@ -716,6 +765,30 @@ def attachment_turn_guard_enabled() -> bool:
     return os.environ.get("ATTACHMENT_TURN_GUARD_ENABLED", "").strip().lower() != "false"
 
 
+def inline_budget_by_reference_enabled() -> bool:
+    """Whether an uploaded document that does not fit in a turn's combined
+    inline budget goes by reference instead of being dropped.
+
+    ``_apply_inline_byte_budget`` holds a turn's inline attachments to
+    ``INLINE_ATTACHMENTS_MAX_TOTAL_BYTES`` first-fit; with this on, a
+    document-class *upload* it moves out becomes a ``ReferenceAttachment``
+    (``over_budget=True``): its stored digest (or a ``status="ready"`` stub) in
+    the user message and ``document_read`` to read it from the original, from the
+    row the resolver already read. No preparation, no extra read before the
+    first token. Images and direct ``files`` bytes have no reference path and
+    are still dropped with the note.
+
+    **Rollout switch, default ON** (house style): unset or empty resolves to
+    enabled; only the literal ``"false"`` (case-insensitive) disables. Off, an
+    over-budget document is dropped with the "combined size limit" note, as
+    before. **Retires** after one production release plus two weeks there with
+    the switch never flipped and the ``AttachmentReference`` count with
+    ``reason = over_budget`` recorded (CLAUDE.md, "Feature switches stay;
+    rollout switches retire").
+    """
+    return os.environ.get("INLINE_BUDGET_BY_REFERENCE_ENABLED", "").strip().lower() != "false"
+
+
 def feedback_eval_sampling_enabled() -> bool:
     """Whether down-thumbed turns may be sent to AgentCore Evaluations.
 
@@ -787,6 +860,28 @@ def platform_self_service_enabled() -> bool:
     return os.environ.get("PLATFORM_SELF_SERVICE_ENABLED", "false").strip().lower() == "true"
 
 
+def meeting_tasks_enabled() -> bool:
+    """Whether the meeting-transcripts-to-GitHub-issues tool families are built.
+
+    Covers the Google Calendar (``google_calendar_meetings``), Zoom
+    (``zoom_meeting_transcripts``) and GitHub (``github_issues_local``) tools built
+    per request by ``_build_meeting_tools`` in the inference API
+    (``agents/local_tools/meeting_tasks.py``,
+    ``docs/specs/meeting-transcripts-to-github-issues.md``). **Opt-in while the
+    feature is in development**: only ``"true"`` (case-insensitive) enables it;
+    unset, empty or anything else is off. AgentCore Runtime only; CDK sets it
+    there, and only while on. No SPA switch: the tools surface through the
+    existing tool picker and connector consent flow.
+
+    It ANDs with RBAC: each family's catalog row is seeded
+    ``enabledByDefault: false`` and not public, so on by default would still
+    grant nobody anything until a role is granted the tool and an admin binds
+    the row to a connector. Off, the tools are never built, so their specs
+    never reach ``toolConfig`` and no catalog read is made for them.
+    """
+    return os.environ.get("MEETING_TASKS_ENABLED", "").strip().lower() == "true"
+
+
 def projects_enabled() -> bool:
     """Whether Shared Projects exist in this environment.
 
@@ -843,6 +938,24 @@ def handoffs_enabled() -> bool:
     a new conversation, which is a product choice a deployment may keep.
     """
     return os.environ.get("HANDOFFS_ENABLED", "").strip().lower() == "true"
+
+
+def handoff_brief_enabled() -> bool:
+    """Whether a handoff's context card is a brief the source's own model writes.
+
+    ``docs/specs/agent-handoffs-and-consults.md`` §4.5.1. While on, the Runtime
+    answers a ``handoff_brief`` invocation by re-sending the source
+    conversation's last request plus one instruction, so the history reads from
+    the source's prompt cache; while off, that invocation answers with a
+    ``flag_off`` fallback and the card stays the PR-0.1 excerpt. Meaningless
+    without ``HANDOFFS_ENABLED``, so both must be on. **Opt-in while in
+    development**: only ``"true"`` enables it. CDK writes it to the Runtime only
+    while on, so the default spends none of the V2 environment budget.
+
+    A **feature switch** once finished: it spends model tokens on every handoff,
+    which a deployment may decline.
+    """
+    return handoffs_enabled() and os.environ.get("HANDOFF_BRIEF_ENABLED", "").strip().lower() == "true"
 
 
 def session_rewind_enabled() -> bool:
@@ -905,6 +1018,51 @@ def session_prewarm_enabled() -> bool:
     any work, so the app-api route is the whole gate.
     """
     return os.environ.get("SESSION_PREWARM_ENABLED", "").strip().lower() == "true"
+
+
+def quota_requests_enabled() -> bool:
+    """Whether users can request more quota and admins can grant extensions.
+
+    ``docs/specs/quota-requests-and-extensions.md``. Gates app-api's
+    ``/quota/*`` user routes and the ``/admin/quota-requests`` and
+    ``/admin/quota-extensions`` admin routes, which 404 after authentication
+    while off. **Opt-in while the feature is in development** (CLAUDE.md
+    "Feature flags"): only ``"true"`` (case-insensitive) enables it, so an
+    unset GitHub variable (``""``) is off. CDK sets it on app-api from
+    ``config.quotaRequests.enabled``. The SPA's matching switch will be
+    ``features.quotaRequests``.
+
+    **app-api only.** The Runtime gets no variable: quota resolution reads
+    extensions wherever it runs, exactly as direct user grants are read, so
+    turning this off stops new extensions without revoking existing ones and
+    spends none of the Runtime's V2 environment budget.
+
+    A **feature switch** once finished: whether users may ask for more is a
+    product and budget choice a deployment may reasonably not want.
+    """
+    return os.environ.get("QUOTA_REQUESTS_ENABLED", "").strip().lower() == "true"
+
+
+def aws_limits_enabled() -> bool:
+    """Whether the AWS Limits admin page (Service Quotas monitoring) is served.
+
+    GitHub issue #12. Gates app-api's ``/admin/aws-limits`` routes, which 404
+    after authentication while off. The page lists the account's applied AWS
+    quotas for the services this stack uses, with usage where AWS publishes a
+    usage metric, and lets an admin request an increase through Service Quotas.
+
+    **Opt-in while the feature is in development** (CLAUDE.md "Feature flags"):
+    only ``"true"`` (case-insensitive) enables it, so an unset GitHub variable
+    (``""``) is off. CDK sets it on app-api from ``config.awsLimits.enabled``,
+    and grants the Service Quotas permissions only while it is on. The SPA's
+    matching switch is ``features.awsLimits``.
+
+    **app-api only.** The Runtime never reads quotas, so it gets no variable.
+
+    A **feature switch** once finished: whether app admins may raise AWS
+    account quotas from the app is a deployment's choice.
+    """
+    return os.environ.get("AWS_LIMITS_ENABLED", "").strip().lower() == "true"
 
 
 def user_grants_enabled() -> bool:
@@ -1151,6 +1309,55 @@ def inline_attachment_persist_enabled() -> bool:
     return os.environ.get("INLINE_ATTACHMENT_PERSIST_ENABLED", "").strip().lower() != "false"
 
 
+def converse_document_cap_enabled() -> bool:
+    """Whether a Converse request is kept within Bedrock's five non-PDF documents.
+
+    Covers ``apis.shared.models.document_cap``, installed by ``AgentFactory``
+    on every Bedrock Converse model. A request over the limit has every
+    non-PDF document after the fifth, in message order, sent as its text
+    instead of failing with "You can't include more than 5 documents". A request
+    within the limit is sent unchanged.
+
+    **Rollout switch, default ON** (house style): unset or empty resolves to
+    enabled; only the literal ``"false"`` (case-insensitive) disables. Off, an
+    over-limit request is sent as before and Bedrock rejects it. Retires on the
+    default condition: shipped in a production release, then two weeks there
+    with the switch never flipped, and the ``document_cap:`` log line's count
+    recorded as the readout.
+    """
+    return os.environ.get("CONVERSE_DOCUMENT_CAP_ENABLED", "").strip().lower() != "false"
+
+
+def converse_documents_as_text_enabled() -> bool:
+    """Whether a Converse request carries non-PDF attachments as text, not documents.
+
+    Covers the ``as_text`` mode of ``apis.shared.models.document_cap``, the
+    per-call projection ``AgentFactory`` installs on every Bedrock Converse
+    model. On, every docx, txt, md, csv and html document block is sent as a
+    text block the deployment rendered (``docx_markdown``, ``html_markdown``,
+    UTF-8), the way Claude's own product treats files; PDFs stay native
+    document blocks. There is then no five-document limit to reach. The stored
+    conversation is unchanged: the user message keeps its document block, so
+    the attachment card, restore, offload and the share and handoff views see
+    what they always saw. The inference route renders a turn's new attachments
+    in worker threads before the agent runs, so the parse stays off the event
+    loop (``prerender_document_text``).
+
+    **Opt-in while the feature is in development** (CLAUDE.md "Feature flags"):
+    only ``"true"`` (case-insensitive) enables it; unset arrives as ``""`` and
+    is off. CDK sets it on the AgentCore Runtime only, and only while on, from
+    ``config.converseDocumentsAsText.enabled``. No SPA switch: there is nothing
+    to show.
+
+    A **feature switch** once finished, not a rollout switch: whether Bedrock or
+    the deployment renders a document is a choice a deployment may make either
+    way. Turning it on or off takes a Runtime update, which replaces every
+    container, so no warm conversation ever holds a prefix projected the other
+    way.
+    """
+    return os.environ.get("CONVERSE_DOCUMENTS_AS_TEXT_ENABLED", "").strip().lower() == "true"
+
+
 def source_provenance_enabled() -> bool:
     """Whether a cited passage is verified against the document it names
     (``docs/specs/source-provenance-verification.md``).
@@ -1180,6 +1387,62 @@ def source_provenance_enabled() -> bool:
     invisible, so there is nothing for a rollout hedge to protect.
     """
     return os.environ.get("SOURCE_PROVENANCE_ENABLED", "").strip().lower() == "true"
+
+
+def web_search_default_max_results_enabled() -> bool:
+    """Whether an AgentCore Web Search call that names no ``maxResults`` asks
+    for 5 results instead of the connector's 10.
+
+    On, ``WebSearchDefaultsHook`` fills in ``maxResults=5`` at
+    ``BeforeToolCallEvent`` for any ``<target>___WebSearch`` call whose input
+    leaves it out. A count the model chose passes through. Each result is about
+    535 tokens, so an unqualified search drops from ~5.3k tokens of tool result
+    to ~2.6k (``docs/specs/web-search-default-comparison-findings.md``). Nothing
+    reaches the system prompt or ``toolConfig``, and the model's request in
+    history stays as it wrote it: the hook hands Strands a copy.
+
+    **Opt-in while the feature is in development** (CLAUDE.md "Feature flags"):
+    only ``"true"`` (case-insensitive) enables it; unset arrives as ``""`` and
+    is off. CDK sets it on the AgentCore Runtime only, and only while on, from
+    ``config.webSearchDefaultMaxResults.enabled``. No SPA switch: there is
+    nothing to show.
+
+    A **feature switch**, not a rollout switch, and therefore permanent: how
+    many results an unqualified search buys is a product choice between
+    context spent and breadth of answer, which a deployment may reasonably
+    make the other way.
+    """
+    return (
+        os.environ.get("WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED", "").strip().lower()
+        == "true"
+    )
+
+
+def project_file_readiness_enabled() -> bool:
+    """Whether a project turn tells the model which project files are not ready.
+
+    On, a Shared Project harness turn whose files include any that are still
+    being prepared (``provisioning`` → ``embedding``) or that ``failed`` gets a
+    short ``<project_files_status>`` note in the user message
+    (``apis.shared.assistants.kb_readiness``). Without it the model sees nothing
+    for those files, because retrieval and full-context both skip a document
+    until it is ``complete``, and answers as though the project had no such
+    file. A turn whose files are all ready is byte-for-byte unchanged. The note
+    rides the persisted user message like ``<project_member>``, never the
+    system prompt or ``toolConfig``, so no cached prefix moves.
+
+    **Opt-in while the feature is in development** (CLAUDE.md "Feature flags"):
+    only ``"true"`` (case-insensitive) enables it; unset arrives as ``""`` and
+    is off. CDK sets it on the AgentCore Runtime only, and only while on, from
+    ``config.projectFileReadiness.enabled``. The SPA's matching switch,
+    ``features.projectFileReadiness``, shows the readiness strip above a
+    project chat's composer.
+
+    A **feature switch** once finished: what the assistant says about files it
+    cannot read yet, and whether the chat shows their progress, is a product
+    choice a deployment may make the other way.
+    """
+    return os.environ.get("PROJECT_FILE_READINESS_ENABLED", "").strip().lower() == "true"
 
 
 def document_extract_enabled() -> bool:
@@ -1236,3 +1499,30 @@ def document_extract_model_id() -> str:
     a default that looks like it works is how one ships.
     """
     return os.environ.get("DOCUMENT_EXTRACT_MODEL_ID", "").strip()
+
+
+def release_ledger_enabled() -> bool:
+    """Whether each model call's cost row also bumps the version-keyed ledger
+    rollups (``docs/specs/release-ledger.md`` §5.2, D3, D8).
+
+    On, ``_update_system_rollups_async`` adds the call to ``LEDGER#VERSION``,
+    ``LEDGER#MODEL#<month>``, ``LEDGER#TOOL#<month>``, ``LEDGER#AGENT#<month>``
+    and ``LEDGER#PROJECT#<month>`` in the existing ``system-cost-rollup`` table,
+    beside the ``ROLLUP#`` bumps and with their fire-and-forget, log-and-swallow
+    semantics: after the stream, never before the first token, and never able
+    to fail a turn. Off, nothing is written. The per-row stamps (``appVersion``,
+    ``build``) and the census weights are not behind it; they are attributes on
+    rows that already exist.
+
+    **Opt-in while the feature is in development** (CLAUDE.md "Feature flags"):
+    only ``"true"`` (case-insensitive) enables it; unset arrives as ``""`` and
+    is off. CDK sets it on app-api (which writes api-converse rows) and, only
+    while on, on the AgentCore Runtime (which writes every chat, voice, brief
+    and extraction row) from ``config.releaseLedger.enabled``. The SPA's
+    matching switch, ``features.releaseLedger``, arrives with the Releases tab.
+
+    A **feature switch** once finished, not a rollout switch, and therefore
+    permanent: the writes are a per-call cost (three to five ``UpdateItem``
+    calls) that a deployment may reasonably decline.
+    """
+    return os.environ.get("RELEASE_LEDGER_ENABLED", "").strip().lower() == "true"
